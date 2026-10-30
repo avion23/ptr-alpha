@@ -1362,6 +1362,16 @@ def test_schema4_preserves_repeated_lots_exact_amount_and_raw_columns(tmp_path):
     assert legacy.legacy_limited
 
 
+@pytest.mark.parametrize("number", ["NaN", "Infinity", "1e999"])
+def test_schema4_rejects_nonfinite_numbers_nested_in_raw_source(number):
+    row = {"asset": "Apple (AAPL)", "type": "Purchase", "date": "01/15/25",
+           "notif_date": None, "amount_raw": "$1,234", "owner": None, "account": None,
+           "instrument_type": "unknown", "raw_cells": {"nested": [{"number": "NUMBER_TOKEN"}]}}
+    raw = "SCHEMA: 4\nMEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\nROW: " + json.dumps(row).replace('"NUMBER_TOKEN"', number)
+    with pytest.raises(gemini_ocr_common.GeminiOutputError, match="invalid ROW JSON"):
+        gemini_ocr_common.parse_gemini_output(raw, expected_page_count=1)
+
+
 def test_durable_delivery_blocks_redispatch_and_finish_replay_is_idempotent(tmp_path):
     from analyzer.ocr.contracts import ExtractionOutcome, ResultBundle
 

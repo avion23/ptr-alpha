@@ -3,8 +3,11 @@
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
+import os
 from pathlib import Path
 import socket
+import subprocess
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -35,7 +38,7 @@ def scope(tmp_path, monkeypatch):
     content = b"%PDF-bound-fixture"
     digest = hashlib.sha256(content).hexdigest()
     with Database(tmp_path / "congress.duckdb") as db:
-        db.conn.execute("INSERT INTO house_archive_generations (archive_year, generation_id) VALUES (2025, 'g')")
+        db.conn.execute("INSERT INTO house_archive_generations (archive_year, generation_id, metadata_count, ptr_count) VALUES (2025, 'g', 4, 4)")
         for doc_id in ("a", "b", "c", "d"):
             pdf = tmp_path / "2025" / "pdfs" / f"{doc_id}.pdf"
             pdf.parent.mkdir(parents=True, exist_ok=True)
@@ -58,6 +61,8 @@ def test_late_superseded_bundle_replays_without_poisoning_current_attempt(scope)
     root, digest = scope
     with Database(root / "congress.duckdb") as db:
         db.conn.execute("DELETE FROM house_generation_metadata WHERE doc_id != 'a'")
+        db.conn.execute("DELETE FROM house_pdf_artifacts WHERE doc_id != 'a'")
+        db.conn.execute("UPDATE house_archive_generations SET metadata_count=1, ptr_count=1")
         original = bound_work(root, digest)
         db.work.register(original)
         attempt_a = db.work.claim(original.task_id)
@@ -167,6 +172,8 @@ def test_local_watchdog_publishes_db_free_uncertainty_and_escalates(scope, monke
     root, digest = scope
     with Database(root / "congress.duckdb") as owner:
         owner.conn.execute("DELETE FROM house_generation_metadata WHERE doc_id != 'a'")
+        owner.conn.execute("DELETE FROM house_pdf_artifacts WHERE doc_id != 'a'")
+        owner.conn.execute("UPDATE house_archive_generations SET metadata_count=1, ptr_count=1")
         work = bound_work(root, digest)
         owner.work.register(work)
         claimed = owner.work.claim(work.task_id)
@@ -261,3 +268,84 @@ def test_same_binding_has_one_provider_call_and_no_duplicate_on_replay(scope, mo
     assert second["work"]["by_state"] == {"accepted": 1, "needs_review": 1, "superseded": 1}
     with Database(root / "congress.duckdb", read_only=True) as reader:
         assert reader.conn.execute("SELECT COUNT(*) FROM transactions").fetchone() == (1,)
+
+
+@pytest.mark.parametrize("counts", [(2, 2), (None, None), (0, None)])
+@pytest.mark.parametrize("operation", ["run", "status"])
+def test_incomplete_official_scope_counts_cannot_report_completion(tmp_path, counts, operation):
+    with Database(tmp_path / "congress.duckdb") as owner:
+        owner.conn.execute("INSERT INTO house_archive_generations (archive_year, generation_id, metadata_count, ptr_count) VALUES (2025, 'missing-scope', ?, ?)", list(counts))
+        owner.publish_snapshot()
+    with pytest.raises(ValueError):
+        if operation == "status":
+            coordinator.pipeline_status(tmp_path, years=[2025])
+        else:
+            coordinator.run_pipeline(tmp_path, [2025])
+
+
+def test_cron_module_entrypoint_runs_actual_spawn_worker_without_api(tmp_path):
+    from tests.test_glm_stage import make_pdf
+
+    root = Path(__file__).resolve().parents[1]
+    data = tmp_path / "data"
+    pdf = make_pdf(data / "2025" / "pdfs" / "spawn-probe.pdf")
+    digest = hashlib.sha256(pdf.read_bytes()).hexdigest()
+    with Database(data / "congress.duckdb") as owner:
+        owner.conn.execute("INSERT INTO house_archive_generations (archive_year, generation_id, metadata_count, ptr_count) VALUES (2025, 'spawn', 1, 1)")
+        owner.conn.execute("INSERT INTO house_generation_metadata (archive_year, generation_id, doc_id, first_name, last_name, filing_date, filing_type) VALUES (2025, 'spawn', 'spawn-probe', 'Jane', 'Doe', '2025-01-20', 'P')")
+        owner.conn.execute("INSERT INTO house_pdf_artifacts (archive_year, generation_id, doc_id, artifact_sha256) VALUES (2025, 'spawn', 'spawn-probe', ?)", [digest])
+    env = dict(os.environ, PYTHONPATH=str(root / "src"), PTR_SKIP_DOCS="spawn-probe")
+    process = subprocess.run(
+        [sys.executable, "-m", "analyzer.cli", "pipeline", "--data-dir", str(data),
+         "--year", "2025", "--local-workers", "1", "--gemini-workers", "0", "--glm-workers", "0"],
+        cwd=root, env=env, capture_output=True, text=True, timeout=60,
+    )
+    assert process.returncode == 1, process.stdout + process.stderr
+    summary = json.loads(process.stdout)
+    assert summary["completed_attempts"] == 1
+    assert summary["unresolved"] == 1
+    assert summary["work"]["by_state"] == {"needs_review": 1}
+    bundle = workers.load_result(next((data / "pipeline" / "results").glob("*.json")))
+    assert bundle.work.lane == ExtractionLane.LOCAL
+    assert bundle.evidence["failure"]["type"] == "ParserCascadeError"
+    assert "skipped via PTR_SKIP_DOCS" in bundle.evidence["failure"]["message"]
+
+
+@pytest.mark.parametrize("number", ["NaN", "Infinity", "1e999"])
+def test_nonfinite_raw_source_is_durable_refusal_without_stopping_other_documents(scope, monkeypatch, number):
+    from analyzer.ocr import common
+
+    root, _ = scope
+    with Database(root / "congress.duckdb") as owner:
+        owner.conn.execute("DELETE FROM house_generation_metadata WHERE doc_id NOT IN ('a', 'b')")
+        owner.conn.execute("DELETE FROM house_pdf_artifacts WHERE doc_id NOT IN ('a', 'b')")
+        owner.conn.execute("UPDATE house_archive_generations SET metadata_count=2, ptr_count=2")
+    row = {"asset": "Apple (AAPL)", "type": "Purchase", "date": "01/15/25",
+           "notif_date": None, "amount_raw": "$1,234", "owner": None, "account": None,
+           "instrument_type": "unknown", "raw_cells": {"nested": [{"number": "NUMBER_TOKEN"}]}}
+    prefix = "SCHEMA: 4\nMEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\nROW: "
+    invalid = prefix + json.dumps(row).replace('"NUMBER_TOKEN"', number)
+    valid = prefix + json.dumps(row).replace('"NUMBER_TOKEN"', '123')
+    run = common.subprocess.run
+    calls = []
+
+    def provider(command, *args, **kwargs):
+        if command[0] != "llm":
+            return run(command, *args, **kwargs)
+        doc = Path(command[command.index("-a") + 1]).stem
+        calls.append(doc)
+        return SimpleNamespace(returncode=0, stdout=invalid if doc == "a" else valid, stderr="")
+
+    monkeypatch.setattr(common.subprocess, "run", provider)
+    summary = coordinator.run_pipeline(root, [2025], local_workers=0, gemini_workers=1)
+    assert sorted(calls) == ["a", "b"]
+    assert summary["completed_attempts"] == 2
+    assert summary["work"]["by_state"] == {"accepted": 1, "needs_review": 1}
+    bundles = {bundle.work.doc_id: bundle for bundle in (
+        workers.load_result(path) for path in (root / "pipeline" / "results").glob("*.json"))}
+    assert bundles["a"].raw_response == invalid
+    assert bundles["a"].rows == []
+    assert "invalid_response" in bundles["a"].evidence["provider_error"]
+    assert len(bundles["b"].rows) == 1
+    with Database(root / "congress.duckdb", read_only=True) as reader:
+        assert reader.conn.execute("SELECT doc_id FROM transactions").fetchall() == [("b",)]

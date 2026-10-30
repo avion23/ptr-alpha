@@ -523,7 +523,11 @@ def test_house_parse_keeps_winning_fallback_rows_and_quarantines_total_failure(
         return pd.DataFrame()
 
     fake_database = FakeDatabase()
-    monkeypatch.setattr(rebuild_staged, "_house_source", lambda _staging: FakeSource())
+    def borrowed_source(_staging, *, db):
+        assert db is fake_database
+        return FakeSource()
+
+    monkeypatch.setattr(rebuild_staged, "_house_source", borrowed_source)
     monkeypatch.setattr(
         rebuild_staged,
         "filter_existing_pdfs",
@@ -661,7 +665,12 @@ def test_house_parse_streams_text_results_before_ocr_tail_and_persists_tail_imme
             "persisted_transactions": count,
         }
 
-    monkeypatch.setattr(rebuild_staged, "_house_source", lambda _staging: source)
+    def borrowed_source(_staging, *, db):
+        assert db is database
+        return source
+
+    database = db
+    monkeypatch.setattr(rebuild_staged, "_house_source", borrowed_source)
     monkeypatch.setattr(
         rebuild_staged,
         "filter_existing_pdfs",

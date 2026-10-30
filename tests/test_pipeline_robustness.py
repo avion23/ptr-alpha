@@ -907,9 +907,6 @@ def test_multi_year_refresh_retains_owner_after_fetch_failure_and_exits_incomple
         patch("analyzer.cli.get_context", return_value=ctx),
         patch("analyzer.cli._HOUSE_PTR_FIRST_ARCHIVE_YEAR", first_year),
         patch(
-            "analyzer.house_refresh._open_database", side_effect=databases[1:]
-        ) as reopen,
-        patch(
             "analyzer.ocr.coordinator.run_pipeline",
             return_value={"unresolved": 0, "missing_years": []},
         ) as parse_pipeline,
@@ -923,7 +920,6 @@ def test_multi_year_refresh_retains_owner_after_fetch_failure_and_exits_incomple
     )
     assert f"FAILED steps: fetch:{first_year}" in result.output
     assert [db for _year, db in attempts] == [databases[0]] * 3
-    reopen.assert_not_called()
     databases[0].close.assert_not_called()
     assert ctx.transaction_source.db is ctx.price_source.db is databases[0]
     parse_pipeline.assert_called_once()
@@ -1042,18 +1038,9 @@ def test_refresh_keeps_single_writer_during_acquisition_and_parse(tmp_path):
 
     before = writer_probe()
     assert before.returncode != 0
-    inter_phase = []
-    real_open = _open_database
-
-    def open_database(data_dir, read_only):
-        if not inter_phase and not read_only:
-            inter_phase.append(writer_probe())
-        return real_open(data_dir, read_only)
-
     try:
         with (
             patch("analyzer.cli.get_context", return_value=app_ctx),
-            patch("analyzer.house_refresh._open_database", side_effect=open_database),
             patch(
                 "analyzer.ocr.coordinator.run_pipeline",
                 return_value={"unresolved": 0, "missing_years": []},
@@ -1067,7 +1054,7 @@ def test_refresh_keeps_single_writer_during_acquisition_and_parse(tmp_path):
 
     assert result.exit_code == 0, result.output
     assert acquisition_probe[0].returncode != 0
-    assert inter_phase == []  # No owner close/reopen window between phases.
+    assert source.db is db  # No owner replacement between acquisition and parsing.
 
 
 def test_backtest_pipeline_emits_real_spy_buy_hold_row(tmp_path):

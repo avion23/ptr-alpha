@@ -15,34 +15,37 @@ from analyzer.cli import _warn_live_ticker_coverage, app
 from analyzer.exceptions import StepResult
 
 
-class TestHouseAcquisitionDatabase(unittest.TestCase):
-    def test_real_connection_is_closed_after_query_or_query_error(self):
-        import duckdb
-
+class TestHouseRefreshOwnership(unittest.TestCase):
+    def test_acquisition_retains_borrowed_owner_on_success_and_failure(self):
         from analyzer.persistence.database import Database
-        from analyzer.house_refresh import _HouseAcquisitionDatabase
+        from analyzer.persistence.ownership import OwnershipError
+        from analyzer.house_refresh import acquire_house_archives
 
         with TemporaryDirectory() as directory:
             path = Path(directory) / "congress.duckdb"
-            Database(path, read_only=False).close()
-            proxy = _HouseAcquisitionDatabase(directory)
-            for archive_year in (2026, object()):
-                with self.subTest(archive_year=archive_year):
-                    retained = Database(path, read_only=True)
-                    try:
-                        with patch(
-                            "analyzer.house_refresh._open_database",
-                            return_value=retained,
-                        ):
-                            if archive_year == 2026:
-                                self.assertTrue(proxy.get_metadata(archive_year).empty)
-                            else:
-                                with self.assertRaises(duckdb.NotImplementedException):
-                                    proxy.get_metadata(archive_year)
-                        with self.assertRaises(duckdb.ConnectionException):
-                            retained.conn.execute("SELECT 1")
-                    finally:
-                        retained.close()
+            with Database(path) as owner:
+                for fails in (False, True):
+                    with self.subTest(fails=fails):
+                        summary = SimpleNamespace(archive_year=2026)
+
+                        def fetch(year, **kwargs):
+                            self.assertEqual(year, 2026)
+                            self.assertEqual(owner.conn.execute("SELECT 1").fetchone(), (1,))
+                            with self.assertRaises(OwnershipError):
+                                Database(path)
+                            if fails:
+                                raise ValueError("acquisition failed")
+                            return summary
+
+                        source = SimpleNamespace(db=owner, fetch_and_cache_pdfs=fetch)
+                        result = acquire_house_archives(source, [2026], all_years=False, refresh_metadata=False)
+                        self.assertEqual(result.success, not fails)
+                        self.assertIs(source.db, owner)
+                        self.assertEqual(owner.conn.execute("SELECT 1").fetchone(), (1,))
+                        if fails:
+                            self.assertIsInstance(result.error, ValueError)
+                        else:
+                            self.assertEqual(result.data, [summary])
 
 
 class TestCliApp(unittest.TestCase):

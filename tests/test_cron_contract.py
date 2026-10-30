@@ -285,9 +285,10 @@ class EscalationWiringTest(TestCase):
 class BacklogOcrContractTest(TestCase):
     def test_scheduled_drain_uses_one_coordinator_with_explicit_lanes(self):
         text = (CRON_DIR / "backlog_ocr.sh").read_text()
-        self.assertIn("from analyzer.ocr.coordinator import run_pipeline", text)
-        self.assertIn("run_pipeline(sys.argv[1], local_workers=3, gemini_workers=0,", text)
-        self.assertIn("glm_workers=2)", text)
+        self.assertIn('python3 -m analyzer.cli pipeline --data-dir "$repo/data"', text)
+        self.assertIn("--local-workers 3 --gemini-workers 0 --glm-workers 2", text)
+        self.assertIn('PYTHONPATH="$repo/src${PYTHONPATH:+:$PYTHONPATH}"', text)
+        self.assertNotIn("python3 - ", text)  # Spawn must be able to import __main__.
         self.assertNotIn("glm_stage.py stage", text)
         self.assertNotIn("--from-manifest", text)
         self.assertIn('exit "$coordinator_rc"', text)

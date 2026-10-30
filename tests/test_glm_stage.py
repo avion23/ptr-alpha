@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import threading
+from uuid import uuid4
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -98,8 +99,8 @@ def seed_house_queue(data_dir, doc_ids, *, archive_year=2024, filing_year=2024):
     db = Database(db_path)
     digests = {}
     db.conn.execute(
-        "INSERT INTO house_archive_generations (archive_year, generation_id) VALUES (?, 'current')",
-        [archive_year],
+        "INSERT INTO house_archive_generations (archive_year, generation_id, metadata_count, ptr_count) VALUES (?, 'current', ?, ?)",
+        [archive_year, len(doc_ids), len(doc_ids)],
     )
     for doc_id in doc_ids:
         digest = glm_stage.pdf_sha256(glm_stage.default_pdf_path(data_dir, archive_year, doc_id))
@@ -2936,6 +2937,77 @@ def test_verdict_binding_rejects_row_mutation_but_accepts_content_bound_record(
     record["staged_rows_sha256"] = glm_stage.staged_rows_sha256(record["rows"])
     bound, reason = glm_stage.verdict_binding(data_dir, "rowhash", record)
     assert bound and reason is None
+
+
+@pytest.mark.parametrize("invalidate", ["before", "during"])
+def test_glm_audit_guard_holds_real_verdict_authorization_through_commit(data_dir, monkeypatch, invalidate):
+    from analyzer.ocr import common, coordinator, ingestion, workers
+    from analyzer.ocr.contracts import ExtractionLane, ExtractionOutcome, ResultBundle, WorkEnvelope, task_key
+    from analyzer.persistence.database import Database
+
+    path, digests = seed_house_queue(data_dir, ["guard"])
+    record = stage_one_audited(data_dir, 2024, "guard", GLM_OUTPUT_ONE_ROW)
+    recipe = workers.extraction_recipe(ExtractionLane.GLM)
+    work = WorkEnvelope(
+        task_key("guard", 2024, "current", digests["guard"], recipe, ExtractionLane.GLM),
+        str(uuid4()), "guard", 2024, "current", digests["guard"],
+        str(glm_stage.default_pdf_path(data_dir, 2024, "guard")), "Jane Doe", "2024-02-01", 1,
+        recipe, ExtractionLane.GLM,
+    )
+    attempted = threading.Event()
+    invalidated = threading.Event()
+    errors = []
+
+    def revoke():
+        attempted.set()
+        try:
+            audit_sample.record_verdict(data_dir, "guard", "fail", "new pixel defect")
+        except Exception as error:
+            errors.append(error)
+        finally:
+            invalidated.set()
+
+    with Database(path) as owner:
+        owner.work.register(work)
+        claimed = owner.work.claim(work.task_id)
+        parsed = common.parse_gemini_output(record["raw_output"], expected_page_count=1)
+        result = ResultBundle(claimed, ExtractionOutcome.CANDIDATE, parsed.transactions,
+                              record["raw_output"], evidence={"artifact_verified": True,
+                              "member": "Jane Doe", "staging_record": record,
+                              "page_count": 1, "output_schema_version": 3,
+                              "page_outcomes": [{"page_number": 1, "outcome": "transactions"}]})
+        bundle_path = workers._publish(result, str(data_dir / "pipeline"))
+        real_commit = ingestion.insert_transactions_outcome
+        invalidator = threading.Thread(target=revoke)
+        committed = []
+
+        def commit(*args, **kwargs):
+            assert invalidate == "during", "revoked authorization reached canonical persistence"
+            invalidator.start()
+            assert attempted.wait(5)
+            assert not invalidated.wait(0.1), "verdict changed after admission but before commit"
+            outcome = real_commit(*args, **kwargs)
+            assert owner.work.is_finished(kwargs["receipt"])
+            assert owner.conn.execute("SELECT COUNT(*) FROM transactions WHERE doc_id='guard'").fetchone() == (1,)
+            assert not invalidated.is_set(), "audit guard released before canonical receipt committed"
+            committed.append(outcome.status)
+            return outcome
+
+        monkeypatch.setattr(ingestion, "insert_transactions_outcome", commit)
+        if invalidate == "before":
+            revoke()
+        try:
+            state = coordinator._ingest(owner, result, Path(bundle_path), data_dir, None)
+        finally:
+            if invalidator.ident is not None:
+                invalidator.join(5)
+        assert not invalidator.is_alive()
+        assert not errors
+        assert invalidated.is_set()
+        assert committed == (["success"] if invalidate == "during" else [])
+        assert state == ("accepted" if invalidate == "during" else "needs_review")
+        assert owner.conn.execute("SELECT COUNT(*) FROM transactions WHERE doc_id='guard'").fetchone() == ((1,) if invalidate == "during" else (0,))
+    assert glm_stage.load_staging_record(data_dir, 2024, "guard")["audit"] == "fail"
 
 
 # --------------------------------------------------------------------------

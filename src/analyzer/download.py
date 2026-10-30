@@ -846,6 +846,9 @@ class HouseTransactionSource(TransactionSource):
         results: list,
         member_lookup: dict,
         ingestion_generation: str,
+        *,
+        recipe: str = PARSE_VERSION,
+        receipt: dict | None = None,
     ) -> None:
         pdf_transactions: dict = {}
         parse_attempts: list[tuple[str, list[str]]] = []
@@ -869,7 +872,7 @@ class HouseTransactionSource(TransactionSource):
             dict(
                 doc_id=doc_id,
                 year=year,
-                parser_version=PARSE_VERSION,
+                parser_version=recipe,
                 status=(
                     "error"
                     if doc_id in invalid_docs
@@ -921,10 +924,13 @@ class HouseTransactionSource(TransactionSource):
                 else []
             ),
             parse_runs=parse_runs,
+            receipt=(dict(receipt, state="needs_review", detail=str(invalid_docs))
+                     if receipt is not None and invalid_docs else receipt),
+            include_global_counts=receipt is None,
         )
         logger.info(
             "Persisted %d transactions across %d parsed PDFs "
-            "(%d zero-row results; canonical=%d raw=%d database rows)",
+            "(%d zero-row results; canonical=%s raw=%s database rows)",
             sum(persisted.by_doc_total.values()),
             len(parse_attempts),
             len(zero_row_doc_ids),

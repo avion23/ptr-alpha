@@ -108,7 +108,12 @@ def get_context(ctx, data_dir=None, read_only=False):
             settings.data.data_dir = data_dir
         # Share a single DuckDB connection across both data sources to avoid
         # two independent Database instances pointing at the same file.
-        shared_db = _open_database(settings.data.data_dir, read_only)
+        if read_only:
+            from analyzer.persistence.ownership import resolve_read_path
+            shared_db = Database(resolve_read_path(Path(settings.data.data_dir) / "congress.duckdb"), read_only=True)
+        else:
+            shared_db = _open_database(settings.data.data_dir, False)
+        ctx.call_on_close(shared_db.close)
         ctx.obj = AppContext(
             settings=settings,
             transaction_source=HouseTransactionSource(
@@ -896,55 +901,42 @@ def parse(
         help="Ignore deterministic parse fingerprints and reparse every cached PDF",
     ),
 ):
-    """Parse cached PDFs to database."""
+    """Parse official acquired scope; API extraction requires --gemini-ocr."""
+    from analyzer.ocr.coordinator import run_pipeline
+
     app_ctx = get_context(ctx, data_dir, read_only=False)
-    parse_success = False
-    generation_complete = False
-    try:
-        result = run_parse_pipeline(
-            app_ctx.transaction_source,
-            year,
-            force=force_full_reparse,
-            activate_generation=False,
-        )
-        parse_success = result.success
-        if parse_success:
-            _activate_house_generation(app_ctx.transaction_source, year)
-            generation_complete = True
-    except Exception:
-        logger.exception("Parse pipeline failed")
-    ocr_inserted = 0
-    ocr_error = None
-    if use_gemini_ocr:
-        db_path = _release_parent_db_for_ocr(app_ctx)
-        try:
-            ocr_inserted, ocr_error = _run_gemini_ocr_year_subprocess(
-                app_ctx.settings.data.data_dir, year
-            )
-            if ocr_error is not None:
-                logger.warning("Gemini OCR failed for %d: %s", year, ocr_error)
-                ocr_inserted = 0
-            else:
-                print(f"  Gemini OCR {year}: {ocr_inserted} transactions inserted")
-        finally:
-            _reacquire_parent_db_after_ocr(app_ctx, db_path)
-    # OCR can resolve artifacts, but cannot erase a parse/write failure.
-    if (
-        parse_success
-        and use_gemini_ocr
-        and ocr_error is None
-        and not generation_complete
-    ):
-        try:
-            _activate_house_generation(app_ctx.transaction_source, year)
-            generation_complete = True
-        except Exception:
-            logger.exception("Post-OCR generation activation failed")
-    if not generation_complete and use_gemini_ocr and ocr_inserted > 0:
-        logger.warning(
-            "Parse pipeline failed but Gemini OCR inserted %s rows", ocr_inserted
-        )
-    _cli_exit(0 if generation_complete and ocr_error is None else 1)
+    result = run_pipeline(app_ctx.settings.data.data_dir, [year],
+                          database=app_ctx.transaction_source.db,
+                          local_workers=app_ctx.transaction_source.parallel_workers,
+                          gemini_workers=int(use_gemini_ocr),
+                          refresh_recipe=force_full_reparse)
+    import json
+    print(json.dumps(result, default=str))
+    _cli_exit(int(result["unresolved"] > 0 or bool(result["missing_years"])))
+
+
+@app.command()
+def pipeline(
+    data_dir: str = typer.Option("data", help="Data directory"),
+    year: list[int] | None = typer.Option(None, "--year", help="Official archive year; repeatable"),
+    status: bool = typer.Option(False, "--status", help="Read published work/status without starting workers"),
+    local_workers: int = typer.Option(3, min=0),
+    gemini_workers: int = typer.Option(0, min=0, help="Explicit billable Gemini slots; zero disables Gemini"),
+    glm_workers: int = typer.Option(0, min=0, help="Explicit billable GLM slots; zero disables GLM"),
+    refresh_recipe: bool = typer.Option(False, "--refresh-recipe", help="After unresolved work, include resolved scope under the current recipe"),
+    publish_every: int = typer.Option(100, min=1),
+):
+    """Run the durable document coordinator, or inspect its published status."""
+    import json
+    from analyzer.ocr.coordinator import pipeline_status, run_pipeline
+
+    if status:
+        result = pipeline_status(data_dir, years=year)
+    else:
+        result = run_pipeline(data_dir, year, local_workers=local_workers,
+                              gemini_workers=gemini_workers, glm_workers=glm_workers,
+                              refresh_recipe=refresh_recipe, publish_every=publish_every)
+    print(json.dumps(result, default=str))
 
 
 @app.command()
@@ -1436,6 +1428,7 @@ def refresh(
             app_ctx.settings.data.data_dir,
             database_lifecycle=database_lifecycle,
             force=force_full_reparse,
+            gemini_workers=int(use_gemini_ocr),
         )
     )
 
@@ -1449,31 +1442,7 @@ def refresh(
             "(use fetch-capitol --output ... --generation ... for reconciliation)"
         )
 
-    if use_gemini_ocr:
-        print("[4/4] Running Gemini OCR on zero-row PDFs...")
-        # The OCR helper opens its own DuckDB handles. A held parent handle
-        # causes a same-process ConnectionException (different config) or a
-        # child-process lock conflict, so release it and reuse the isolated-
-        # subprocess pattern of the standalone entrypoint for every year.
-        db_path = _release_parent_db_for_ocr(app_ctx)
-        try:
-            for archive_year in archive_years:
-                inserted, ocr_error = _run_gemini_ocr_year_subprocess(
-                    app_ctx.settings.data.data_dir, archive_year
-                )
-                if ocr_error is not None:
-                    failed_steps.append(f"gemini_ocr:{archive_year}")
-                    logger.warning(
-                        "Gemini OCR failed for %d: %s", archive_year, ocr_error
-                    )
-                    continue
-                print(
-                    f"  Gemini OCR {archive_year}: {inserted} transactions inserted"
-                )
-        finally:
-            _reacquire_parent_db_after_ocr(app_ctx, db_path)
-    else:
-        print("[4/4] Skipping Gemini OCR (use --gemini-ocr to enable)")
+    print("[4/4] Local/API work completed by the shared coordinator; publishing final status")
 
     generation_outcomes, metrics = complete_house_refresh(
         app_ctx.transaction_source,

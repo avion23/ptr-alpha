@@ -129,9 +129,6 @@ def acquire_house_archives(
     database_lifecycle = False
 
     try:
-        database_lifecycle = _prepare_house_acquisition_database(
-            transaction_source, price_source, data_dir
-        )
         fail_fast = len(archive_years) == 1
         for archive_year in archive_years:
             should_refresh_metadata = (
@@ -153,7 +150,6 @@ def acquire_house_archives(
                     archive_year,
                     year_exc,
                 )
-                _reopen_shared_database(transaction_source, price_source, data_dir)
                 try:
                     summary = transaction_source.fetch_and_cache_pdfs(
                         archive_year, refresh_metadata=should_refresh_metadata
@@ -169,9 +165,6 @@ def acquire_house_archives(
                     failed = True
                     if first_error is None:
                         first_error = retry_exc
-                    _reopen_shared_database(
-                        transaction_source, price_source, data_dir
-                    )
                     continue
             summaries.append(summary)
 
@@ -198,31 +191,17 @@ def parse_house_archives(
     *,
     database_lifecycle: bool,
     force: bool,
+    gemini_workers: int = 0,
 ) -> list[int]:
-    """Parse each acquired archive with a short-lived writer per year."""
-    failed_years = []
-    for archive_year in archive_years:
-        if database_lifecycle:
-            parse_db = _open_database(data_dir, False)
-            _set_shared_database(transaction_source, price_source, parse_db)
-        try:
-            try:
-                # Activation follows optional OCR, never the parse step.
-                parse_result = run_parse_pipeline(
-                    transaction_source,
-                    archive_year,
-                    force=force,
-                    activate_generation=False,
-                )
-                if not parse_result.success:
-                    failed_years.append(archive_year)
-            except Exception as exc:
-                failed_years.append(archive_year)
-                logger.warning("PDF parse failed for %d: %s", archive_year, exc)
-        finally:
-            if database_lifecycle:
-                _release_shared_database(transaction_source, price_source)
-    return failed_years
+    """Use one rolling window and one owner across every acquired archive."""
+    from analyzer.ocr.coordinator import run_pipeline
+
+    run_pipeline(data_dir, archive_years, database=transaction_source.db,
+                 local_workers=transaction_source.parallel_workers,
+                 gemini_workers=gemini_workers, refresh_recipe=force)
+    return [year for year in archive_years
+            if (generation := transaction_source.db.get_latest_house_generation(year)) is None
+            or transaction_source.db.get_unresolved_house_doc_ids(year, generation)]
 
 
 def complete_house_refresh(

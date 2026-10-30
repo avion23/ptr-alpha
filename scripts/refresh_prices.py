@@ -52,7 +52,7 @@ import pandas as pd
 import numpy as np
 
 from analyzer.persistence.database import Database
-from analyzer.persistence.ownership import resolve_read_path
+from analyzer.persistence.ownership import database_owner, resolve_read_path
 from analyzer.exceptions import DataSourceError
 from analyzer.persistence.price_repository import (
     nyse_sessions,
@@ -317,6 +317,8 @@ def refresh_prices(
         raise FileExistsError(
             f"temp database already exists: {temp_db} (use --force to overwrite)"
         )
+    if resolve_read_path(temp_db).resolve() != temp_db.resolve():
+        raise ValueError("output has a published read version; use a new attempt path")
 
     tickers = _source_tickers(source_db)
     eligible, excluded = select_eligible_assets(tickers)
@@ -324,12 +326,9 @@ def refresh_prices(
         raise ValueError("no eligible assets found in the source database")
 
     temp_db.parent.mkdir(parents=True, exist_ok=True)
-    if temp_db.exists() and force:
-        temp_db.unlink()
-    for sidecar in ("", ".wal"):
-        leftover = Path(str(temp_db) + sidecar)
-        if leftover.exists():
-            leftover.unlink()
+    with database_owner(temp_db, purpose="price attempt reset maintenance"):
+        temp_db.unlink(missing_ok=True)
+        Path(str(temp_db) + ".wal").unlink(missing_ok=True)
 
     settings = Settings(data=DataSettings(data_dir=str(temp_db.parent)))
     db = Database(temp_db, read_only=False)

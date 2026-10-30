@@ -840,7 +840,7 @@ def test_dual_read_opt_in_flag_default_off():
 # ---------------------------------------------------------------------------
 
 
-def test_dual_read_agreement_persists_rows_as_v6(tmp_path, vision_b_server):
+def test_dual_read_agreement_cannot_persist_without_source_review(tmp_path, vision_b_server):
     _seed_db(tmp_path)
     server = vision_b_server(B_OUTPUT_REFORMAT)
 
@@ -849,9 +849,14 @@ def test_dual_read_agreement_persists_rows_as_v6(tmp_path, vision_b_server):
     )
 
     assert outcome.handled
-    assert outcome.inserted == 1
-    assert outcome.progress_key == "completed"
+    assert outcome.decision.status == AGREE
+    assert outcome.decision.parser_version == DUAL_PARSER_VERSION
+    assert outcome.decision.engines_attempted == DUAL_ENGINES_ATTEMPTED
+    assert outcome.decision.raw_row_count == 1
+    assert outcome.inserted == 0
+    assert outcome.progress_key == "errors"
     assert outcome.member == "Jane Doe"
+    assert len(server.requests) == 1
     with duckdb.connect(str(tmp_path / "congress.duckdb")) as conn:
         rows = conn.execute(
             "SELECT transaction_type, amount_raw, source FROM transactions "
@@ -861,11 +866,13 @@ def test_dual_read_agreement_persists_rows_as_v6(tmp_path, vision_b_server):
             "SELECT parser_version, status, engines_attempted, transaction_count "
             "FROM pdf_parse_runs WHERE doc_id = 'dual-doc'"
         ).fetchone()
-    assert rows == [("Purchase", "A", "gemini_ocr")]
-    assert run_row == (DUAL_PARSER_VERSION, "success", DUAL_ENGINES_ATTEMPTED, 1)
+        assert conn.execute("SELECT COUNT(*) FROM transaction_versions").fetchone() == (0,)
+    # Agreement describes extraction, not independent source-review authority.
+    assert rows == []
+    assert run_row is None
 
 
-def test_dual_read_zero_row_agreement_records_no_txs(tmp_path, vision_b_server):
+def test_dual_read_zero_row_agreement_cannot_verify_source_absence(tmp_path, vision_b_server):
     _seed_db(tmp_path)
     server = vision_b_server(NO_TXS_OUTPUT)
 
@@ -877,8 +884,12 @@ def test_dual_read_zero_row_agreement_records_no_txs(tmp_path, vision_b_server):
     )
 
     assert outcome.handled
+    assert outcome.decision.status == AGREE
+    assert outcome.decision.raw_row_count == 0
+    assert outcome.metadata.parsed.no_transactions
     assert outcome.inserted == 0
-    assert outcome.progress_key == "no_txs"
+    assert outcome.progress_key == "errors"
+    assert len(server.requests) == 1
     with duckdb.connect(str(tmp_path / "congress.duckdb")) as conn:
         count = conn.execute(
             "SELECT COUNT(*) FROM transactions WHERE doc_id = 'dual-doc'"
@@ -886,8 +897,10 @@ def test_dual_read_zero_row_agreement_records_no_txs(tmp_path, vision_b_server):
         status = conn.execute(
             "SELECT parser_version, status FROM pdf_parse_runs WHERE doc_id = 'dual-doc'"
         ).fetchone()
+        assert conn.execute("SELECT COUNT(*) FROM transaction_versions").fetchone() == (0,)
+    # Two model empty claims do not prove all source pages lack transactions.
     assert count == 0
-    assert status == (DUAL_PARSER_VERSION, "no_txs")
+    assert status is None
 
 
 def test_dual_read_partial_insert_is_never_completed(
@@ -1473,8 +1486,10 @@ def test_visionb_pipeline_stages_and_replays_without_unreviewed_admission(coordi
 
 
 @pytest.mark.parametrize("mode", [None, "gemini"])
-def test_single_engine_default_spends_only_gemini_and_replays_without_reread(coordinated_scope, monkeypatch, capsys, mode):
+def test_single_engine_default_spends_only_gemini_and_replays_unreviewed_candidates(coordinated_scope, monkeypatch, capsys, mode):
     from analyzer import vision_engines
+    from analyzer.ocr import workers
+    from analyzer.ocr.contracts import ExtractionLane, ExtractionOutcome
 
     root = coordinated_scope
     if mode is None:
@@ -1491,14 +1506,38 @@ def test_single_engine_default_spends_only_gemini_and_replays_without_reread(coo
 
     monkeypatch.setattr(gem, "call_gemini", read_a)
     monkeypatch.setattr(vision_engines, "read_document_with_engine_b", lambda *a, **kw: pytest.fail("Gemini mode contacted GLM"))
-    assert ocr_zero_rows.main() == 0
+    assert ocr_zero_rows.main() == 1
     first = json.loads(capsys.readouterr().out)
-    assert first["work"]["by_state"] == {"accepted": 2}
-    assert first["resolved"] == 2
+    assert first["completed_attempts"] == 2
+    assert first["work"]["by_state"] == {"needs_review": 2}
+    assert first["resolved"] == 0
+    assert first["unresolved"] == 2
     assert sorted(calls) == ["a", "b"]
-    assert ocr_zero_rows.main() == 0
-    assert json.loads(capsys.readouterr().out)["completed_attempts"] == 0
+    bundles = {path: path.read_bytes() for path in (root / "pipeline" / "results").glob("*.json")}
+    assert len(bundles) == 2
+    for path in bundles:
+        result = workers.load_result(path)
+        assert result.work.lane == ExtractionLane.GEMINI
+        assert result.outcome == ExtractionOutcome.CANDIDATE
+        assert result.raw_response == output
+        assert result.evidence["output_schema_version"] == 4
+        assert result.rows == gem.parse_gemini_output(output, expected_page_count=1).transactions
+        decision = workers.admission_decision(result, root)
+        assert not decision["allowed"]
+        assert decision["reason"].startswith("grounded API review required:")
+    assert ocr_zero_rows.main() == 1
+    replay = json.loads(capsys.readouterr().out)
+    assert replay["completed_attempts"] == 0
+    assert replay["work"]["by_state"] == {"needs_review": 2}
+    assert replay["resolved"] == 0
+    assert replay["unresolved"] == 2
     assert sorted(calls) == ["a", "b"]
+    assert {path: path.read_bytes() for path in (root / "pipeline" / "results").glob("*.json")} == bundles
+    with Database(root / "congress.duckdb", read_only=True) as db:
+        assert db.conn.execute("SELECT COUNT(*) FROM transactions").fetchone() == (0,)
+        assert db.conn.execute("SELECT COUNT(*) FROM transaction_versions").fetchone() == (0,)
+        assert db.conn.execute("SELECT COUNT(*) FROM pdf_parse_runs").fetchone() == (0,)
+    assert not (root / "progress.json").exists()
 
 
 def test_visionb_quota_leaves_durable_retry_and_unspent_pending_work(coordinated_scope, monkeypatch, capsys):

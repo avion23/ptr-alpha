@@ -178,3 +178,88 @@ class WorkRepository:
         counts = dict(self.conn.execute("SELECT status, COUNT(*) FROM extraction_work GROUP BY status").fetchall())
         return {"total": sum(counts.values()), "by_state": counts,
                 "results": self.conn.execute("SELECT COUNT(*) FROM extraction_results").fetchone()[0]}
+
+    def effective_admission_decision(self, receipt: dict) -> dict:
+        """Follow append-only decisions without rewriting the extraction receipt."""
+        keys = ("result_id", "task_id", "attempt_id", "path")
+        current = {key: receipt[key] for key in keys}
+        seen = set()
+        while True:
+            if current["result_id"] in seen:
+                raise ValueError("Admission decision cycle")
+            seen.add(current["result_id"])
+            row = self.conn.execute("""SELECT state, detail, finished_at FROM extraction_results
+                WHERE result_id = ? AND task_id = ? AND attempt_id = ? AND path = ?""",
+                [current[key] for key in keys]).fetchone()
+            if row is None or row[2] is None:
+                raise ValueError("Admission decision requires a finished exact receipt")
+            successors = self.conn.execute("""SELECT result_id, task_id, attempt_id, path
+                FROM extraction_results WHERE task_id = ? AND attempt_id = ?
+                  AND json_valid(detail)
+                  AND json_extract_string(TRY_CAST(detail AS JSON), '$.kind') = 'admission_decision'
+                  AND json_extract_string(TRY_CAST(detail AS JSON), '$.predecessor.result_id') = ?""",
+                [current["task_id"], current["attempt_id"], current["result_id"]]).fetchall()
+            if not successors:
+                detail = json.loads(row[1]) if row[1] and row[1].startswith("{") else row[1]
+                return {**current, "state": row[0], "detail": detail}
+            if len(successors) != 1:
+                raise ValueError("Conflicting admission decisions")
+            current = dict(zip(keys, successors[0]))
+
+    def append_admission_decision(self, predecessor_receipt: dict, decision: ResultBundle,
+                                  path: str, state: str, detail: dict,
+                                  in_transaction=False) -> dict:
+        """Append an immutable decision and advance only the still-current attempt."""
+        if state not in {"accepted", "verified_empty", "needs_review", "blocked"}:
+            raise ValueError("Unsupported admission decision state")
+        if not isinstance(detail, dict):
+            raise TypeError("Admission decision detail must be a dictionary")
+        expected_outcome = {"accepted": "candidate", "verified_empty": "verified_empty",
+                            "needs_review": "needs_review", "blocked": "blocked"}[state]
+        if decision.outcome.value != expected_outcome:
+            raise ValueError("Decision outcome does not match disposition")
+        from analyzer.ocr.workers import load_result
+
+        if load_result(path) != decision:
+            raise ValueError("Decision does not match its immutable result bundle")
+        predecessor = {key: predecessor_receipt[key]
+                       for key in ("result_id", "task_id", "attempt_id", "path")}
+        identity = hashlib.sha256(_json(decision.to_dict()).encode()).hexdigest()
+        receipt = {"result_id": identity, "task_id": decision.work.task_id,
+                   "attempt_id": decision.work.attempt_id, "path": str(path)}
+        event = _json({"kind": "admission_decision", "predecessor": predecessor,
+                       "decision": decision.to_dict(), "detail": detail})
+        if not in_transaction:
+            self.conn.execute("BEGIN TRANSACTION")
+        try:
+            if self.validate_receipt(predecessor) != decision.work:
+                raise ValueError("Decision does not match predecessor extraction attempt")
+            effective = self.effective_admission_decision(predecessor)
+            current = self.conn.execute("""SELECT attempt_id, result_id, status FROM extraction_work
+                WHERE task_id = ?""", [decision.work.task_id]).fetchone()
+            if current != (decision.work.attempt_id, effective["result_id"], effective["state"]):
+                raise ValueError("Admission scope changed: task has newer work")
+            existing = self.conn.execute("""SELECT task_id, attempt_id, path, state, detail
+                FROM extraction_results WHERE result_id = ?""", [identity]).fetchone()
+            if existing is not None:
+                if (existing != (receipt["task_id"], receipt["attempt_id"], receipt["path"], state, event)
+                        or effective["result_id"] != identity):
+                    raise ValueError("Admission scope changed or decision identity reused")
+            else:
+                if effective["result_id"] != predecessor["result_id"]:
+                    raise ValueError("Admission scope changed: predecessor has a newer decision")
+                self.conn.execute("""INSERT INTO extraction_results
+                    (result_id, task_id, attempt_id, path, state, detail, finished_at)
+                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+                    [identity, receipt["task_id"], receipt["attempt_id"], receipt["path"], state, event])
+                self.conn.execute("""UPDATE extraction_work SET status = ?, detail = ?,
+                    result_id = ?, lease_until = NULL, retry_at = NULL,
+                    updated_at = CURRENT_TIMESTAMP WHERE task_id = ?""",
+                    [state, event, identity, receipt["task_id"]])
+            if not in_transaction:
+                self.conn.execute("COMMIT")
+            return receipt
+        except Exception:
+            if not in_transaction:
+                self.conn.execute("ROLLBACK")
+            raise

@@ -57,6 +57,38 @@ def test_missing_notification_is_resolved(stored):
     assert ops.get_ocr_work_items(db_path=str(path), data_dir=path.parent) == []
 
 
+@pytest.mark.parametrize(
+    ("instrument", "strike"), [("unknown", None), ("call", "100")],
+)
+def test_lossless_cache_matches_persisted_instrument_projection(stored, instrument, strike):
+    path, pdf, digest = stored
+    row = {
+        "asset": "Apple (AAPL)", "type": "Purchase", "date": "01/15/24",
+        "notif_date": "01/20/24", "amount_raw": "$12,345.67", "owner": "SP",
+        "account": None, "instrument_type": instrument, "strike_price": strike,
+        "expiry_date": None, "raw_cells": {"Amount": "$12,345.67", "Owner": "SP"},
+    }
+    output = "SCHEMA: 4\nMEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\nROW: " + json.dumps(row)
+    common.write_cached_response('1', pdf, output, str(path.parent / 'gemini_cache'))
+    parsed = common.parse_gemini_output(output)
+    assert not parsed.legacy_limited
+    assert ops.insert_transactions(
+        '1', 2024, parsed.member, parsed.transactions, db_path=str(path),
+        artifact_sha256=digest, ingestion_generation='g',
+    ) == 1
+    with Database(path) as db:
+        if instrument == "unknown":
+            # Existing canonical rows represent unknown instruments as SQL NULL.
+            db.conn.execute("UPDATE transactions SET instrument_type = NULL WHERE doc_id='1'")
+        persisted = db.conn.execute(
+            "SELECT instrument_type, strike_price, amount_raw, raw_owner FROM transactions WHERE doc_id='1'"
+        ).fetchone()
+    assert persisted == (None if instrument == "unknown" else instrument,
+                         None if strike is None else 100.0, "$12,345.67", "SP")
+    # SQL's unknown -> NULL and DOUBLE coercion must not trigger OCR redispatch.
+    assert ops.get_ocr_work_items(db_path=str(path), data_dir=path.parent) == []
+
+
 def test_null_provenance_is_stale(stored):
     cache_and_insert(stored)
     path, _, _ = stored

@@ -131,7 +131,7 @@ def _current_binding(db: Database, work: WorkEnvelope) -> bool:
 def _ingest(db: Database, result, path: Path, data_dir: Path, source) -> str:
     from analyzer.ocr.ingestion import insert_transactions_outcome
     from analyzer.ocr.normalization import normalize_candidate
-    from analyzer.ocr.workers import admission_decision
+    from analyzer.ocr.workers import admission_decision, admission_guard
 
     work = result.work
     receipt = dict(task_id=work.task_id, attempt_id=work.attempt_id,
@@ -181,49 +181,52 @@ def _ingest(db: Database, result, path: Path, data_dir: Path, source) -> str:
         existing = glm_stage.load_staging_record(data_dir, work.archive_year, work.doc_id)
         if existing is None or glm_stage.audit_staged_record_sha256(existing) != glm_stage.audit_staged_record_sha256(record):
             glm_stage.publish_staging_record(data_dir, record)
-    gate = admission_decision(result, data_dir)
-    local_uncertain = (work.lane == ExtractionLane.LOCAL
-                       and result.evidence.get("artifact_verified") is True
-                       and result.evidence.get("failure", {}).get("type") == "ParserCascadeError")
-    # Deterministic rows already have the local cascade schema, not the OCR
-    # schema. _save_parse_results owns their existing complete-rowset
-    # consolidation/validation, so do not OCR-normalize them a second time.
-    local_candidate = (work.lane == ExtractionLane.LOCAL
-                       and result.outcome == ExtractionOutcome.CANDIDATE and bool(result.rows))
-    candidate = None if local_candidate else normalize_candidate(work, result)
-    status = result.outcome.value if candidate is None else candidate["status"]
-    if not gate["allowed"] or status not in {"candidate", "verified_empty"}:
-        permanent = ((status == "blocked" or result.outcome == ExtractionOutcome.BLOCKED)
-                     and not local_uncertain) or gate["reason"] in {
-            "extraction recipe changed", "artifact verification evidence missing"}
-        disposition = "blocked" if permanent else "needs_review"
-        db.work.finish(receipt, disposition, result.detail or gate["reason"] or str(candidate["findings"] if candidate else []))
-        return disposition
-    if local_candidate:
-        source._save_parse_results(
-            work.archive_year,
-            [(Path(work.artifact_path),
-              result.rows, result.evidence.get("engines", []))],
-            {work.doc_id: {"First": work.member, "Last": "", "FilingDate": work.filing_date}},
-            work.generation_id, recipe=work.extraction_recipe, receipt=receipt,
-        )
-    else:
-        from analyzer.ocr.common import MODEL
+    # Publish staging before entering the guard: publication takes the document
+    # lock itself. The guard rechecks the exact staged record and holds audit
+    # authorization through normalization and the atomic canonical receipt.
+    with admission_guard(result, data_dir) as gate:
+        local_uncertain = (work.lane == ExtractionLane.LOCAL
+                           and result.evidence.get("artifact_verified") is True
+                           and result.evidence.get("failure", {}).get("type") == "ParserCascadeError")
+        # Deterministic rows already have the local cascade schema, not the OCR
+        # schema. _save_parse_results owns their existing complete-rowset
+        # consolidation/validation, so do not OCR-normalize them a second time.
+        local_candidate = (work.lane == ExtractionLane.LOCAL
+                           and result.outcome == ExtractionOutcome.CANDIDATE and bool(result.rows))
+        candidate = None if local_candidate else normalize_candidate(work, result)
+        status = result.outcome.value if candidate is None else candidate["status"]
+        if not gate["allowed"] or status not in {"candidate", "verified_empty"}:
+            permanent = ((status == "blocked" or result.outcome == ExtractionOutcome.BLOCKED)
+                         and not local_uncertain) or gate["reason"] in {
+                "extraction recipe changed", "artifact verification evidence missing"}
+            disposition = "blocked" if permanent else "needs_review"
+            db.work.finish(receipt, disposition, result.detail or gate["reason"] or str(candidate["findings"] if candidate else []))
+            return disposition
+        if local_candidate:
+            source._save_parse_results(
+                work.archive_year,
+                [(Path(work.artifact_path),
+                  result.rows, result.evidence.get("engines", []))],
+                {work.doc_id: {"First": work.member, "Last": "", "FilingDate": work.filing_date}},
+                work.generation_id, recipe=work.extraction_recipe, receipt=receipt,
+            )
+        else:
+            from analyzer.ocr.common import MODEL
 
-        model = ("visionb/" + str(result.evidence.get("staging_record", {}).get("model", "glm"))
-                 if work.lane == ExtractionLane.GLM else MODEL)
-        insert_transactions_outcome(
-            work.doc_id, work.archive_year, work.member, candidate["rows"],
-            conn=db.conn, receipt=receipt, evidence=result.evidence,
-            raw_count=len(result.rows), parser_version=work.extraction_recipe,
-            artifact_sha256=work.artifact_sha256, ingestion_generation=work.generation_id,
-            engine_model=model, checkpoint=False,
-        )
-    row = db.conn.execute("SELECT state FROM extraction_results WHERE result_id = ?",
-                          [receipt["result_id"]]).fetchone()
-    if not db.work.is_finished(receipt):
-        raise RuntimeError("canonical persistence did not atomically finish its result receipt")
-    return row[0]
+            model = ("visionb/" + str(result.evidence.get("staging_record", {}).get("model", "glm"))
+                     if work.lane == ExtractionLane.GLM else MODEL)
+            insert_transactions_outcome(
+                work.doc_id, work.archive_year, work.member, candidate["rows"],
+                conn=db.conn, receipt=receipt, evidence=result.evidence,
+                raw_count=len(result.rows), parser_version=work.extraction_recipe,
+                artifact_sha256=work.artifact_sha256, ingestion_generation=work.generation_id,
+                engine_model=model, checkpoint=False,
+            )
+        row = db.conn.execute("SELECT state FROM extraction_results WHERE result_id = ?",
+                              [receipt["result_id"]]).fetchone()
+        if not db.work.is_finished(receipt):
+            raise RuntimeError("canonical persistence did not atomically finish its result receipt")
+        return row[0]
 
 
 def run_pipeline(

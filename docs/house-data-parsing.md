@@ -123,6 +123,12 @@ The optional Gemini pass is separate. It targets unresolved deterministic parses
 
 Ticker extraction is intentionally conservative. Company-name fallback mappings and parser-artifact mappings are not equivalent to exchange verification; downstream candidate selection also applies asset and provenance checks.
 
+House transaction IDs preceding an explicit owner code are row metadata, not
+part of the asset name. Trailing `[Account: ...]` annotations remain available
+as provenance but cannot supply an asset ticker or override transaction identity.
+The `v7-deterministic-row-context` recipe uses a new cache fingerprint; earlier
+terminal parses are not evidence that this changed recipe reproduced their rows.
+
 ## Consolidation and persistence
 
 `consolidate_transactions()` joins parsed document IDs to House metadata, assigns member/disclosure identity, normalizes dates, and rejects impossible rows.

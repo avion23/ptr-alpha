@@ -37,7 +37,7 @@ from analyzer.parsing.cascade import (
 )
 
 logger = logging.getLogger(__name__)
-PARSE_VERSION = "v6-deterministic-context"
+PARSE_VERSION = "v7-deterministic-row-context"
 
 
 def _invalid_consolidated_house_docs(df: pd.DataFrame) -> dict[str, list[str]]:

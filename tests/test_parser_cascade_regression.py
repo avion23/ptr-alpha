@@ -121,6 +121,13 @@ class TestTickerMetadataContamination(unittest.TestCase):
         self.assertEqual(extract_ticker("Unlisted issuer (RILA)"), "RILA")
         self.assertIsNone(extract_ticker("Series 2025 (2025)"))
         self.assertIsNone(extract_ticker("Asset [Account: Owner: SP]"))
+        account = " [Account: Registered Index Linked Annuity (RILA)]"
+        for asset in ("Prudential RILA", "Apple (AAPL)"):
+            with self.subTest(asset=asset):
+                self.assertEqual(
+                    parser_cascade._transaction_identity(tx(asset + account)),
+                    parser_cascade._transaction_identity(tx(asset)),
+                )
 
 
 class TestPdftotextLayoutRepair(unittest.TestCase):

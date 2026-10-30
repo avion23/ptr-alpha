@@ -295,7 +295,7 @@ def test_parse_persistence_records_house_provenance_and_artifact_hash(tmp_path):
     assert stored["ingestion_generation"] == "legacy-untracked-2021"
     assert stored["official_filing_date"].date() == date(2021, 1, 3)
     assert stored["artifact_sha256"] == hashlib.sha256(pdf_bytes).hexdigest()
-    assert parse_run == ("v6-deterministic-context", "success", 1, 1)
+    assert parse_run == ("v7-deterministic-row-context", "success", 1, 1)
 
 
 
@@ -344,7 +344,7 @@ def test_zero_output_parse_preserves_stale_house_and_ocr_rows(tmp_path):
             """
             SELECT status, raw_row_count, transaction_count
             FROM pdf_parse_runs
-            WHERE doc_id = 'zero' AND parser_version = 'v6-deterministic-context'
+            WHERE doc_id = 'zero' AND parser_version = 'v7-deterministic-row-context'
             """
         ).fetchone()
     finally:
@@ -612,14 +612,14 @@ def test_parser_recipe_cache_policy_retains_only_explicit_legacy_materialization
         if reuse:
             assert db.conn.execute("SELECT * FROM transactions WHERE doc_id = 'legacy'").fetchall() == before_rows
             assert db.conn.execute("SELECT * FROM pdf_parse_runs WHERE doc_id = 'legacy'").fetchall() == before_runs
-            assert "count=1 original_producer=v5-deterministic current_producer=v6-deterministic-context" in caplog.text
+            assert "count=1 original_producer=v5-deterministic current_producer=v7-deterministic-row-context" in caplog.text
             assert "not corrected or reproduced" in caplog.text
         assert f"year=2026 producer={PARSE_VERSION} force={force}" in caplog.text
         assert f"PTR_REUSE_LEGACY_V5_CACHE_YEAR={opt_in} legacy_reuse={reuse}" in caplog.text
         for doc in expected:
             assert db.conn.execute(
                 "SELECT status FROM pdf_parse_runs WHERE doc_id = ? AND parser_version = ?",
-                [doc, "v6-deterministic-context"],
+                [doc, "v7-deterministic-row-context"],
             ).fetchall() == [("success",)]
             stored = db.get_transactions_for_doc(doc)
             assert stored["notification_date"].eq(pd.Timestamp("2026-09-30")).any()
@@ -856,7 +856,7 @@ def test_failed_reparse_preserves_terminal_run_rows_and_generation_audit(
             SELECT status, transaction_count
             FROM pdf_parse_runs
             WHERE doc_id = 'stable'
-              AND parser_version = 'v6-deterministic-context'
+              AND parser_version = 'v7-deterministic-row-context'
               AND artifact_sha256 = ?
               AND ingestion_generation = ?
             """,

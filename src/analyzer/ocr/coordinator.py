@@ -18,6 +18,7 @@ from uuid import uuid4
 from analyzer.exceptions import DataSourceError
 from analyzer.ocr.contracts import ExtractionLane, ExtractionOutcome, WorkEnvelope, task_key
 from analyzer.persistence.database import Database
+from analyzer.persistence.ownership import assert_publication_allowed
 
 
 def _scope(db: Database, years: list[int] | None) -> list[dict]:
@@ -272,6 +273,7 @@ def run_pipeline(
     A provider retry never consumes another provider's slots. Unresolved local
     results may escalate to configured API lanes; a retry is not an escalation.
     """
+    assert_publication_allowed(Path(data_dir) / "congress.duckdb")
     from analyzer.download import HouseTransactionSource
     from analyzer.ocr.workers import extract_document, extraction_recipe, load_result
     from analyzer.settings import Settings

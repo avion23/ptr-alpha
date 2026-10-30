@@ -112,6 +112,34 @@ def test_coherent_wrong_checkbox_claim_is_not_source_verification(candidate):
     assert db.conn.execute('SELECT COUNT(*) FROM transactions').fetchone() == (0,)
 
 
+@pytest.mark.parametrize('partial_detection', [False, True])
+def test_offline_grid_observations_cannot_authorize_api_admission(candidate, monkeypatch, partial_detection):
+    import sys
+    from scripts import house_grid_evidence
+
+    _, result, root = candidate
+    output = root / 'offline-observations'
+    monkeypatch.setattr(sys, 'argv', ['house_grid_evidence', result.work.artifact_path, str(output)])
+    monkeypatch.setattr(house_grid_evidence, '_orient_image', lambda image, _: image)
+    if partial_detection:
+        # Even successful local detector observations are not an all-fields review.
+        monkeypatch.setattr(house_grid_evidence, 'analyze_page', lambda *args: {
+            'status': 'partial_evidence', 'rows': [{'disposition': 'marked_row_not_certified_transaction',
+            'fields': {'direction': {'state': 'observed', 'value': 'PURCHASE'}}}],
+        })
+    code = house_grid_evidence.main()
+    observations = json.loads((output / 'evidence.json').read_text())
+    assert code == (0 if partial_detection else 2)
+    assert observations['status'] == ('partial_evidence_only' if partial_detection else 'unknown')
+    assert observations['approval'] is False
+    assert observations['artifact_sha256'] == result.work.artifact_sha256
+    assert len(observations['pages']) == 1
+    review.prepare_review(result, root)
+    with pytest.raises(ValueError, match='exact frozen candidate'):
+        review.record_review(result, root, observations, verdict='pass', human_reviewed=True)
+    assert not workers.admission_decision(result, root)['allowed']
+
+
 @pytest.mark.parametrize("missing", ["pages", "rows", "critical_fields", "omissions", "evidence", "binding", "policy"])
 def test_positive_review_requires_exact_binding_and_complete_source_coverage(candidate, missing):
     _, result, root = candidate

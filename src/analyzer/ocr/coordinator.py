@@ -238,6 +238,7 @@ def run_pipeline(
     """
     from analyzer.download import HouseTransactionSource
     from analyzer.ocr.workers import extract_document, extraction_recipe, load_result
+    from analyzer.persistence.ownership import publication_state
     from analyzer.settings import Settings
 
     capacities = {ExtractionLane.LOCAL: local_workers, ExtractionLane.GEMINI: gemini_workers,
@@ -257,6 +258,18 @@ def run_pipeline(
         source = HouseTransactionSource(settings, db=db)
         with ExitStack() as stack:
             stack.callback(source.close)
+            def publication_signature(conn=None):
+                conn = db.conn if conn is None else conn
+                return (conn.execute("SELECT COUNT(*), MAX(updated_at) FROM extraction_work").fetchone(),
+                        conn.execute("SELECT COUNT(*), MAX(finished_at) FROM extraction_results").fetchone(),
+                        conn.execute("SELECT archive_year, generation_id, parse_status FROM house_archive_generations ORDER BY 1, 2").fetchall())
+
+            publication = publication_state(db.db_path)
+            published_signature = None
+            if publication["published"]:
+                with Database(publication["path"], read_only=True) as reader:
+                    published_signature = publication_signature(reader.conn)
+            published_before_dispatch = False
             scope = _scope(db, years)
             scoped = {(s["archive_year"], s["generation_id"], s["doc_id"]): s for s in scope}
             known_years = {int(r[0]) for r in db.conn.execute(
@@ -348,13 +361,6 @@ def run_pipeline(
                     ORDER BY w.priority DESC, w.task_id LIMIT ?
                 """, [lane.value, recipes[lane], sorted({s["archive_year"] for s in scope}), limit]).fetchall()
 
-            def publication_signature():
-                return (db.conn.execute("SELECT COUNT(*), MAX(updated_at) FROM extraction_work").fetchone(),
-                        db.conn.execute("SELECT COUNT(*), MAX(finished_at) FROM extraction_results").fetchone(),
-                        db.conn.execute("SELECT archive_year, generation_id, parse_status FROM house_archive_generations ORDER BY 1, 2").fetchall())
-
-            publication = db.publish_snapshot()
-            published_signature = publication_signature()
             pools = {}
             for lane in lanes:
                 if lane == ExtractionLane.LOCAL:
@@ -387,6 +393,11 @@ def run_pipeline(
                     # One bounded rolling window across all years, replenished
                     # after every completion rather than after a batch barrier.
                     for (task_id,) in ready(lane, free):
+                        if not published_before_dispatch:
+                            if publication_signature() != published_signature:
+                                publication = db.publish_snapshot()
+                                published_signature = publication_signature()
+                            published_before_dispatch = True
                         work = db.work.claim(task_id, lease_seconds=lease_seconds)
                         running[pools[lane].submit(extract_document, work, str(spool))] = work
                 if not running:

@@ -3,6 +3,7 @@ import runpy
 import subprocess
 import sys
 from datetime import date
+from pathlib import Path
 
 import pytest
 
@@ -11,7 +12,7 @@ from analyzer.ocr import common as common
 from analyzer.ocr import ingestion as ops
 from analyzer.ocr import runner
 from analyzer.persistence.database import Database
-from .conftest import make_ocr_output
+from .conftest import make_ocr_output, make_text_pdf
 
 
 @pytest.fixture(autouse=True)
@@ -29,8 +30,9 @@ def forbid_network(monkeypatch):
 def stored(tmp_path, monkeypatch):
     path = tmp_path / 'congress.duckdb'
     pdf = tmp_path / '2024' / 'pdfs' / '1.pdf'
-    pdf.parent.mkdir(parents=True)
-    pdf.write_bytes(b'pdf')
+    make_text_pdf(pdf, ["HOUSE PTR - Jane Doe - Filed 02/01/2024",
+                        "Asset | Type | Trade Date | Notification Date | Amount | Owner",
+                        "Apple (AAPL) | Purchase | 01/15/24 | 01/20/24 | $12,345.67 | SP"])
     monkeypatch.setattr(common, 'pdf_page_count', lambda _: 1)
     digest = common.pdf_sha256(pdf)
     db = Database(path)
@@ -44,11 +46,42 @@ def stored(tmp_path, monkeypatch):
 
 
 def cache_and_insert(stored, notification='01/20/24'):
+    from analyzer.ocr import coordinator, review, workers
+    from analyzer.ocr.contracts import ExtractionLane, ExtractionOutcome, ResultBundle
+
     path, pdf, digest = stored
-    output = f'MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\nApple (AAPL) | Purchase | 01/15/24 | {notification} | A'
+    notification = None if notification == 'N/A' else notification
+    make_text_pdf(pdf, ["HOUSE PTR - Jane Doe - Filed 02/01/2024",
+                        "Asset | Type | Trade Date | Notification Date | Amount | Owner",
+                        f"Apple (AAPL) | Purchase | 01/15/24 | {notification or ''} | $12,345.67 | SP"])
+    digest = common.pdf_sha256(pdf)
+    output = make_ocr_output(asset="Apple (AAPL)", notif_date=notification)
     common.write_cached_response('1', pdf, output, str(path.parent / 'gemini_cache'))
     parsed = common.parse_gemini_output(output)
-    ops.insert_transactions('1', 2024, parsed.member, parsed.transactions, db_path=str(path), artifact_sha256=digest, ingestion_generation='g')
+    with Database(path) as db:
+        db.conn.execute("UPDATE house_pdf_artifacts SET artifact_sha256=? WHERE doc_id='1'", [digest])
+        work = coordinator._envelope(dict(archive_year=2024, generation_id='g', doc_id='1',
+                                         artifact_sha256=digest, first_name='Jane', last_name='Doe', filing_date='2024-02-01'),
+                                     path.parent, ExtractionLane.GEMINI, workers.extraction_recipe(ExtractionLane.GEMINI))
+        db.work.register(work)
+        work = db.work.claim(work.task_id)
+        result = ResultBundle(work, ExtractionOutcome.CANDIDATE, parsed.transactions, output, {
+            "artifact_verified": True, "output_schema_version": 4, "page_count": 1,
+            "page_outcomes": [{"page_number": 1, "outcome": "transactions"}],
+        })
+        review.prepare_review(result, path.parent)
+        report = review.review_report_template(result)
+        projection, = review.review_material(result)["projection"]
+        assert (projection["ticker"], projection["transaction_type"], projection["transaction_date"],
+                projection["notification_date"], projection["amount_raw"], projection["owner_code"]) == (
+                    "AAPL", "Purchase", "2024-01-15", "2024-01-20" if notification else None, "$12,345.67", "SP")
+        report["evidence"] = "Unit oracle: synthetic Jane Doe House PTR filed 02/01/24, one Apple row."
+        report["pages"][0].update(outcome="transactions", evidence="Entire page has only the declared Apple row; no examples or omissions.")
+        report["rows"][0]["evidence"] = f"Apple (AAPL), Purchase, 01/15/24, notification {notification or 'blank'}, $12,345.67, SP; no option or instrument terms."
+        report["omissions_checked"] = True
+        review.record_review(result, path.parent, report, verdict="pass", human_reviewed=True)
+        result_path = workers._publish(result, str(path.parent / 'pipeline'))
+        assert coordinator._ingest(db, result, Path(result_path), path.parent, None) == "accepted"
 
 
 @pytest.mark.parametrize(
@@ -72,13 +105,15 @@ def test_success_requires_valid_source_response(stored, monkeypatch, raw):
 def test_missing_notification_is_resolved(stored):
     cache_and_insert(stored, 'N/A')
     path, _, _ = stored
-    assert ops.get_ocr_work_items(db_path=str(path), data_dir=path.parent) == []
+    with Database(path) as db:
+        assert db.get_unresolved_house_doc_ids(2024, 'g') == []
+        assert db.conn.execute("SELECT notification_date FROM transactions").fetchall() == [(None,)]
 
 
 @pytest.mark.parametrize(
     ("instrument", "strike"), [("unknown", None), ("call", "100")],
 )
-def test_lossless_cache_matches_persisted_instrument_projection(stored, instrument, strike):
+def test_lossless_cache_matches_typed_instrument_projection(stored, instrument, strike):
     path, pdf, digest = stored
     row = {
         "asset": "Apple (AAPL)", "type": "Purchase", "date": "01/15/24",
@@ -90,21 +125,20 @@ def test_lossless_cache_matches_persisted_instrument_projection(stored, instrume
     common.write_cached_response('1', pdf, output, str(path.parent / 'gemini_cache'))
     parsed = common.parse_gemini_output(output)
     assert not parsed.legacy_limited
-    assert ops.insert_transactions(
-        '1', 2024, parsed.member, parsed.transactions, db_path=str(path),
-        artifact_sha256=digest, ingestion_generation='g',
-    ) == 1
-    with Database(path) as db:
-        if instrument == "unknown":
-            # Existing canonical rows represent unknown instruments as SQL NULL.
-            db.conn.execute("UPDATE transactions SET instrument_type = NULL WHERE doc_id='1'")
-        persisted = db.conn.execute(
-            "SELECT instrument_type, strike_price, amount_raw, raw_owner FROM transactions WHERE doc_id='1'"
-        ).fetchone()
-    assert persisted == (None if instrument == "unknown" else instrument,
-                         None if strike is None else 100.0, "$12,345.67", "SP")
-    # SQL's unknown -> NULL and DOUBLE coercion must not trigger OCR redispatch.
-    assert ops.get_ocr_work_items(db_path=str(path), data_dir=path.parent) == []
+    from analyzer.ocr.normalization import canonical_row_projection, normalize_rows
+    typed, findings = normalize_rows('1', parsed.member, parsed.transactions, '2024-02-01', 'Jane Doe', digest)
+    assert not findings
+    normalized, errors = ops._normalize_ocr_rows('1', parsed.member, typed, date(2024, 2, 1),
+                                                artifact_sha256=digest, ingestion_generation='g')
+    assert not errors
+    projected, = normalized
+    assert (projected['instrument_type'], projected['strike_price'], projected['amount_raw'], projected['raw_owner']) == (
+        instrument, None if strike is None else 100.0, "$12,345.67", "SP")
+    sql_unknown = {**projected, 'instrument_type': None if instrument == 'unknown' else instrument}
+    assert canonical_row_projection(sql_unknown) == canonical_row_projection(projected)
+    # A faithful projection alone still does not authorize publication.
+    assert ops.insert_transactions('1', 2024, parsed.member, parsed.transactions, db_path=str(path),
+                                   artifact_sha256=digest, ingestion_generation='g') == 0
 
 
 def test_null_provenance_is_stale(stored):
@@ -116,58 +150,34 @@ def test_null_provenance_is_stale(stored):
     assert len(ops.get_ocr_work_items(db_path=str(path), data_dir=path.parent)) == 1
 
 
-def test_semantic_zero_retires_exact_artifact(stored):
+def test_unreviewed_semantic_zero_preserves_exact_artifact(stored):
     cache_and_insert(stored)
     path, _, digest = stored
     ops.insert_transactions('1', 2024, 'Jane Doe', [], raw_count=1, db_path=str(path), artifact_sha256=digest, ingestion_generation='g')
     db = Database(path)
     try:
-        assert db.conn.execute('SELECT COUNT(*) FROM transactions').fetchone()[0] == 0
+        assert db.conn.execute('SELECT COUNT(*) FROM transactions').fetchone()[0] == 1
     finally:
         db.close()
 
 
-@pytest.mark.parametrize("insert_fails", [True, False])
-def test_insertion_preserves_primary_failure_and_always_closes(stored, monkeypatch, insert_fails):
+@pytest.mark.parametrize("admission", [None, {"allowed": True, "review_binding": {"human_reviewed": True}}])
+def test_unreviewed_insertion_refuses_before_opening_a_writer(stored, monkeypatch, admission):
     path, _, digest = stored
-    connect = ops.duckdb.connect
-    closed = []
-    drops = []
 
-    class FaultyConnection:
-        def __init__(self):
-            self.conn = connect(str(path))
+    def forbidden(*args, **kwargs):
+        raise AssertionError("unreviewed API input opened a writer")
 
-        def execute(self, sql, *args):
-            if sql.startswith("INSERT INTO staging_gemini_ocr_transactions") and insert_fails:
-                raise ValueError("primary insert failure")
-            if sql.startswith("DROP TABLE IF EXISTS staging_gemini_ocr_transactions"):
-                drops.append(sql)
-                if len(drops) > 1:
-                    raise RuntimeError("drop failure")
-            return self.conn.execute(sql, *args)
-
-        def close(self):
-            closed.append(True)
-            self.conn.close()
-            raise RuntimeError("close failure")
-
-    def failed_record(*args, **kwargs):
-        raise RuntimeError("record failure")
-
-    monkeypatch.setattr(ops.duckdb, "connect", lambda _: FaultyConnection())
-    monkeypatch.setattr(ops, "record_failed_ocr_attempt", failed_record)
+    monkeypatch.setattr(ops.duckdb, "connect", forbidden)
     parsed = common.parse_gemini_output(
         "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
         "Apple (AAPL) | Purchase | 01/15/24 | 01/20/24 | A"
     )
-    error, message = (ValueError, "primary insert failure") if insert_fails else (RuntimeError, "drop failure")
-    with pytest.raises(error, match=message):
-        ops.insert_transactions_outcome(
-            "1", 2024, parsed.member, parsed.transactions,
-            db_path=str(path), artifact_sha256=digest, ingestion_generation="g",
-        )
-    assert closed == [True]
+    outcome = ops.insert_transactions_outcome(
+        "1", 2024, parsed.member, parsed.transactions,
+        db_path=str(path), artifact_sha256=digest, ingestion_generation="g", admission=admission,
+    )
+    assert outcome.status == 'needs_review'
 
 
 def _partial_transactions():
@@ -204,10 +214,12 @@ def test_partial_ocr_is_retained_but_canonical_commit_is_blocked(stored):
         ingestion_generation="g",
     )
 
-    assert outcome.status == "partial"
-    assert outcome.inserted == 0 and outcome.expected == 2
+    assert outcome.status == "needs_review"
+    assert outcome.inserted == 0
     assert outcome.committed is False and outcome.complete is False
-    assert outcome.rejections == {"date_out_of_window": 1}
+    # Deterministic negative validation remains independent of publication authority.
+    _, findings = common.validate_transactions('1', member, transactions, date(2024, 2, 1), 'Jane Doe')
+    assert findings == {"date_out_of_window": 1}
     db = Database(path)
     try:
         assert db.conn.execute(
@@ -218,14 +230,8 @@ def test_partial_ocr_is_retained_but_canonical_commit_is_blocked(stored):
             "WHERE doc_id='1' AND parser_version=?",
             [ops.GEMINI_PARSER_VERSION],
         ).fetchone()
-        assert run[0:2] == ("partial", 0)
-        assert "canonical commit blocked" in run[2]
-        retained = db.conn.execute(
-            "SELECT transactions_json::VARCHAR, rejections_json::VARCHAR "
-            "FROM ocr_partial_results WHERE doc_id='1'"
-        ).fetchone()
-        assert "Microsoft (MSFT)" in retained[0] and "Bad date row" in retained[0]
-        assert json.loads(retained[1]) == {"date_out_of_window": 1}
+        assert run is None  # No unauthorised direct call may retag an accepted parse run.
+        assert 'ocr_partial_results' not in {row[0] for row in db.conn.execute('SHOW TABLES').fetchall()}
     finally:
         db.close()
 
@@ -236,7 +242,7 @@ def test_partial_ocr_is_retained_but_canonical_commit_is_blocked(stored):
     ]
 
 
-def test_partial_canonical_override_is_loud_and_still_incomplete(stored, capsys):
+def test_partial_canonical_override_cannot_bypass_operator_review(stored, capsys):
     path, _, digest = stored
     member, transactions = _partial_transactions()
     outcome = ops.insert_transactions_outcome(
@@ -250,27 +256,20 @@ def test_partial_canonical_override_is_loud_and_still_incomplete(stored, capsys)
         ingestion_generation="g",
         force_partial_canonical=True,
     )
-    assert "WARNING: --force-partial-canonical" in capsys.readouterr().out
-    assert outcome.status == "partial" and outcome.committed
+    assert "FORCED" not in capsys.readouterr().out
+    assert outcome.status == "needs_review" and not outcome.committed
     assert not outcome.complete
     db = Database(path)
     try:
         assert db.conn.execute(
             "SELECT ticker FROM transactions WHERE doc_id='1' AND source='gemini_ocr'"
-        ).fetchall() == [("MSFT",)]
+        ).fetchall() == []
         assert db.conn.execute(
             "SELECT status, error_message FROM pdf_parse_runs WHERE doc_id='1' "
             "AND parser_version=?",
             [ops.GEMINI_PARSER_VERSION],
-        ).fetchone()[0] == "success"
-        assert "FORCED PARTIAL CANONICAL COMMIT" in db.conn.execute(
-            "SELECT error_message FROM pdf_parse_runs WHERE doc_id='1' "
-            "AND parser_version=?",
-            [ops.GEMINI_PARSER_VERSION],
-        ).fetchone()[0]
-        assert db.conn.execute(
-            "SELECT COUNT(*) FROM ocr_partial_results WHERE doc_id='1'"
-        ).fetchone()[0] == 1
+        ).fetchone() is None
+        assert 'ocr_partial_results' not in {row[0] for row in db.conn.execute('SHOW TABLES').fetchall()}
     finally:
         db.close()
 
@@ -282,7 +281,7 @@ def test_ocr_mutations_preserve_accepted_historical_rows(stored, mutation):
     db = Database(path)
     db.conn.execute("UPDATE house_archive_generations SET promoted_at='2024-02-01'")
     db.conn.execute("UPDATE transactions SET created_at='2024-02-02'")
-    db.conn.execute("UPDATE pdf_parse_runs SET parsed_at='2024-02-03'")
+    db.conn.execute("UPDATE pdf_parse_runs SET parsed_at='2024-02-03',rowset_created_at='2024-02-02' WHERE status='success'")
     with db.canonical_as_of(date(2024, 3, 1)):
         assert db.get_transactions(2024).ticker.tolist() == ["AAPL"]
     db.close()
@@ -300,8 +299,8 @@ def test_ocr_mutations_preserve_accepted_historical_rows(stored, mutation):
             assert db.get_transactions(2024).ticker.tolist() == ["AAPL"]
         # Initialization's NULL-owner normalization is now versioned as well;
         # assert the actual accepted pre-OCR version, not unrelated migrations.
-        assert db.conn.execute("SELECT COUNT(*) FROM transaction_versions WHERE created_at='2024-02-02'").fetchone()[0] == 1
-        assert db.conn.execute("SELECT COUNT(*) FROM parse_run_versions").fetchone()[0] >= 1
+        assert db.conn.execute("SELECT ticker FROM transactions WHERE created_at='2024-02-02'").fetchall() == [('AAPL',)]
+        assert db.conn.execute("SELECT COUNT(*) FROM transaction_versions WHERE created_at='2024-02-02'").fetchone()[0] == 0
     finally:
         db.close()
 
@@ -371,13 +370,11 @@ def test_parenthetical_ticker_retains_provenance(stored, asset, expected):
     path, _, digest = stored
     parsed = common.parse_gemini_output(
         f'MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n{asset} | Purchase | 01/15/24 | N/A | A')
-    assert ops.insert_transactions('1', 2024, parsed.member, parsed.transactions,
-        db_path=str(path), artifact_sha256=digest, ingestion_generation='g') == 1
-    db = Database(path)
-    try:
-        assert db.conn.execute('SELECT ticker, raw_ticker, ticker_candidate, ticker_origin FROM transactions').fetchone() == expected
-    finally:
-        db.close()
+    rows, errors = ops._normalize_ocr_rows('1', parsed.member, parsed.transactions, date(2024, 2, 1),
+                                         artifact_sha256=digest, ingestion_generation='g')
+    assert not errors
+    row, = rows
+    assert tuple(row[key] for key in ('ticker', 'raw_ticker', 'ticker_candidate', 'ticker_origin')) == expected
 
 
 @pytest.mark.parametrize('name,expected', [('John A. Smith', 'JOHN A SMITH'),
@@ -468,8 +465,8 @@ def test_runner_admission_requires_bound_physical_page_coverage(stored, monkeypa
     metadata = common.ArtifactMetadata(digest, metadata_pages, len(pdf.read_bytes()), str(pdf), parsed)
     monkeypatch.setattr(common, 'call_gemini', lambda *args, **kwargs: (output, '', metadata))
     summary = runner.run_gemini_ocr_for_year(2024, str(path.parent))
-    assert summary['unresolved'] == (0 if metadata_pages == 1 else 1)
-    assert summary['work']['by_state'] == {'accepted' if metadata_pages == 1 else 'blocked': 1}
+    assert summary['unresolved'] == 1
+    assert summary['work']['by_state'] == {'needs_review' if metadata_pages == 1 else 'blocked': 1}
     from analyzer.ocr.workers import load_result
     bundle = load_result(next((path.parent / 'pipeline' / 'results').glob('*.json')))
     assert bundle.evidence['page_count'] == 1
@@ -480,6 +477,9 @@ def test_runner_admission_requires_bound_physical_page_coverage(stored, monkeypa
 @pytest.mark.parametrize("failure", ["member", "page_binding", "artifact_binding"])
 def test_year_runner_validation_failure_preserves_accepted_rows(stored, monkeypatch, failure):
     cache_and_insert(stored)
+    from analyzer.ocr import workers
+    recipe = workers.extraction_recipe
+    monkeypatch.setattr(workers, 'extraction_recipe', lambda lane: recipe(lane) + ':fresh-fixture')
     path, pdf, digest = stored
     member = 'Other Person' if failure == 'member' else 'Jane Doe'
     output = make_ocr_output(member=member)
@@ -490,7 +490,7 @@ def test_year_runner_validation_failure_preserves_accepted_rows(stored, monkeypa
     )
     monkeypatch.setattr(common, 'call_gemini', lambda *args, **kwargs: (output, '', metadata))
     summary = runner.run_gemini_ocr_for_year(2024, str(path.parent), refresh=True)
-    assert summary['work']['by_state'] == {'needs_review' if failure == 'member' else 'blocked': 1}
+    assert summary['work']['by_state'] == {'accepted': 1, 'needs_review' if failure == 'member' else 'blocked': 1}
     db = Database(path)
     try:
         assert db.conn.execute('SELECT COUNT(*) FROM transactions').fetchone()[0] == 1
@@ -503,6 +503,9 @@ def test_fresh_legacy_provider_response_requires_review_without_upgrading_publis
     from analyzer.ocr.workers import load_result
 
     cache_and_insert(stored)  # An old trusted materialization remains valid history.
+    from analyzer.ocr import workers
+    recipe = workers.extraction_recipe
+    monkeypatch.setattr(workers, 'extraction_recipe', lambda lane: recipe(lane) + ':fresh-fixture')
     path, pdf, digest = stored
     with Database(path) as db:
         original = db.conn.execute("SELECT * FROM transactions").fetchall()
@@ -518,10 +521,11 @@ def test_fresh_legacy_provider_response_requires_review_without_upgrading_publis
     for index in range(2):
         summary = runner.run_gemini_ocr_for_year(2024, str(path.parent), refresh=True)
         assert summary['completed_attempts'] == (1 if index == 0 else 0)
-        assert summary['work']['by_state'] == {'needs_review': 1}
+        assert summary['work']['by_state'] == {'accepted': 1, 'needs_review': 1}
         assert summary['unresolved'] == 0  # The earlier accepted materialization is not erased.
     assert calls == ['1']
-    bundle = load_result(next((path.parent / 'pipeline' / 'results').glob('*.json')))
+    bundle, = [item for item in (load_result(p) for p in (path.parent / 'pipeline' / 'results').glob('*.json'))
+               if item.raw_response == legacy]
     normalized = normalize_candidate(bundle.work, bundle)
     assert normalized['legacy_limited']
     assert normalized['findings']['obsolete_output_schema'] == 1
@@ -530,7 +534,7 @@ def test_fresh_legacy_provider_response_requires_review_without_upgrading_publis
     assert bundle.rows == parsed.transactions
     with Database(path) as db:
         assert db.conn.execute("SELECT * FROM transactions").fetchall() == original
-        assert db.conn.execute("SELECT state FROM extraction_results").fetchall() == [('needs_review',)]
+        assert db.conn.execute("SELECT state FROM extraction_results ORDER BY state").fetchall() == [('accepted',), ('needs_review',)]
 
 
 @pytest.mark.parametrize(
@@ -593,8 +597,10 @@ def test_operational_script_maps_main_status_to_process_exit(
 
 def test_insert_rejects_unbound_generation(stored):
     path, _, digest = stored
-    with pytest.raises(RuntimeError, match='generation'):
-        ops.insert_transactions('1', 2024, 'Jane Doe', [], db_path=str(path), artifact_sha256=digest, ingestion_generation='invented')
+    assert ops.insert_transactions('1', 2024, 'Jane Doe', [], db_path=str(path), artifact_sha256=digest, ingestion_generation='invented') == 0
+    with Database(path) as db:
+        with pytest.raises(RuntimeError, match='generation'):
+            ops._resolve_ingestion_generation(db.conn, '1', 2024, 'unbound-artifact')
 
 
 def test_insertion_uses_bound_metadata(stored):
@@ -615,6 +621,7 @@ def test_empty_mismatched_report_is_not_no_transactions(stored):
     ops.insert_transactions('1', 2024, 'Wrong Person', [], db_path=str(path), artifact_sha256=digest, ingestion_generation='g')
     db = Database(path)
     try:
-        assert db.conn.execute("SELECT status FROM pdf_parse_runs WHERE parser_version = ?", [common.GEMINI_PARSER_VERSION]).fetchone()[0] == 'error'
+        assert db.conn.execute("SELECT status FROM pdf_parse_runs WHERE parser_version = ?", [common.GEMINI_PARSER_VERSION]).fetchone() is None
+        assert db.conn.execute("SELECT COUNT(*) FROM transactions").fetchone() == (0,)
     finally:
         db.close()

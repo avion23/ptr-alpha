@@ -37,7 +37,9 @@ def quarantine(conn, scope: list[dict], baseline: Path, data_dir: Path,
     baseline = baseline.expanduser().resolve(strict=True)
     scope_id = hashlib.sha256(json.dumps(scope, sort_keys=True).encode()).hexdigest()
     repair = {"operation": "quarantine_model_admissions", "scope_sha256": scope_id,
-              "baseline": str(baseline), "reason": reason}
+              "baseline": str(baseline), "reason": reason,
+              "restoration": "new_observation_v1"}
+    restoration_parser = "baseline-restoration:gemini:" + scope_id + ":"
     # ATTACH does not accept parameter placeholders; escape the operator's path.
     conn.execute("ATTACH '" + str(baseline).replace("'", "''") + "' AS quarantine_baseline (READ_ONLY)")
     conn.execute("BEGIN TRANSACTION")
@@ -115,39 +117,61 @@ def quarantine(conn, scope: list[dict], baseline: Path, data_dir: Path,
         counts["baseline_canonical_rows"] = conn.execute("""SELECT COUNT(*) FROM
             quarantine_baseline.canonical_transactions WHERE doc_id IN (SELECT unnest(?))""", [docs]).fetchone()[0]
 
-        # On replay, verify the prior repair still has its exact baseline rows
-        # and runs; never undo later edits just because its event still exists.
-        for table, predicate in (("transactions", tx_filter), ("pdf_parse_runs parse_run", run_filter)):
-            left = "SELECT * FROM " + table + " WHERE " + predicate
-            right = "SELECT * FROM quarantine_baseline." + table + " WHERE " + predicate
-            for first, second in ((left, right), (right, left)):
-                if conn.execute("SELECT COUNT(*) FROM (" + first + " EXCEPT ALL " + second + ")",
-                                [already, already]).fetchone()[0]:
+        # A restoration is a NEW observation, not a second physical copy of an
+        # old observation. Replaying must match both baseline values and the
+        # original restoration event's clock, never today's clock.
+        for frozen in scope:
+            doc = repository.validate_receipt(frozen).doc_id
+            if doc not in already:
+                continue
+            effective = repository.effective_admission_decision(frozen)
+            restored_at = conn.execute("SELECT finished_at FROM extraction_results WHERE result_id = ?",
+                                       [effective["result_id"]]).fetchone()[0]
+            for table, predicate, projection, extra in (
+                ("transactions", tx_filter, "* REPLACE (? AS created_at)", [restored_at]),
+                ("pdf_parse_runs parse_run", run_filter,
+                 "* REPLACE (? || parser_version AS parser_version, ? AS parsed_at, ? AS rowset_created_at)",
+                 [restoration_parser, restored_at, restored_at]),
+            ):
+                left = "SELECT * FROM " + table + " WHERE " + predicate
+                right = "SELECT " + projection + " FROM quarantine_baseline." + table + " WHERE " + predicate
+                if (conn.execute("SELECT COUNT(*) FROM (" + left + " EXCEPT ALL " + right + ")",
+                                 [[doc], *extra, [doc]]).fetchone()[0]
+                        or conn.execute("SELECT COUNT(*) FROM (" + right + " EXCEPT ALL " + left + ")",
+                                        [*extra, [doc], [doc]]).fetchone()[0]):
                     raise ValueError("Scope changed after quarantine; refusing replay")
 
         if not apply:
             conn.execute("ROLLBACK")
             return {**counts, "applied": False}
 
-        # Existing history tables hold every column, including IDs, raw fields,
-        # exact types and original watermarks. Do not call accept_corrections.
+        # Archive unchanged physical observations before replacing them. Old
+        # timestamps stay ONLY in history: copying them into current would make
+        # historical UNION ALL rowsets contain the same observation twice.
         for table, history, predicate in (("transactions", "transaction_versions", tx_filter),
                                            ("pdf_parse_runs", "parse_run_versions", run_filter.replace("parse_run.", "pdf_parse_runs."))):
             conn.execute("INSERT INTO " + history + " SELECT *, CURRENT_TIMESTAMP FROM " + table
                          + " WHERE " + predicate, [pending_docs])
             conn.execute("DELETE FROM " + table + " WHERE " + predicate, [pending_docs])
-            conn.execute("INSERT INTO " + table + " SELECT * FROM quarantine_baseline." + table
-                         + " WHERE " + predicate, [pending_docs])
+            if table == "transactions":
+                projection = "* REPLACE (CURRENT_TIMESTAMP AS created_at)"
+                parameters = [pending_docs]
+            else:
+                projection = """* REPLACE (? || parser_version AS parser_version,
+                    CURRENT_TIMESTAMP AS parsed_at, CURRENT_TIMESTAMP AS rowset_created_at)"""
+                parameters = [restoration_parser, pending_docs]
+            conn.execute("INSERT INTO " + table + " SELECT " + projection + " FROM quarantine_baseline." + table
+                         + " WHERE " + predicate, parameters)
         for receipt, decision in plans:
             path = _publish(decision, str(data_dir / "pipeline"))
             repository.append_admission_decision(receipt, decision, path, "needs_review", repair,
                                                   in_transaction=True)
-        # Exact bidirectional comparison includes every business/provenance
-        # column and detects missing or newly exposed canonical rows.
+        # Business/provenance values are exact; created_at truthfully records
+        # this restoration, while prior observations retain their original time.
         for first, second in (("main", "quarantine_baseline"), ("quarantine_baseline", "main")):
             if conn.execute(f"""SELECT COUNT(*) FROM (
-                SELECT * FROM {first}.canonical_transactions WHERE doc_id IN (SELECT unnest(?))
-                EXCEPT ALL SELECT * FROM {second}.canonical_transactions WHERE doc_id IN (SELECT unnest(?)))""",
+                SELECT * EXCLUDE (created_at) FROM {first}.canonical_transactions WHERE doc_id IN (SELECT unnest(?))
+                EXCEPT ALL SELECT * EXCLUDE (created_at) FROM {second}.canonical_transactions WHERE doc_id IN (SELECT unnest(?)))""",
                 [docs, docs]).fetchone()[0]:
                 raise ValueError("Quarantine did not restore exact baseline canonical rows")
         conn.execute("COMMIT")

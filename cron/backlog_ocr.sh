@@ -40,17 +40,10 @@ cd "$repo"
 # One coordinator inventories authoritative database work for all years. No
 # separate GLM staging loop, directory-scan fallback, or quota-output regex.
 printf '%s\n' '--- coordinator start (local=3 gemini=0 glm=2) ---'
-timeout "$((run_budget_seconds - tail_reserve_seconds))" python3 - "$repo/data" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path.cwd() / "src"))
-from analyzer.ocr.coordinator import run_pipeline
-
-print(json.dumps(run_pipeline(sys.argv[1], local_workers=3, gemini_workers=0,
-                              glm_workers=2), default=str, sort_keys=True))
-PY
+PYTHONPATH="$repo/src${PYTHONPATH:+:$PYTHONPATH}" \
+    timeout "$((run_budget_seconds - tail_reserve_seconds))" \
+    python3 -m analyzer.cli pipeline --data-dir "$repo/data" \
+    --local-workers 3 --gemini-workers 0 --glm-workers 2
 coordinator_rc=$?
 printf 'coordinator exit=%d (retry/blocked work may remain; see structured status above)\n' "$coordinator_rc"
 

@@ -239,7 +239,6 @@ def run_pipeline(
     """
     from analyzer.download import HouseTransactionSource
     from analyzer.ocr.workers import extract_document, extraction_recipe, load_result
-    from analyzer.persistence.ownership import publication_state
     from analyzer.settings import Settings
 
     capacities = {ExtractionLane.LOCAL: local_workers, ExtractionLane.GEMINI: gemini_workers,
@@ -259,18 +258,9 @@ def run_pipeline(
         source = HouseTransactionSource(settings, db=db)
         with ExitStack() as stack:
             stack.callback(source.close)
-            def publication_signature(conn=None):
-                conn = db.conn if conn is None else conn
-                return (conn.execute("SELECT COUNT(*), MAX(updated_at) FROM extraction_work").fetchone(),
-                        conn.execute("SELECT COUNT(*), MAX(finished_at) FROM extraction_results").fetchone(),
-                        conn.execute("SELECT archive_year, generation_id, parse_status FROM house_archive_generations ORDER BY 1, 2").fetchall())
-
-            publication = publication_state(db.db_path)
-            published_signature = None
-            if publication["published"]:
-                with Database(publication["path"], read_only=True) as reader:
-                    published_signature = publication_signature(reader.conn)
-            published_before_dispatch = False
+            # Ownership may follow price, metadata, or other maintenance writes.
+            # A document-only signature cannot establish whole-database freshness.
+            publication = db.publish_snapshot()
             scope = _scope(db, years)
             scoped = {(s["archive_year"], s["generation_id"], s["doc_id"]): s for s in scope}
             known_years = {int(r[0]) for r in db.conn.execute(
@@ -467,11 +457,6 @@ def run_pipeline(
                     # One bounded rolling window across all years, replenished
                     # after every completion rather than after a batch barrier.
                     for (task_id,) in ready(lane, free):
-                        if not published_before_dispatch:
-                            if publication_signature() != published_signature:
-                                publication = db.publish_snapshot()
-                                published_signature = publication_signature()
-                            published_before_dispatch = True
                         work = db.work.claim(task_id, lease_seconds=lease_seconds)
                         running[pools[lane].submit(extract_document, work, str(spool))] = work
                 if not running:
@@ -495,12 +480,10 @@ def run_pipeline(
                     completed += 1
                     if completed % publish_every == 0:
                         publication = db.publish_snapshot()
-                        published_signature = publication_signature()
             for year, generation in unresolved:
                 if not db.get_unresolved_house_doc_ids(year, generation):
                     db.mark_house_generation_parse_complete(year, generation)
-            if publication_signature() != published_signature:
-                publication = db.publish_snapshot()
+            publication = db.publish_snapshot()
             return {**pipeline_status(base, years=years, database=db),
                     "completed_attempts": completed, "missing_years": missing_years,
                     "snapshot": publication}

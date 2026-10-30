@@ -1199,11 +1199,9 @@ def refresh(
         else str(archive_years[0])
     )
     print(f"[1/4] Fetching and reconciling House PDF archives {label}...")
-    acquisition, database_lifecycle = acquire_house_archives(
+    acquisition = acquire_house_archives(
         app_ctx.transaction_source,
-        app_ctx.price_source,
         archive_years,
-        app_ctx.settings.data.data_dir,
         all_years=all_years,
         refresh_metadata=refresh_metadata,
     )
@@ -1242,10 +1240,8 @@ def refresh(
         f"parse:{archive_year}"
         for archive_year in parse_house_archives(
             app_ctx.transaction_source,
-            app_ctx.price_source,
             archive_years,
             app_ctx.settings.data.data_dir,
-            database_lifecycle=database_lifecycle,
             force=force_full_reparse,
             gemini_workers=int(use_gemini_ocr),
         )
@@ -1265,10 +1261,7 @@ def refresh(
 
     generation_outcomes, metrics = complete_house_refresh(
         app_ctx.transaction_source,
-        app_ctx.price_source,
         archive_years,
-        app_ctx.settings.data.data_dir,
-        database_lifecycle=database_lifecycle,
     )
     for archive_year in archive_years:
         generation_id, unresolved = generation_outcomes[archive_year]

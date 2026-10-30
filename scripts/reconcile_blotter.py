@@ -151,7 +151,9 @@ def get_congressional(
     (member, ticker, transaction_date, transaction_type, disclosure_date) so
     that n_buys and match tests are not inflated.
     """
-    conn = duckdb.connect(str(db_path), read_only=True)
+    from analyzer.persistence.ownership import resolve_read_path
+
+    conn = duckdb.connect(str(resolve_read_path(db_path)), read_only=True)
     try:
         rows = conn.execute(
             """

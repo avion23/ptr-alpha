@@ -37,6 +37,7 @@ import duckdb
 import pandas as pd
 
 from analyzer.price_source import certify_adjusted_price_generations
+from analyzer.persistence.ownership import database_owner, resolve_read_path
 
 DEFAULT_DATABASE = Path("/home/ubuntu/insider-trading/data/congress.duckdb")
 REQUIRED_BACKUP = Path(
@@ -192,6 +193,14 @@ def _plan_counts(con: duckdb.DuckDBPyConnection, plan: list[dict]) -> dict:
 def apply_plan(
     database: Path, backup: Path, plan: list[dict], change_log: Path
 ) -> dict:
+    with (
+        database_owner(database, purpose="price rebaseline maintenance"),
+        duckdb.connect(str(database)) as con,
+    ):
+        return _apply_plan_owned(database, backup, plan, change_log, con)
+
+
+def _apply_plan_owned(database, backup, plan, change_log, con):
     if backup != REQUIRED_BACKUP:
         raise SystemExit(f"--backup must be exactly {REQUIRED_BACKUP}")
     if not backup.is_file() or backup.stat().st_size != database.stat().st_size:
@@ -199,7 +208,6 @@ def apply_plan(
             "required backup is missing or its size differs from the canonical DB"
         )
 
-    con = duckdb.connect(str(database))
     stats: dict = {
         "applied_at": datetime.now(timezone.utc).isoformat(),
         "backup": str(backup),
@@ -310,15 +318,12 @@ def apply_plan(
         con.execute("COMMIT")
     except Exception:
         con.execute("ROLLBACK")
-        con.close()
         raise
     con.execute("CHECKPOINT")
     stats["table_counts_after"] = _table_counts(con)
     stats["state_after"] = con.execute(
         "SELECT comparability, COUNT(*) FROM price_generation_state GROUP BY 1 ORDER BY 2 DESC"
     ).fetchall()
-    con.close()
-
     stats["tickers"] = plan
     change_log.parent.mkdir(parents=True, exist_ok=True)
     change_log.write_text(json.dumps(stats, indent=1, default=str))
@@ -352,7 +357,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    con = duckdb.connect(str(args.database), read_only=True)
+    con = duckdb.connect(str(resolve_read_path(args.database)), read_only=True)
     plan, plan_meta = build_plan(con, args.limit)
     counts = _plan_counts(con, plan)
     con.close()

@@ -1567,7 +1567,9 @@ def run_audit(conn: duckdb.DuckDBPyConnection) -> list[CheckResult]:
 
 
 def audit_database(db_path: str | Path) -> list[CheckResult]:
-    conn = duckdb.connect(str(db_path), read_only=True)
+    from analyzer.persistence.ownership import resolve_read_path
+
+    conn = duckdb.connect(str(resolve_read_path(db_path)), read_only=True)
     try:
         return run_audit(conn)
     finally:

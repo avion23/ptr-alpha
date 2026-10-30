@@ -103,7 +103,9 @@ def _load_trades(path: Path) -> list[dict[str, str]]:
 
 
 def _canonical_rows(db_path: Path) -> list[dict]:
-    connection = duckdb.connect(str(db_path), read_only=True)
+    from analyzer.persistence.ownership import resolve_read_path
+
+    connection = duckdb.connect(str(resolve_read_path(db_path)), read_only=True)
     try:
         rows = connection.execute(
             """SELECT doc_id, member, transaction_date, amount_raw, ticker

@@ -46,6 +46,7 @@ if __name__ == "__main__":
             sys.path.insert(0, _entry)
 
 from analyzer.persistence.database import Database  # noqa: E402
+from analyzer.persistence.ownership import database_owner, resolve_read_path
 from analyzer.row_history import archive_rows, preserve_repair_history  # noqa: E402
 from analyzer.download import (  # noqa: E402
     PARSE_FAILURE_PREFIX,
@@ -110,6 +111,11 @@ def _database_fingerprint(path: Path) -> dict[str, int | str]:
 
 
 def _checkpoint_database(path: Path) -> None:
+    with database_owner(path, purpose="staged checkpoint maintenance"):
+        _checkpoint_owned(path)
+
+
+def _checkpoint_owned(path: Path) -> None:
     conn = duckdb.connect(str(path))
     try:
         conn.execute("CHECKPOINT")
@@ -169,7 +175,9 @@ def _git_sha() -> str:
 def _fresh_database(staging: Path) -> Database:
     db_path = staging / "congress.duckdb"
     if db_path.exists():
-        db_path.unlink()
+        raise RuntimeError(
+            f"refusing to overwrite staged database {db_path}; use a new generation"
+        )
     return Database(db_path)
 
 
@@ -2192,6 +2200,12 @@ def verify(args) -> None:
 
 def promote(args) -> None:
     """Install a verified staged database with an atomic filesystem swap."""
+    live_db = _REPO_ROOT / "data" / "congress.duckdb"
+    with database_owner(live_db, purpose="staged promotion maintenance"):
+        _promote_owned(args)
+
+
+def _promote_owned(args) -> None:
     staging = Path(args.staging)
     staged_db = staging / "congress.duckdb"
     live_db = _REPO_ROOT / "data" / "congress.duckdb"
@@ -2203,6 +2217,12 @@ def promote(args) -> None:
     # A checkpoint is the only writer interaction in this command. The live
     # database is never opened by DuckDB; it is copied and replaced as a file.
     _checkpoint_database(staged_db)
+    if resolve_read_path(staged_db).resolve() != staged_db.resolve():
+        raise SystemExit(
+            "promote refused: staging has a published read version; "
+            "use a fresh standalone rebuild generation so verification audits "
+            "the exact file being installed"
+        )
     verify(args)
     manifest = _load_manifest(staging)
     verification = manifest.get("verify") or {}
@@ -2227,16 +2247,19 @@ def promote(args) -> None:
             "promote refused: staged database changed after verification"
         )
 
-    live_db.parent.mkdir(parents=True, exist_ok=True)
-    backup = live_db.with_name(
-        f"{live_db.name}.backup-{time.strftime('%Y%m%dT%H%M%S')}"
-    )
-    if backup.exists():
-        backup = live_db.with_name(f"{backup.name}-{time.time_ns()}")
-    if live_db.exists():
-        shutil.copy2(live_db, backup)
-        print(f"promote: backup {backup}")
-    os.replace(staged_db, live_db)
+    with database_owner(staged_db, purpose="staged promotion maintenance"):
+        if _database_fingerprint(staged_db) != expected_fingerprint:
+            raise SystemExit("promote refused: staged database changed after verification")
+        live_db.parent.mkdir(parents=True, exist_ok=True)
+        backup = live_db.with_name(
+            f"{live_db.name}.backup-{time.strftime('%Y%m%dT%H%M%S')}"
+        )
+        if backup.exists():
+            backup = live_db.with_name(f"{backup.name}-{time.time_ns()}")
+        if live_db.exists():
+            shutil.copy2(live_db, backup)
+            print(f"promote: backup {backup}")
+        os.replace(staged_db, live_db)
     print(f"promote: installed {live_db} from {staging}")
 
 
@@ -2905,7 +2928,7 @@ def _ingest_prices(track_dir: Path, track_manifest: dict, db: Database) -> dict:
     elif duckdb_file.exists():
         import duckdb as _duckdb  # noqa: PLC0415
 
-        src_conn = _duckdb.connect(str(duckdb_file), read_only=True)
+        src_conn = _duckdb.connect(str(resolve_read_path(duckdb_file)), read_only=True)
         try:
             tables = [
                 r[0]

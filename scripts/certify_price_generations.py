@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import duckdb
 import pandas as pd
+from analyzer.persistence.ownership import database_owner, resolve_read_path
 
 from analyzer.price_source import (
     _PRICE_BASIS,
@@ -99,12 +100,19 @@ def _table_counts(connection):
 
 
 def _apply(database: Path, results: dict, backup: Path, change_log: Path):
+    with (
+        database_owner(database, purpose="price certification maintenance"),
+        duckdb.connect(str(database)) as connection,
+    ):
+        return _apply_owned(database, results, backup, change_log, connection)
+
+
+def _apply_owned(database, results, backup, change_log, connection):
     if backup != REQUIRED_BACKUP:
         raise SystemExit(f"--backup must be exactly {REQUIRED_BACKUP}")
     if not backup.is_file() or backup.stat().st_size != database.stat().st_size:
         raise SystemExit("required backup is missing or its size differs from the canonical DB")
 
-    connection = duckdb.connect(str(database))
     db = SimpleNamespace(conn=connection)
     before_counts = _table_counts(connection)
     changes = []
@@ -131,7 +139,6 @@ def _apply(database: Path, results: dict, backup: Path, change_log: Path):
         connection.execute("ROLLBACK")
         raise
     after_counts = _table_counts(connection)
-    connection.close()
     changed_tables = {
         table: (before_counts[table], after_counts[table])
         for table in before_counts
@@ -177,7 +184,7 @@ def main():
     parser.add_argument("--change-log", type=Path, default=DEFAULT_CHANGE_LOG)
     args = parser.parse_args()
 
-    connection = duckdb.connect(str(args.database), read_only=True)
+    connection = duckdb.connect(str(resolve_read_path(args.database)), read_only=True)
     try:
         results = _read_certifications(connection)
     finally:

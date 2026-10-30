@@ -42,6 +42,7 @@ if __name__ == "__main__":
 import duckdb  # noqa: E402
 
 from analyzer.sql_fragments import HOUSE_PARSE_SOURCE  # noqa: E402
+from analyzer.persistence.ownership import database_owner, resolve_read_path
 
 logger = logging.getLogger("purge_unaccepted_house_rowsets")
 
@@ -124,6 +125,13 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     db_path = Path(args.db_path)
+    if args.apply:
+        with database_owner(db_path, purpose="unaccepted rowset purge maintenance"):
+            return _purge_owned(args, db_path)
+    return _purge_owned(args, resolve_read_path(db_path))
+
+
+def _purge_owned(args, db_path):
     conn = duckdb.connect(str(db_path), read_only=not args.apply)
     try:
         rows = conn.execute(UNACCEPTED_ROWSETS).fetchall()

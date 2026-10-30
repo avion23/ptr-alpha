@@ -52,6 +52,7 @@ import pandas as pd
 import numpy as np
 
 from analyzer.persistence.database import Database
+from analyzer.persistence.ownership import resolve_read_path
 from analyzer.exceptions import DataSourceError
 from analyzer.persistence.price_repository import (
     nyse_sessions,
@@ -499,7 +500,7 @@ def merge_temp_into_canonical(
     try:
         con = canon.conn
         # duckdb 1.5.x cannot bind ATTACH paths as parameters.
-        attach_path = str(Path(temp_db).resolve()).replace("'", "''")
+        attach_path = str(resolve_read_path(temp_db)).replace("'", "''")
         con.execute(f"ATTACH '{attach_path}' AS merge_src (READ_ONLY)")
         try:
             if not dry_run:
@@ -830,9 +831,11 @@ def merge_temp_into_canonical(
                 0 if dry_run else int(stats["dividend_candidates"])
             )
             stats["dry_run"] = bool(dry_run)
-            return stats
         finally:
             con.execute("DETACH merge_src")
+        if not dry_run:
+            canon.publish_snapshot()
+        return stats
     finally:
         canon.close()
 
@@ -851,7 +854,7 @@ def verify_consumption(
     try:
         con = canon.conn
         # duckdb 1.5.x cannot bind ATTACH paths as parameters.
-        attach_path = str(Path(temp_db).resolve()).replace("'", "''")
+        attach_path = str(resolve_read_path(temp_db)).replace("'", "''")
         con.execute(f"ATTACH '{attach_path}' AS verify_src (READ_ONLY)")
         try:
             con.execute("CREATE TEMP TABLE _verify_eligible (ticker VARCHAR)")

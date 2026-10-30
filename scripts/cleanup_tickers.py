@@ -16,6 +16,7 @@ if __name__ == "__main__":
             sys.path.insert(0, _entry)
 
 from analyzer.row_history import archive_rows, accept_corrections
+from analyzer.persistence.ownership import database_owner
 
 # IMPORTANT: do NOT use the parser's _TICKER_BLACKLIST here.
 # That set contains single-letter tokens ('A', 'O', 'X', 'S', 'P', 'E') that
@@ -189,6 +190,11 @@ def is_cash_or_fund(ticker: str) -> bool:
 
 
 def main(db_path="data/congress.duckdb"):
+    with database_owner(db_path, purpose="ticker cleanup maintenance"):
+        return _cleanup_owned(db_path)
+
+
+def _cleanup_owned(db_path):
     con = duckdb.connect(str(db_path))
     in_transaction = False
     try:

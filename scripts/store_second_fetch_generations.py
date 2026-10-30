@@ -23,6 +23,7 @@ import duckdb
 import pandas as pd
 
 from analyzer.persistence.database import Database
+from analyzer.persistence.ownership import resolve_read_path
 from analyzer.price_source import store_generations
 
 DEFAULT_TEMP_DB = Path(
@@ -117,7 +118,7 @@ def main() -> int:
     if not args.temp_db.is_file():
         raise SystemExit(f"temp fetch DB missing: {args.temp_db}")
 
-    temp = duckdb.connect(str(args.temp_db), read_only=True)
+    temp = duckdb.connect(str(resolve_read_path(args.temp_db)), read_only=True)
     entries = []
     missing_gen: list[str] = []
     collisions: list[str] = []

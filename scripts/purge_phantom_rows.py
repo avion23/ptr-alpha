@@ -21,6 +21,7 @@ if __name__ == "__main__":
             sys.path.insert(0, _entry)
 
 from analyzer.row_history import preserve_repair_history
+from analyzer.persistence.ownership import database_owner, resolve_read_path
 
 
 VICTIMS_CTE = """
@@ -103,8 +104,15 @@ def main() -> None:
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
 
-    # Dry-run must not take DuckDB's exclusive write lock on a live DB.
-    conn = duckdb.connect(str(Path(args.db_path)), read_only=not args.execute)
+    db_path = Path(args.db_path)
+    if args.execute:
+        with database_owner(db_path, purpose="phantom row purge maintenance"):
+            return _purge_owned(args, db_path)
+    return _purge_owned(args, resolve_read_path(db_path))
+
+
+def _purge_owned(args, db_path):
+    conn = duckdb.connect(str(db_path), read_only=not args.execute)
     try:
         counts = count_phantom_rows(conn)
         if not args.execute:

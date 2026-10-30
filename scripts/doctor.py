@@ -35,6 +35,7 @@ if __name__ == "__main__":
             sys.path.insert(0, _entry)
 
 from analyzer.freshness import FreshnessCheck, monitoring_checks  # noqa: E402
+from analyzer.persistence.ownership import OwnershipError, resolve_read_path  # noqa: E402
 from scripts.audit_sample import doc_fail_severity, verdict_of  # noqa: E402
 
 CANONICAL = Path(os.environ.get("DOCTOR_CANONICAL", str(REPO / "data" / "congress.duckdb")))
@@ -715,12 +716,17 @@ def _crontab_contract() -> FreshnessCheck:
 
 
 def main() -> int:
-    if not CANONICAL.exists():
+    try:
+        read_path = resolve_read_path(CANONICAL)
+    except OwnershipError as exc:
+        print(f"doctor: read publication unavailable: {exc}; request owner publication")
+        return 1
+    if not read_path.exists():
         print(f"doctor: canonical database missing: {CANONICAL}")
         return 1
     import duckdb
 
-    canonical = duckdb.connect(str(CANONICAL), read_only=True)
+    canonical = duckdb.connect(str(read_path), read_only=True)
     try:
         results = check(canonical)
     finally:

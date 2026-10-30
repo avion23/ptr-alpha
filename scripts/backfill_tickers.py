@@ -16,12 +16,20 @@ if __name__ == "__main__":
 
 from analyzer.asset_ticker_map import resolve_asset_ticker
 from analyzer.row_history import accept_corrections
+from analyzer.persistence.ownership import database_owner, resolve_read_path
 
 
 def backfill_tickers(
     db_path: str | Path = "data/congress.duckdb", *, apply: bool = False
 ) -> tuple[int, int]:
     """Return (resolved, unresolved); version ticker corrections before writing."""
+    if apply:
+        with database_owner(db_path, purpose="ticker backfill maintenance"):
+            return _backfill_owned(db_path, apply=True)
+    return _backfill_owned(resolve_read_path(db_path), apply=False)
+
+
+def _backfill_owned(db_path, *, apply):
     connection = duckdb.connect(str(db_path), read_only=not apply)
     try:
         rows = connection.execute(

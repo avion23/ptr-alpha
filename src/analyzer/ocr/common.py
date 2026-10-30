@@ -415,6 +415,7 @@ def _read_cached_snapshot(
     cache_dir: str,
     parser_version: str,
     model: str = MODEL,
+    response_sink=None,
 ) -> CachedGeminiResponse | None:
     path = cache_path(doc_id, cache_dir)
     try:
@@ -432,8 +433,6 @@ def _read_cached_snapshot(
         )
         if envelope != expected:
             return None
-        parsed = parse_gemini_output(output, expected_page_count=snapshot.page_count)
-        return CachedGeminiResponse(output, parsed, snapshot.sha256, snapshot.page_count)
     except (
         OSError,
         UnicodeError,
@@ -443,6 +442,13 @@ def _read_cached_snapshot(
         GeminiOutputError,
     ):
         return None
+    if response_sink is not None:
+        response_sink(output)
+    try:
+        parsed = parse_gemini_output(output, expected_page_count=snapshot.page_count)
+    except GeminiOutputError:
+        return None
+    return CachedGeminiResponse(output, parsed, snapshot.sha256, snapshot.page_count)
 
 
 def inspect_cached_response(
@@ -542,6 +548,7 @@ def call_gemini(
     model: str = MODEL,
     thinking_level: str | None = None,
     max_output_tokens: int | None = None,
+    response_sink=None,
 ) -> tuple[str | None, str, ArtifactMetadata | None]:
     """Call Gemini against the same immutable bytes used for hash/cache checks."""
     metadata = None
@@ -555,7 +562,8 @@ def call_gemini(
             )
             if doc_id and not refresh:
                 cached = _read_cached_snapshot(
-                    str(doc_id), snapshot, cache_dir, parser_version, model
+                    str(doc_id), snapshot, cache_dir, parser_version, model,
+                    response_sink=response_sink,
                 )
                 if cached is not None:
                     return cached.output, "", replace(metadata, parsed=cached.parsed)
@@ -573,6 +581,8 @@ def call_gemini(
                 result = subprocess.run(
                     command, capture_output=True, text=True, timeout=timeout,
                 )
+                if response_sink is not None:
+                    response_sink(result.stdout)
                 if result.returncode == 0 or not is_quota_error(result.stderr) or attempt == 2:
                     break
                 time.sleep(30 * 2**attempt)

@@ -1654,6 +1654,8 @@ def record_failed_ocr_attempt(
     receipt=None,
 ) -> None:
     """Record a failed OCR attempt and retire rows for that exact artifact."""
+    if _receipt_replay(conn, receipt, doc_id, year, artifact_sha256, ingestion_generation, parser_version) is not None:
+        return
     conn.execute("BEGIN TRANSACTION")
     try:
         if artifact_sha256 and ingestion_generation:
@@ -1734,6 +1736,35 @@ def _finish_receipt(conn, receipt, state, detail=None):
         WorkRepository(conn).finish(receipt, state, detail=detail, in_transaction=True)
 
 
+def _receipt_replay(conn, receipt, doc_id, year, artifact_sha256, ingestion_generation, parser_version):
+    """Validate mutation scope and stop replay before touching rows or history."""
+    if receipt is None:
+        return None
+    from analyzer.persistence.work_repository import WorkRepository
+    repository = WorkRepository(conn)
+    work = repository.validate_receipt(receipt)
+    if (str(doc_id), year, artifact_sha256, ingestion_generation) != (
+        work.doc_id, work.archive_year, work.artifact_sha256, work.generation_id,
+    ):
+        raise ValueError("OCR mutation scope does not match result receipt")
+    if not repository.is_finished(receipt):
+        return None
+    state, detail = conn.execute(
+        "SELECT state, detail FROM extraction_results WHERE result_id = ?",
+        [receipt["result_id"]],
+    ).fetchone()
+    run = conn.execute(
+        "SELECT status, raw_row_count, transaction_count FROM pdf_parse_runs "
+        "WHERE doc_id = ? AND parser_version = ? AND artifact_sha256 = ? "
+        "AND ingestion_generation = ? ORDER BY parsed_at DESC LIMIT 1",
+        [str(doc_id), parser_version, artifact_sha256, ingestion_generation],
+    ).fetchone()
+    if run and ((state == "accepted" and run[0] == "success") or
+                (state == "verified_empty" and run[0] == "no_txs")):
+        return InsertOutcome(status=run[0], inserted=run[2], expected=run[1], committed=True, detail=detail)
+    return InsertOutcome(status="already_finished", detail=state)
+
+
 def insert_outcome_from_report(
     report: dict | None, *, inserted: int, expected: int
 ) -> InsertOutcome:
@@ -1800,6 +1831,9 @@ def _insert_transactions(
 ) -> InsertOutcome:
     """Validate and dispatch a generation-bound rowset; partials stay blocked."""
 
+    replay = _receipt_replay(conn, receipt, doc_id, year, artifact_sha256, ingestion_generation, parser_version)
+    if replay is not None:
+        return replay
     require_ocr_schema(conn)
     if not artifact_sha256 or not ingestion_generation:
         raise RuntimeError(
@@ -1833,8 +1867,11 @@ def _insert_transactions(
             rejections=dict(identity_rejections),
         )
     if not transactions:
-        if receipt is not None and not raw_count and not verified_empty_evidence(evidence):
-            raise ValueError("verified empty admission requires explicit evidence for every page")
+        if receipt is not None and not raw_count:
+            from analyzer.persistence.work_repository import WorkRepository
+            work = WorkRepository(conn).validate_receipt(receipt)
+            if not verified_empty_evidence(evidence) or evidence["page_count"] != work.page_count:
+                raise ValueError("verified empty admission requires explicit evidence for every artifact page")
         status = "error" if raw_count else "no_txs"
         message = "semantic_zero_after_raw_rows" if raw_count else ""
         if raw_count:

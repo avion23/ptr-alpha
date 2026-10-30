@@ -99,12 +99,14 @@ def _table_counts(connection):
     }
 
 
-def _apply(database: Path, results: dict, backup: Path, change_log: Path):
+def _apply(database: Path, backup: Path, change_log: Path):
     with (
         database_owner(database, purpose="price certification maintenance"),
         duckdb.connect(str(database)) as connection,
     ):
-        return _apply_owned(database, results, backup, change_log, connection)
+        results = _read_certifications(connection)
+        changes = _apply_owned(database, results, backup, change_log, connection)
+        return results, changes
 
 
 def _apply_owned(database, results, backup, change_log, connection):
@@ -184,11 +186,11 @@ def main():
     parser.add_argument("--change-log", type=Path, default=DEFAULT_CHANGE_LOG)
     args = parser.parse_args()
 
-    connection = duckdb.connect(str(resolve_read_path(args.database)), read_only=True)
-    try:
-        results = _read_certifications(connection)
-    finally:
-        connection.close()
+    if args.apply:
+        results, changes = _apply(args.database, args.backup, args.change_log)
+    else:
+        with duckdb.connect(str(resolve_read_path(args.database)), read_only=True) as connection:
+            results = _read_certifications(connection)
 
     certified = sum(row["certification"]["certified"] for row in results.values())
     failed = Counter()
@@ -235,7 +237,6 @@ def main():
         },
     }
     if args.apply:
-        changes = _apply(args.database, results, args.backup, args.change_log)
         output["state_changes"] = len(changes)
         output["change_log"] = str(args.change_log)
     print(json.dumps(output, indent=2, sort_keys=True))

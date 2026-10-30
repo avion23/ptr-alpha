@@ -216,6 +216,13 @@ resume the coordinator and publish a fresh snapshot. Do not bypass the lease
 or infer permission from a process-name scan. Maintenance edits to a working
 database do not by themselves replace an already published read version.
 
+Price certification and rebaseline reporting use a pinned published snapshot.
+Their `--apply` mode instead acquires the maintenance lease, then computes,
+validates, and applies its plan using one working-database connection. A plan
+computed from an older published version is never reused for mutation. If
+ownership is busy, request a handoff; do not retry against a snapshot as a
+write substitute.
+
 `scripts/ocr_parallel.py` delegates to `analyzer.ocr.coordinator.run_pipeline`;
 it no longer starts a competing database writer. Its supported arguments are
 `--data-dir`, `--years`, and `--workers` (Gemini slots). Unsupported legacy

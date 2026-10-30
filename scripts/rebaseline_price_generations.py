@@ -191,13 +191,25 @@ def _plan_counts(con: duckdb.DuckDBPyConnection, plan: list[dict]) -> dict:
 
 
 def apply_plan(
-    database: Path, backup: Path, plan: list[dict], change_log: Path
-) -> dict:
+    database: Path, backup: Path, limit: int | None, change_log: Path
+) -> tuple[dict, dict]:
     with (
         database_owner(database, purpose="price rebaseline maintenance"),
         duckdb.connect(str(database)) as con,
     ):
-        return _apply_plan_owned(database, backup, plan, change_log, con)
+        plan, summary = _plan_summary(con, limit)
+        result = _apply_plan_owned(database, backup, plan, change_log, con)
+        return summary, result
+
+
+def _plan_summary(con, limit):
+    plan, plan_meta = build_plan(con, limit)
+    return plan, {
+        "scope_tickers": len(plan),
+        "tickers_with_deletions": sum(1 for entry in plan if entry["deleted"]),
+        **_plan_counts(con, plan),
+        **plan_meta,
+    }
 
 
 def _apply_plan_owned(database, backup, plan, change_log, con):
@@ -357,21 +369,14 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    con = duckdb.connect(str(resolve_read_path(args.database)), read_only=True)
-    plan, plan_meta = build_plan(con, args.limit)
-    counts = _plan_counts(con, plan)
-    con.close()
-
-    summary = {
-        "scope_tickers": len(plan),
-        "tickers_with_deletions": sum(1 for entry in plan if entry["deleted"]),
-        **counts,
-        **plan_meta,
-    }
+    if args.apply:
+        summary, result = apply_plan(args.database, args.backup, args.limit, args.change_log)
+    else:
+        with duckdb.connect(str(resolve_read_path(args.database)), read_only=True) as con:
+            _, summary = _plan_summary(con, args.limit)
     print(json.dumps(summary, indent=1, default=str))
     if not args.apply:
         return 0
-    result = apply_plan(args.database, args.backup, plan, args.change_log)
     print(json.dumps(result, indent=1, default=str))
     print(f"change log: {args.change_log}")
     return 0

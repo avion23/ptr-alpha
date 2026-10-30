@@ -1362,6 +1362,58 @@ def test_schema4_preserves_repeated_lots_exact_amount_and_raw_columns(tmp_path):
     assert legacy.legacy_limited
 
 
+@pytest.mark.parametrize("raw_heading,date", [
+    ("Date of Notified Transaction", "01/20/25"),
+    ("DATE NOTIFIED OF TRANSACTION", "1/20/25"),
+    ("Date of Notified of Transaction", "01/20/25"),
+])
+def test_explicit_raw_notification_date_with_typed_null_requires_review(tmp_path, raw_heading, date):
+    from analyzer.ocr.contracts import ExtractionOutcome, ResultBundle
+    from analyzer.ocr.normalization import normalize_candidate
+
+    # Synthetic equivalents of the short-filings/9106236 spotcheck defects.
+    row = {**_tx(date="01/15/25"), "notif_date": None, "amount_raw": "$1,000-$15,000",
+           "raw_cells": {raw_heading: date}, "page_number": 1}
+    work = _bound_work(tmp_path)
+    result = ResultBundle(work, ExtractionOutcome.CANDIDATE, [row], evidence={
+        "output_schema_version": 4, "page_count": 1,
+        "page_outcomes": [{"page_number": 1, "outcome": "transactions"}],
+    })
+    before = result.to_dict()
+    normalized = normalize_candidate(work, result)
+    assert normalized["status"] == "needs_review"
+    assert normalized["findings"]["raw_cell_consistency"] == [{
+        "occurrence": 1, "field": "notification_date", "source_key": raw_heading,
+        "reason": "typed_omission",
+    }]
+    assert normalized["raw_rows"] == [row]
+    # A contradiction finding must not silently repair either evidence layer.
+    assert normalized["rows"][0]["notification_date"] is None
+    assert result.to_dict() == before
+
+
+def test_typed_sale_conflicting_with_raw_purchase_checkbox_requires_review(tmp_path):
+    from analyzer.ocr.contracts import ExtractionOutcome, ResultBundle
+    from analyzer.ocr.normalization import normalize_candidate
+
+    row = {**_tx(date="01/15/25", tx_type="Sale"), "notif_date": "01/20/25", "amount_raw": "$50,001-$100,000",
+           "raw_cells": {"PURCHASE": "X", "SALE": "", "EXCHANGE": ""}, "page_number": 1}
+    work = _bound_work(tmp_path)
+    result = ResultBundle(work, ExtractionOutcome.CANDIDATE, [row], evidence={
+        "output_schema_version": 4, "page_count": 1,
+        "page_outcomes": [{"page_number": 1, "outcome": "transactions"}],
+    })
+    before = result.to_dict()
+    normalized = normalize_candidate(work, result)
+    assert normalized["status"] == "needs_review"
+    assert normalized["findings"]["raw_cell_consistency"] == [{
+        "occurrence": 1, "field": "type", "source_key": "PURCHASE",
+        "reason": "typed_source_mismatch",
+    }]
+    assert normalized["raw_rows"] == [row]
+    assert result.to_dict() == before
+
+
 @pytest.mark.parametrize("number", ["NaN", "Infinity", "1e999"])
 def test_schema4_rejects_nonfinite_numbers_nested_in_raw_source(number):
     row = {"asset": "Apple (AAPL)", "type": "Purchase", "date": "01/15/25",

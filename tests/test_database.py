@@ -75,6 +75,57 @@ def test_failed_cow_publication_preserves_old_snapshot_and_writer_lease(tmp_path
         assert not list(path.with_suffix(".duckdb.snapshots").glob("*.tmp"))
 
 
+@pytest.mark.parametrize("source", ["house_pdf", "gemini_ocr"])
+@pytest.mark.parametrize("generation_status", ["incomplete", "complete"])
+@pytest.mark.parametrize("notification", [None, date(2025, 1, 14), date(2025, 1, 15), date(2025, 1, 16)])
+def test_house_canonical_acceptance_and_readiness_share_notification_chronology(tmp_path, source, generation_status, notification):
+    from analyzer.download import PARSE_VERSION
+    from analyzer.ocr.common import GEMINI_PARSER_VERSION, MODEL
+
+    with Database(tmp_path / "chronology.duckdb") as db:
+        db.conn.execute("INSERT INTO house_archive_generations (archive_year, generation_id, metadata_count, ptr_count, parse_status) VALUES (2025, 'g', 1, 1, ?)", [generation_status])
+        db.conn.execute("INSERT INTO house_generation_metadata (archive_year, generation_id, doc_id, first_name, last_name, filing_date, filing_type) VALUES (2025, 'g', 'chronology', 'Jane', 'Doe', '2025-01-20', 'P')")
+        db.conn.execute("INSERT INTO house_pdf_artifacts (archive_year, generation_id, doc_id, artifact_sha256) VALUES (2025, 'g', 'chronology', ?)", ["a" * 64])
+        base = {"doc_id": "chronology", "member": "Jane Doe", "ticker": "AAPL",
+                "transaction_date": date(2025, 1, 15), "notification_date": notification,
+                "disclosure_date": date(2025, 1, 20), "official_filing_date": date(2025, 1, 20),
+                "transaction_type": "Purchase", "chamber": "house", "source_record_id": "chronology",
+                "source_row_id": "r1", "ingestion_generation": "g", "artifact_sha256": "a" * 64}
+        db.upsert_transactions(pd.DataFrame([base, {**base, "source_row_id": "r2", "transaction_date": date(2025, 1, 10), "notification_date": None}]), source=source)
+        db.upsert_parse_run(doc_id="chronology", year=2025,
+                            parser_version=PARSE_VERSION if source == "house_pdf" else GEMINI_PARSER_VERSION,
+                            engines_attempted="pdftotext" if source == "house_pdf" else MODEL,
+                            status="success", raw_row_count=2, transaction_count=2,
+                            artifact_sha256="a" * 64, ingestion_generation="g")
+        valid = notification is None or notification >= date(2025, 1, 15)
+        assert db.get_unresolved_house_doc_ids(2025, "g") == ([] if valid else ["chronology"])
+        assert len(db.get_transactions_for_doc("chronology")) == (2 if valid else 0)
+        observed_day = db.conn.execute("SELECT CURRENT_DATE").fetchone()[0]
+        with db.canonical_as_of(observed_day):
+            assert len(db.get_transactions_for_doc("chronology")) == (2 if valid else 0)
+        # Rejection is a read/admission policy, never a date repair or raw/history purge.
+        assert db.conn.execute("SELECT notification_date FROM transactions WHERE source_row_id='r1'").fetchone() == (notification,)
+        assert db.conn.execute("SELECT COUNT(*) FROM transactions").fetchone() == (2,)
+        assert db.conn.execute("SELECT status, transaction_count FROM pdf_parse_runs").fetchone() == ("success", 2)
+
+
+@pytest.mark.parametrize("source", ["house_pdf", "gemini_ocr"])
+@pytest.mark.parametrize("notification", [None, date(2025, 1, 14), date(2025, 1, 15)])
+def test_legacy_house_rows_cannot_bypass_notification_chronology(tmp_path, source, notification):
+    with Database(tmp_path / "legacy-chronology.duckdb") as db:
+        db.upsert_transactions(pd.DataFrame([{
+            "doc_id": "legacy", "member": "Jane Doe", "ticker": "AAPL",
+            "transaction_date": date(2025, 1, 15), "notification_date": notification,
+            "disclosure_date": date(2025, 1, 20), "transaction_type": "Purchase",
+        }]), source=source)
+        expected = 0 if notification == date(2025, 1, 14) else 1
+        assert len(db.get_transactions_for_doc("legacy")) == expected
+        observed_day = db.conn.execute("SELECT CURRENT_DATE").fetchone()[0]
+        with db.canonical_as_of(observed_day):
+            assert len(db.get_transactions_for_doc("legacy")) == expected
+        assert db.conn.execute("SELECT notification_date FROM transactions").fetchone() == (notification,)
+
+
 
 
 def test_database_keeps_legacy_archive_year_unknown_and_nonauthoritative(tmp_path):

@@ -2,6 +2,7 @@ import hashlib
 import os
 import signal
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import date, datetime
 from io import BytesIO
@@ -21,11 +22,67 @@ from analyzer.settings import Settings
 pytestmark = pytest.mark.slow
 
 
-def _source(tmp_path):
+def _source(tmp_path, *, db_name="test.duckdb"):
     settings = Settings()
     settings.data.data_dir = str(tmp_path)
-    db = Database(tmp_path / "test.duckdb")
+    db = Database(tmp_path / db_name)
     return HouseTransactionSource(settings, db=db), db
+
+
+@pytest.fixture(autouse=True)
+def forbid_network(monkeypatch):
+    import socket
+
+    def refused(*args, **kwargs):
+        raise AssertionError("House download tests must not access the network")
+
+    monkeypatch.setattr(socket.socket, "connect", refused)
+    monkeypatch.setattr(socket, "create_connection", refused)
+
+
+def _pipeline_source(tmp_path, monkeypatch, docs, *, year=2021, filing_date="2022-01-04"):
+    from analyzer.ocr import common, coordinator
+
+    source, db = _source(tmp_path, db_name="congress.duckdb")
+    source.parallel_workers = 2
+    db.conn.execute("INSERT INTO house_archive_generations (archive_year, generation_id, metadata_count, ptr_count) VALUES (?, 'captured-g1', ?, ?)", [year, len(docs), len(docs)])
+    for doc in docs:
+        pdf = tmp_path / str(year) / "pdfs" / f"{doc}.pdf"
+        pdf.parent.mkdir(parents=True, exist_ok=True)
+        pdf.write_bytes(b"%PDF-" + doc.encode() + b"\n%%EOF")
+        digest = hashlib.sha256(pdf.read_bytes()).hexdigest()
+        db.conn.execute("INSERT INTO metadata (doc_id, archive_year, first_name, last_name, filing_date, filing_type) VALUES (?, ?, 'First', 'Last', ?, 'P')", [doc, year, filing_date])
+        db.conn.execute("INSERT INTO house_generation_metadata (archive_year, generation_id, doc_id, first_name, last_name, filing_date, filing_type) VALUES (?, 'captured-g1', ?, 'First', 'Last', ?, 'P')", [year, doc, filing_date])
+        db.conn.execute("INSERT INTO house_pdf_artifacts (archive_year, generation_id, doc_id, artifact_sha256) VALUES (?, 'captured-g1', ?, ?)", [year, doc, digest])
+    monkeypatch.setattr(common, "pdf_page_count", lambda _: 1)
+    monkeypatch.setattr(coordinator, "ProcessPoolExecutor", lambda slots, **kwargs: ThreadPoolExecutor(slots))
+    return source, db
+
+
+def _local_transaction(**overrides):
+    return {"ticker": "AAPL", "transaction_type": "Purchase", "transaction_date": "2021-01-02",
+            "notification_date": "2021-01-03", "owner_code": "JT", "amount_raw": "$1,001 - $15,000",
+            "amount_midpoint": 8000.5, "instrument_type": "stock", "asset_description": "Original stock [ST]",
+            "source_row_id": "r1", **overrides}
+
+
+def _pipeline_doc(path):
+    return path.read_bytes().splitlines()[0].decode().removeprefix("%PDF-")
+
+
+def _pipeline_backend(monkeypatch, backend):
+    from analyzer.ocr import workers
+    from analyzer.parsing import cascade
+
+    run = workers.subprocess.run
+
+    def text_source(command, *args, **kwargs):
+        if command[0] == "pdftotext":
+            return SimpleNamespace(returncode=0, stdout=Path(command[-2]).read_text(), stderr="")
+        return run(command, *args, **kwargs)
+
+    monkeypatch.setattr(cascade, "parse_pdf_worker", backend)
+    monkeypatch.setattr(workers.subprocess, "run", text_source)
 
 
 def _metadata(*doc_ids):
@@ -498,71 +555,60 @@ def test_second_directory_rename_failure_restores_prior_canonical(tmp_path, monk
 
 
 def test_parse_cached_pdfs_binds_save_to_captured_generation(tmp_path, monkeypatch):
-    source, db = _source(tmp_path)
-    pdf_path = tmp_path / "2021" / "pdfs" / "bound.pdf"
-    pdf_path.parent.mkdir(parents=True)
-    pdf_path.write_bytes(b"%PDF-bound\n%%EOF")
-    source.fetch_metadata = MagicMock(return_value=_metadata("bound"))
-    source.db.get_latest_house_generation = MagicMock(return_value="captured-g1")
-    source._save_parse_results = MagicMock()
+    from analyzer.ocr import workers
 
-    class FakePool:
-        def __init__(self, _workers):
-            pass
+    source, db = _pipeline_source(tmp_path, monkeypatch, ["bound"])
+    captured = []
+    claim = db.work.claim
 
-        def __enter__(self):
-            return self
+    def advance_generation(task_id, **kwargs):
+        work = claim(task_id, **kwargs)
+        captured.append(work.generation_id)
+        if work.generation_id == "captured-g1":
+            db.conn.execute("INSERT INTO house_archive_generations (archive_year, generation_id, metadata_count, ptr_count, promoted_at) VALUES (2021, 'replacement-g2', 1, 1, '2099-01-01')")
+            db.conn.execute("INSERT INTO house_generation_metadata SELECT archive_year, 'replacement-g2', doc_id, first_name, last_name, filing_date, filing_type, fetched_at FROM house_generation_metadata WHERE generation_id='captured-g1'")
+            db.conn.execute("INSERT INTO house_pdf_artifacts (archive_year, generation_id, doc_id, artifact_sha256) SELECT archive_year, 'replacement-g2', doc_id, artifact_sha256 FROM house_pdf_artifacts WHERE generation_id='captured-g1'")
+        return work
 
-        def __exit__(self, *_args):
-            return False
-
-        def map(self, _worker, paths):
-            return [(path, [], ["pdfplumber"]) for path in paths]
-
-        def imap_unordered(self, _worker, paths):
-            return iter([(path, [], ["pdfplumber"]) for path in paths])
-
-    monkeypatch.setattr("analyzer.download.Pool", FakePool)
+    monkeypatch.setattr(db.work, "claim", advance_generation)
+    _pipeline_backend(monkeypatch, lambda path: (path, [_local_transaction()], ["pdftotext"]))
     try:
         source.parse_cached_pdfs(2021, force=True)
+        assert captured == ["captured-g1"]
+        assert db.conn.execute("SELECT COUNT(*) FROM transactions").fetchone() == (0,)
+        assert db.work.status()["by_state"] == {"blocked": 1}
+        source.parse_cached_pdfs(2021)
+        assert captured == ["captured-g1", "replacement-g2"]
+        assert db.conn.execute("SELECT ingestion_generation FROM transactions").fetchall() == [("replacement-g2",)]
+        bundles = [workers.load_result(path) for path in (tmp_path / "pipeline" / "results").glob("*.json")]
+        assert {bundle.work.generation_id for bundle in bundles} == {"captured-g1", "replacement-g2"}
     finally:
         source.close()
         db.close()
 
-    assert source.db.get_latest_house_generation.call_count == 1
-    assert source._save_parse_results.call_args.args[-1] == "captured-g1"
 
-
-@pytest.mark.parametrize("opt_in,force,reuse", [
-    (None, False, False),
-    ("2026", False, True),
-    ("2025", False, False),
-    ("2026", True, False),
-    ("invalid", True, False),
+@pytest.mark.parametrize("opt_in,force", [
+    (None, False),
+    ("2026", False),
+    ("2025", False),
+    ("2026", True),
+    ("invalid", True),
 ])
-def test_parser_recipe_cache_policy_retains_only_explicit_legacy_materializations(
-    tmp_path, monkeypatch, caplog, opt_in, force, reuse
+def test_pipeline_cache_follows_bound_readiness_not_retired_legacy_environment(
+    tmp_path, monkeypatch, opt_in, force
 ):
-    from multiprocessing.pool import ThreadPool
-
     from analyzer.download import validated_pdf_sha256
+    from analyzer.ocr.workers import extraction_recipe
+    from analyzer.ocr.contracts import ExtractionLane
     from analyzer.parsing.metadata import consolidate_transactions
 
     monkeypatch.delenv("PTR_REUSE_LEGACY_V5_CACHE_YEAR", raising=False)
     if opt_in is not None:
         monkeypatch.setenv("PTR_REUSE_LEGACY_V5_CACHE_YEAR", opt_in)
-    source, db = _source(tmp_path)
-    generation = "legacy-untracked-2026"
     docs = ("legacy", "current", "fresh", "changed", "oldgen", "failed")
+    source, db = _pipeline_source(tmp_path, monkeypatch, docs, year=2026, filing_date="2026-10-20")
+    generation = "captured-g1"
     pdf_dir = tmp_path / "2026" / "pdfs"
-    pdf_dir.mkdir(parents=True)
-    for doc in docs:
-        (pdf_dir / f"{doc}.pdf").write_bytes(b"%PDF-" + doc.encode() + b"\n%%EOF")
-    metadata = _metadata(*docs)
-    metadata["ArchiveYear"] = 2026
-    metadata["FilingDate"] = pd.Timestamp("2026-10-20")
-    source.fetch_metadata = MagicMock(return_value=metadata)
-    source.db.get_latest_house_generation = MagicMock(return_value=generation)
     transaction = dict(
         ticker="AAPL", transaction_type="Purchase", transaction_date="09/29/2026",
         owner_code="JT", amount_raw="$1,001 - $15,000", amount_midpoint=8000.5,
@@ -571,11 +617,10 @@ def test_parser_recipe_cache_policy_retains_only_explicit_legacy_materialization
     parsed = []
 
     def worker(path):
-        parsed.append(path.stem)
+        parsed.append(_pipeline_doc(path))
         return path, [{**transaction, "notification_date": "09/30/2026"}], ["pdfplumber"]
 
-    monkeypatch.setattr("analyzer.download.Pool", ThreadPool)
-    monkeypatch.setattr("analyzer.download.tolerant_parse_pdf_worker", worker)
+    _pipeline_backend(monkeypatch, worker)
     lookup = {doc: dict(First="First", Last="Last", FilingDate="2026-10-20") for doc in docs}
     try:
         # Seed genuine legacy versions and values, never label old results as v6.
@@ -586,6 +631,7 @@ def test_parser_recipe_cache_policy_retains_only_explicit_legacy_materialization
             bound_generation = "old-generation" if doc == "oldgen" else generation
             frame = consolidate_transactions({Path(f"{doc}.pdf"): [transaction]}, lookup)
             frame["chamber"] = "house"
+            frame["official_filing_date"] = pd.Timestamp("2026-10-20")
             frame["source_record_id"] = doc
             frame["ingestion_generation"] = bound_generation
             frame["artifact_sha256"] = artifact
@@ -599,192 +645,121 @@ def test_parser_recipe_cache_policy_retains_only_explicit_legacy_materialization
             )
         before_rows = db.conn.execute("SELECT * FROM transactions WHERE doc_id = 'legacy'").fetchall()
         before_runs = db.conn.execute("SELECT * FROM pdf_parse_runs WHERE doc_id = 'legacy'").fetchall()
-        cache_lookup = MagicMock(wraps=db.parse_runs.get_cached_doc_ids)
-        monkeypatch.setattr(db.parse_runs, "get_cached_doc_ids", cache_lookup)
-        with caplog.at_level("INFO", logger="analyzer.download"):
-            source.parse_cached_pdfs(2026, force=force)
-        expected = set(docs) - ({"current"} if not force else set()) - ({"legacy"} if reuse else set())
+        assert set(db.get_unresolved_house_doc_ids(2026, generation)) == {"fresh", "changed", "oldgen", "failed"}
+        source.parse_cached_pdfs(2026, force=force)
+        expected = set(docs) if force else set(docs) - {"legacy", "current"}
         assert set(parsed) == expected
-        assert cache_lookup.call_count == (0 if force else 2 if reuse else 1)
-        for call in cache_lookup.call_args_list:
-            assert call.kwargs["year"] == 2026
-            assert call.kwargs["ingestion_generation"] == generation
-        if reuse:
+        assert db.conn.execute("SELECT COUNT(*) FROM extraction_attempts").fetchone() == (len(expected),)
+        if not force:
             assert db.conn.execute("SELECT * FROM transactions WHERE doc_id = 'legacy'").fetchall() == before_rows
             assert db.conn.execute("SELECT * FROM pdf_parse_runs WHERE doc_id = 'legacy'").fetchall() == before_runs
-            assert "count=1 original_producer=v5-deterministic current_producer=v7-deterministic-row-context" in caplog.text
-            assert "not corrected or reproduced" in caplog.text
-        assert f"year=2026 producer={PARSE_VERSION} force={force}" in caplog.text
-        assert f"PTR_REUSE_LEGACY_V5_CACHE_YEAR={opt_in} legacy_reuse={reuse}" in caplog.text
+        recipe = extraction_recipe(ExtractionLane.LOCAL)
         for doc in expected:
             assert db.conn.execute(
                 "SELECT status FROM pdf_parse_runs WHERE doc_id = ? AND parser_version = ?",
-                [doc, "v7-deterministic-row-context"],
+                [doc, recipe],
             ).fetchall() == [("success",)]
             stored = db.get_transactions_for_doc(doc)
             assert stored["notification_date"].eq(pd.Timestamp("2026-09-30")).any()
+        source.parse_cached_pdfs(2026)
+        assert len(parsed) == len(expected)  # Receipts and canonical binding prevent another parse.
     finally:
         source.close()
         db.close()
 
 
 @pytest.mark.parametrize("value", ["", "1", "true", "2026,2025", "0000"])
-def test_legacy_cache_opt_in_requires_explicit_year_before_access(monkeypatch, value):
+def test_retired_legacy_environment_cannot_change_the_coordinator_contract(monkeypatch, tmp_path, value):
+    from analyzer.ocr import coordinator
+
     monkeypatch.setenv("PTR_REUSE_LEGACY_V5_CACHE_YEAR", value)
-    source = SimpleNamespace(db=MagicMock())
-    with pytest.raises(ValueError, match="must be a four-digit year"):
-        HouseTransactionSource.parse_cached_pdfs(source, 2026)
-    source.db.get_latest_house_generation.assert_not_called()
+    source = SimpleNamespace(db=MagicMock(), data_dir=tmp_path, parallel_workers=2)
+    run = MagicMock(return_value={"unresolved": 0})
+    monkeypatch.setattr(coordinator, "run_pipeline", run)
+    HouseTransactionSource.parse_cached_pdfs(source, 2026)
+    run.assert_called_once_with(tmp_path, [2026], local_workers=2, refresh_recipe=False, database=source.db)
 
 
 def test_parse_cached_pdfs_persists_large_year_in_resumable_batches(
     tmp_path, monkeypatch
 ):
-    source, db = _source(tmp_path)
-    pdf_dir = tmp_path / "2021" / "pdfs"
-    pdf_dir.mkdir(parents=True)
     stems = [f"doc{i:02d}" for i in range(17)]
-    for stem in stems:
-        (pdf_dir / f"{stem}.pdf").write_bytes(
-            b"%PDF-" + stem.encode() + b"\n%%EOF"
-        )
-    source.fetch_metadata = MagicMock(return_value=_metadata(*stems))
-    source.db.get_latest_house_generation = MagicMock(return_value="captured-g1")
-    source._save_parse_results = MagicMock()
-    source._save_failed_parse_runs = MagicMock()
+    source, db = _pipeline_source(tmp_path, monkeypatch, stems)
+    commits = MagicMock(wraps=db.replace_transactions_for_docs)
+    monkeypatch.setattr(db, "replace_transactions_for_docs", commits)
+    parsed = []
 
-    class FakePool:
-        def __init__(self, _workers):
-            pass
+    def backend(path):
+        parsed.append(_pipeline_doc(path))
+        return path, [_local_transaction()], ["pdftotext"]
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def map(self, _worker, paths):
-            return [(path, [], ["pdfplumber"]) for path in paths]
-
-        def imap_unordered(self, _worker, paths):
-            return iter([(path, [], ["pdfplumber"]) for path in paths])
-
-    monkeypatch.setattr("analyzer.download.Pool", FakePool)
+    _pipeline_backend(monkeypatch, backend)
     try:
         source.parse_cached_pdfs(2021, force=True)
+        assert sorted(parsed) == stems
+        assert commits.call_count == len(stems)
+        for call in commits.call_args_list:
+            assert len(call.args[0]) == 1
+            assert len(call.kwargs["attempted_doc_ids"]) == 1
+            assert db.work.is_finished(call.kwargs["receipt"])
+        assert db.work.status()["by_state"] == {"accepted": 17}
+        assert db.conn.execute("SELECT COUNT(*) FROM transactions").fetchone() == (17,)
+        source.parse_cached_pdfs(2021)
+        assert len(parsed) == 17
+        assert db.conn.execute("SELECT COUNT(*) FROM extraction_attempts").fetchone() == (17,)
     finally:
         source.close()
         db.close()
-
-    # Per-document checkpoints: one save per completed PDF so an interrupted
-    # archive resumes without re-running finished siblings.
-    assert source._save_parse_results.call_count == len(stems)
-    for call in source._save_parse_results.call_args_list:
-        assert len(call.args[1]) == 1
-    assert source._save_failed_parse_runs.call_count == 0
 
 
 def test_parse_cached_pdfs_isolates_per_pdf_cascade_failures(
-    tmp_path, monkeypatch, caplog
+    tmp_path, monkeypatch
 ):
-    import logging
-
-    from analyzer import download as download_module
+    from analyzer.ocr import workers
     from analyzer.parsing.cascade import ParserCascadeError
 
-    source, db = _source(tmp_path)
-    pdf_dir = tmp_path / "2021" / "pdfs"
-    pdf_dir.mkdir(parents=True)
-    for stem in ("goodone", "badone"):
-        (pdf_dir / f"{stem}.pdf").write_bytes(b"%PDF-" + stem.encode() + b"\n%%EOF")
-    source.fetch_metadata = MagicMock(return_value=_metadata("goodone", "badone"))
-    source.db.get_latest_house_generation = MagicMock(return_value="captured-g1")
-    source._save_parse_results = MagicMock()
+    source, db = _pipeline_source(tmp_path, monkeypatch, ["goodone", "badone"])
+    parsed = []
 
     def fake_worker(path):
-        if path.stem == "badone":
+        parsed.append(_pipeline_doc(path))
+        if _pipeline_doc(path) == "badone":
             raise ParserCascadeError(f"{path}: unresolved parser completeness: boom")
-        return path, [], ["pdfplumber", "won:pdfplumber"]
+        return path, [_local_transaction()], ["pdfplumber", "won:pdfplumber"]
 
-    monkeypatch.setattr(download_module, "parse_pdf_worker", fake_worker)
-
-    class FakePool:
-        def __init__(self, _workers):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def map(self, worker, paths):
-            return [worker(path) for path in paths]
-
-        def imap_unordered(self, worker, paths):
-            return iter([worker(path) for path in paths])
-
-    monkeypatch.setattr(download_module, "Pool", FakePool)
+    _pipeline_backend(monkeypatch, fake_worker)
     try:
-        with caplog.at_level(logging.WARNING, logger="analyzer.download"):
-            source.parse_cached_pdfs(2021, force=True)
+        source.parse_cached_pdfs(2021, force=True)
+        assert sorted(parsed) == ["badone", "goodone"]
+        assert db.conn.execute("SELECT doc_id FROM canonical_transactions").fetchall() == [("goodone",)]
+        assert db.work.status()["by_state"] == {"accepted": 1, "needs_review": 1}
+        bundles = {bundle.work.doc_id: bundle for bundle in (
+            workers.load_result(path) for path in (tmp_path / "pipeline" / "results").glob("*.json"))}
+        assert bundles["badone"].evidence["failure"]["type"] == "ParserCascadeError"
+        assert "boom" in bundles["badone"].evidence["failure"]["message"]
+        assert bundles["badone"].raw_response == "%PDF-badone\n%%EOF"
+        source.parse_cached_pdfs(2021)
+        assert len(parsed) == 2
     finally:
         source.close()
         db.close()
-
-    results = source._save_parse_results.call_args.args[1]
-    assert [pdf_path.stem for pdf_path, _tx, _engines in results] == ["goodone"]
-    failure_warnings = [
-        record
-        for record in caplog.records
-        if record.levelno == logging.WARNING and "badone" in record.getMessage()
-    ]
-    assert failure_warnings, "expected a warning naming the failed doc_id"
-    assert any(
-        "Excluding unparseable PDF" in record.getMessage()
-        for record in failure_warnings
-    )
 
 
 def test_failed_reparse_preserves_terminal_run_rows_and_generation_audit(
     tmp_path, monkeypatch
 ):
-    from analyzer import download as download_module
+    from analyzer.ocr import workers
     from analyzer.parsing.cascade import ParserCascadeError
     from scripts.audit_generation import (
         check_house_generation_activation,
         check_parse_counts_match_persisted,
     )
 
-    source, db = _source(tmp_path)
+    source, db = _pipeline_source(tmp_path, monkeypatch, ["stable"], filing_date="2021-01-03")
     generation = "captured-g1"
     pdf_path = tmp_path / "2021" / "pdfs" / "stable.pdf"
-    pdf_path.parent.mkdir(parents=True)
-    pdf_bytes = b"%PDF-stable\n%%EOF"
-    pdf_path.write_bytes(pdf_bytes)
-    artifact_sha = hashlib.sha256(pdf_bytes).hexdigest()
-    source.fetch_metadata = MagicMock(return_value=_metadata("stable"))
-    source.db.get_latest_house_generation = MagicMock(return_value=generation)
-
-    metadata, _ = _acquired("stable")
-    db.replace_metadata(2021, metadata)
-    db.conn.execute(
-        """
-        INSERT INTO house_archive_generations (
-            archive_year, generation_id, metadata_sha256,
-            metadata_count, ptr_count, parse_status
-        ) VALUES (2021, ?, 'metadata-sha', 1, 1, 'complete')
-        """,
-        [generation],
-    )
-    db.conn.execute(
-        """
-        INSERT INTO house_pdf_artifacts (
-            archive_year, doc_id, generation_id, artifact_sha256, http_status
-        ) VALUES (2021, 'stable', ?, ?, 200)
-        """,
-        [generation, artifact_sha],
-    )
+    artifact_sha = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
+    db.conn.execute("UPDATE house_archive_generations SET parse_status='complete'")
     db.upsert_transactions(
         pd.DataFrame(
             [{
@@ -793,6 +768,7 @@ def test_failed_reparse_preserves_terminal_run_rows_and_generation_audit(
                 "ticker": "AAPL",
                 "transaction_date": date(2021, 1, 2),
                 "disclosure_date": date(2021, 1, 3),
+                "official_filing_date": date(2021, 1, 3),
                 "transaction_type": "Purchase",
                 "chamber": "house",
                 "source_record_id": "stable",
@@ -822,7 +798,7 @@ def test_failed_reparse_preserves_terminal_run_rows_and_generation_audit(
             artifact_sha256, landing_sha256, error_message,
             raw_row_count, accepted_row_count, rejected_row_count
         ) VALUES (?, 'house_pdf', 'house', 'stable', '2021/pdfs/stable.pdf',
-                  'First Last', '2022-01-04', 'parsed', ?, ?, NULL, 1, 1, 0)
+                  'First Last', '2021-01-03', 'parsed', ?, ?, NULL, 1, 1, 0)
         """,
         [generation, artifact_sha, artifact_sha],
     )
@@ -830,27 +806,16 @@ def test_failed_reparse_preserves_terminal_run_rows_and_generation_audit(
     def failed_worker(path):
         raise ParserCascadeError(f"{path}: unresolved parser completeness: boom")
 
-    monkeypatch.setattr(download_module, "parse_pdf_worker", failed_worker)
-
-    class FakePool:
-        def __init__(self, _workers):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def map(self, worker, paths):
-            return [worker(path) for path in paths]
-
-        def imap_unordered(self, worker, paths):
-            return iter([worker(path) for path in paths])
-
-    monkeypatch.setattr(download_module, "Pool", FakePool)
+    _pipeline_backend(monkeypatch, failed_worker)
+    before_rows = db.conn.execute("SELECT * FROM transactions").fetchall()
+    before_versions = db.conn.execute("SELECT * FROM transaction_versions").fetchall()
     try:
         source.parse_cached_pdfs(2021, force=True)
+        assert db.work.status()["by_state"] == {"needs_review": 1}
+        assert db.conn.execute("SELECT * FROM transactions").fetchall() == before_rows
+        assert db.conn.execute("SELECT * FROM transaction_versions").fetchall() == before_versions
+        bundle = workers.load_result(next((tmp_path / "pipeline" / "results").glob("*.json")))
+        assert "boom" in bundle.evidence["failure"]["message"]
         runs = db.conn.execute(
             """
             SELECT status, transaction_count
@@ -893,57 +858,64 @@ def test_engine_error_detail_only_flags_dedicated_sentinel():
 
 
 def test_parse_cached_pdfs_saves_docs_with_transient_engine_errors(
-    tmp_path, monkeypatch, caplog
+    tmp_path, monkeypatch
 ):
-    import logging
+    from analyzer.ocr import workers
 
-    from analyzer import download as download_module
-
-    source, db = _source(tmp_path)
-    pdf_dir = tmp_path / "2021" / "pdfs"
-    pdf_dir.mkdir(parents=True)
-    (pdf_dir / "mixedone.pdf").write_bytes(b"%PDF-mixedone\n%%EOF")
-    source.fetch_metadata = MagicMock(return_value=_metadata("mixedone"))
-    source.db.get_latest_house_generation = MagicMock(return_value="captured-g1")
-    source._save_parse_results = MagicMock()
+    source, db = _pipeline_source(tmp_path, monkeypatch, ["mixedone"])
 
     def fake_worker(path):
-        return path, [], ["lattice", "error:lattice", "won:pdftotext"]
+        return path, [_local_transaction()], ["lattice", "error:lattice", "won:pdftotext"]
 
-    monkeypatch.setattr(download_module, "parse_pdf_worker", fake_worker)
-
-    class FakePool:
-        def __init__(self, _workers):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def map(self, worker, paths):
-            return [worker(path) for path in paths]
-
-        def imap_unordered(self, worker, paths):
-            return iter([worker(path) for path in paths])
-
-    monkeypatch.setattr(download_module, "Pool", FakePool)
+    _pipeline_backend(monkeypatch, fake_worker)
     try:
-        with caplog.at_level(logging.WARNING, logger="analyzer.download"):
-            source.parse_cached_pdfs(2021, force=True)
+        source.parse_cached_pdfs(2021, force=True)
+        assert db.work.status()["by_state"] == {"accepted": 1}
+        assert db.conn.execute("SELECT doc_id FROM canonical_transactions").fetchall() == [("mixedone",)]
+        bundle = workers.load_result(next((tmp_path / "pipeline" / "results").glob("*.json")))
+        assert bundle.outcome == "candidate"
+        assert bundle.evidence["engines"] == ["lattice", "error:lattice", "won:pdftotext"]
+        assert "failure" not in bundle.evidence
     finally:
         source.close()
         db.close()
 
-    results = source._save_parse_results.call_args.args[1]
-    assert [pdf_path.stem for pdf_path, _tx, _engines in results] == ["mixedone"]
-    exclusion_warnings = [
-        record
-        for record in caplog.records
-        if record.levelno == logging.WARNING and "Excluding" in record.getMessage()
-    ]
-    assert not exclusion_warnings, "transient engine errors must not quarantine a doc"
+
+def test_local_notification_before_transaction_is_reviewable_without_guessing_or_redispatch(tmp_path, monkeypatch):
+    from analyzer.ocr import coordinator, workers
+
+    source, db = _pipeline_source(tmp_path, monkeypatch, ["badnf"], filing_date="2021-01-03")
+    pdf = tmp_path / "2021" / "pdfs" / "badnf.pdf"
+    raw_source = "%PDF-badnf\nTX: 01/02/2021\nNF: 01/01/2021\n%%EOF"
+    pdf.write_text(raw_source)
+    db.conn.execute("UPDATE house_pdf_artifacts SET artifact_sha256=? WHERE doc_id='badnf'", [hashlib.sha256(pdf.read_bytes()).hexdigest()])
+    row = _local_transaction(notification_date="2021-01-01", raw_cells={"TX": "01/02/2021", "NF": "01/01/2021"})
+    calls = []
+
+    def backend(path):
+        calls.append(_pipeline_doc(path))
+        return path, [row], ["pdftotext"]
+
+    _pipeline_backend(monkeypatch, backend)
+    try:
+        source.parse_cached_pdfs(2021, force=True)
+        bundle = workers.load_result(next((tmp_path / "pipeline" / "results").glob("*.json")))
+        assert bundle.raw_response == raw_source
+        assert bundle.rows == [row]
+        assert bundle.rows[0]["raw_cells"]["NF"] == "01/01/2021"
+        assert db.work.status()["by_state"] == {"needs_review": 1}
+        assert db.get_unresolved_house_doc_ids(2021, "captured-g1") == ["badnf"]
+        assert db.conn.execute("SELECT COUNT(*) FROM transactions").fetchone() == (0,)
+        assert db.conn.execute("SELECT COUNT(*) FROM transaction_versions").fetchone() == (0,)
+        status = coordinator.pipeline_status(tmp_path, database=db)
+        assert status["documents"]["by_state"] == {"needs_review": 1}
+        source.parse_cached_pdfs(2021)
+        assert calls == ["badnf"]
+        assert db.conn.execute("SELECT COUNT(*) FROM extraction_attempts").fetchone() == (1,)
+        assert db.conn.execute("SELECT state, finished_at IS NOT NULL FROM extraction_results").fetchall() == [("needs_review", True)]
+    finally:
+        source.close()
+        db.close()
 
 
 

@@ -35,7 +35,11 @@ if __name__ == "__main__":
             sys.path.insert(0, _entry)
 
 from analyzer.freshness import FreshnessCheck, monitoring_checks  # noqa: E402
-from analyzer.persistence.ownership import OwnershipError, resolve_read_path  # noqa: E402
+from analyzer.persistence.ownership import (  # noqa: E402
+    OwnershipError,
+    publication_state,
+    resolve_read_path,
+)
 from scripts.audit_sample import doc_fail_severity, verdict_of  # noqa: E402
 
 CANONICAL = Path(os.environ.get("DOCTOR_CANONICAL", str(REPO / "data" / "congress.duckdb")))
@@ -103,7 +107,9 @@ def check(
 ) -> list[FreshnessCheck]:
     staging_root = staging_root or STAGING_ROOT
     ocr_log_root = ocr_log_root or OCR_LOG_ROOT
+    quality_hold = _publication_quality_hold()
     results: list[FreshnessCheck] = [
+        *([quality_hold] if quality_hold is not None else []),
         *monitoring_checks(canonical, receipts_path=RECEIPTS, staging_root=staging_root),
         # 5. No unconsumed cron artifacts older than the grace window.
         _stale_artifacts(),
@@ -120,6 +126,23 @@ def check(
         _crontab_contract(),
     ]
     return results
+
+
+def _publication_quality_hold() -> FreshnessCheck | None:
+    """Freshness of a readable snapshot does not clear an operator hold."""
+    name = "publication.quality_hold"
+    try:
+        state = publication_state(CANONICAL)
+    except (OwnershipError, OSError, ValueError, KeyError, TypeError) as exc:
+        return FreshnessCheck.unknown(name, f"cannot inspect publication state: {exc}")
+    if "quality_hold" not in state:
+        return None
+    return FreshnessCheck(
+        name,
+        f"OPERATOR HOLD: {state['quality_hold']}; new admission/publication blocked; "
+        "the pinned snapshot remains readable, not approved for new admission",
+        False,
+    )
 
 
 def _rel(path: Path) -> str:

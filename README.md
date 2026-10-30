@@ -207,6 +207,20 @@ An active owner without a published snapshot is an error, not permission to
 read the working database. Unowned standalone databases without publication
 remain readable. Fetch/parse/refresh are mutating paths.
 
+### Operator quality hold
+
+An active publication `quality_hold` leaves the pinned snapshot readable, but
+readability or healthy freshness is **not new admission clearance**. Doctor
+reports `publication.quality_hold` as FAIL with the hold reason. The hold is
+already checked before coordinator startup and snapshot publication; the
+broader API admission-policy gate is under development, not a release procedure.
+Queued sources may be source-staged, not admitted or published while held.
+
+Release requires verified repair/quarantine and new source-grounded Gemini
+and GLM review, then explicit operator release through the publication guard;
+do not force publication or remove the hold just to resume a queue. A source
+model name or valid JSON does not establish fidelity to the source document.
+
 The database is single-owner, not a collection of independent writer services.
 Writable `Database` instances acquire ownership before connecting. Raw repair
 and promotion tools acquire the same maintenance lease, including filesystem

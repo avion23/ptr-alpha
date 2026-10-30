@@ -54,12 +54,22 @@ published readers can observe them; a successful repair is not proof that the
 served version changed. OCR parallel work belongs to the unified coordinator,
 not an independently scheduled writer loop.
 
+An active publication `quality_hold` is an operator block, even when the pinned
+snapshot is readable and fresh. Doctor emits `publication.quality_hold` FAIL
+with its reason. Coordinator startup and publication already refuse the hold;
+broader API admission-policy gating is under development. Sources may remain
+queued/source-staged, not admitted or published. Verified repair/quarantine and
+new source-grounded Gemini plus GLM review are required before explicit manual
+release through the publication guard; no force bypass. Model names and valid
+JSON alone are not source-fidelity evidence.
+
 `cron/backlog_ocr.sh` now invokes that coordinator once, with three local and
 two GLM slots (Gemini disabled), rather than running `glm_stage.py` year loops.
 The six-hour deadline reserves five minutes for backup/doctor work; both tail
 steps use the remaining deadline. Its wrapper `flock` prevents duplicate cron
 invocations but is not a substitute for the database owner lease. GLM quota
-exhaustion remains lane-local, with retries/blocked work in structured status;
+exhaustion uses lane-local backoff for the configured two GLM provider slots,
+with retries/blocked work in structured status, not a billing/quota probe;
 no leftover-count regex claims quota exhaustion or archive completion.
 The existing backup preserves the staged GLM audit corpus, not the canonical
 database or the coordinator spool. Coordinator, backup, and doctor failures

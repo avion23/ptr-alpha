@@ -35,7 +35,13 @@ def database_owner(db_path, purpose):
         try:
             fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            raise OwnershipError(f"Database already has a writer owner: {path}") from exc
+            raise OwnershipError(
+                f"Database already has a writer owner: {path}. "
+                "For maintenance, stop/drain the current owner at the repository CLI "
+                "boundary and wait for ownership release. Run maintenance against "
+                f"the working database {path}, not a published snapshot; then "
+                "republish a snapshot before resuming readers on the new version."
+            ) from exc
         try:
             yield lease
         finally:

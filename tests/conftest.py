@@ -27,6 +27,34 @@ def make_ocr_output(member="Jane Doe", **overrides):
     return "SCHEMA: 4\nMEMBER: " + member + "\nPAGES: 1\nPAGE: 1\nROW: " + json.dumps(row)
 
 
+def make_text_pdf(path, lines):
+    """Tiny real one-page source, using the parser-cascade PDF fixture format."""
+    text = "BT /F1 10 Tf 40 750 Td 18 TL\n" + "\n".join(
+        "(" + line.replace("\\", "\\\\").replace("(", r"\(").replace(")", r"\)") + ") Tj T*"
+        for line in lines
+    ) + "\nET"
+    stream = text.encode("ascii")
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>",
+        b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
+    ]
+    content, offsets = b"%PDF-1.4\n", []
+    for number, obj in enumerate(objects, 1):
+        offsets.append(len(content))
+        content += f"{number} 0 obj\n".encode() + obj + b"\nendobj\n"
+    xref = len(content)
+    content += b"xref\n0 6\n0000000000 65535 f \n"
+    content += b"".join(f"{offset:010d} 00000 n \n".encode() for offset in offsets)
+    content += f"trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    return path
+
+
 def make_entry_prices(transactions_df, prices_df):
     prices_long = prices_df.stack().reset_index(name="price")
     prices_long.columns = ["price_date", "ticker", "price"]

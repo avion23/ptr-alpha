@@ -23,7 +23,7 @@ consolidation + metadata attribution
 atomic transaction + parse-run persistence
         |
         v
-complete generation -> canonical_transactions
+accepted document rowset -> canonical_transactions -> sealed read publication
 ```
 
 ### 1. Metadata
@@ -40,7 +40,11 @@ Validation includes:
 - filing-date validation;
 - ambiguous ZIP text-member rejection.
 
-House archive generations are tracked explicitly. An incomplete generation is not made canonical merely because some files or rows exist.
+House archive generations are tracked explicitly. An accepted, artifact-bound
+document rowset can be admitted incrementally without calling its annual
+archive complete. Mere file or row existence is not admission. Archive
+completion still requires the archive-level inventory and terminal-outcome
+checks; read publication does not establish that every filing was recovered.
 
 ### 2. PDF acquisition
 
@@ -130,6 +134,24 @@ The `v7-deterministic-row-context` recipe uses a new cache fingerprint; earlier
 terminal parses are not evidence that this changed recipe reproduced their rows.
 
 ## Consolidation and persistence
+
+The unified coordinator owns the writable database. Extraction workers return
+database-free results; they do not open canonical independently. The legacy
+`scripts/ocr_parallel.py` entry point delegates to that coordinator, accepting
+only `--data-dir`, `--years`, and `--workers`. Readers resolve one immutable
+published version and keep it pinned for the read. Missing publication while
+an owner is active is an explicit error.
+
+Repair/backfill/promotion tools acquire the same exclusive maintenance lease.
+If the coordinator is active, arrange a handoff and wait for it to release
+ownership; do not start another writer, remove its lease file, or guess from
+process names. Resume the owner and publish after maintenance: changing the
+working file alone does not advance an existing publication pointer.
+
+These ownership and publication boundaries do not replace semantic admission.
+In particular, a historical five-field audit is not proof of the full rowset,
+artifact, generation, availability, or archive-completeness contract. Existing
+admission and validation gates remain required.
 
 `consolidate_transactions()` joins parsed document IDs to House metadata, assigns member/disclosure identity, normalizes dates, and rejects impossible rows.
 

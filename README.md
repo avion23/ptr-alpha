@@ -201,7 +201,25 @@ Common commands:
 | `ptr-alpha portfolio --start 2024-01-01 --end 2025-12-31` | Shared-cash equal-slot portfolio simulation; optional slippage is declared in basis points |
 | `ptr-alpha snapshot` | Explicitly write a reproducible price snapshot |
 
-`analyze`, `backtest`, `portfolio`, and `snapshot` open the canonical database read-only. Fetch/parse/refresh are the mutating paths.
+`analyze`, `backtest`, `portfolio`, and `snapshot` read a pinned published
+database version when publication is configured, not the writer's working file.
+An active owner without a published snapshot is an error, not permission to
+read the working database. Unowned standalone databases without publication
+remain readable. Fetch/parse/refresh are mutating paths.
+
+The database is single-owner, not a collection of independent writer services.
+Writable `Database` instances acquire ownership before connecting. Raw repair
+and promotion tools acquire the same maintenance lease, including filesystem
+replacement. If an owner is running, request an explicit maintenance handoff:
+let that owner finish and release ownership before running the repair, then
+resume the coordinator and publish a fresh snapshot. Do not bypass the lease
+or infer permission from a process-name scan. Maintenance edits to a working
+database do not by themselves replace an already published read version.
+
+`scripts/ocr_parallel.py` delegates to `analyzer.ocr.coordinator.run_pipeline`;
+it no longer starts a competing database writer. Its supported arguments are
+`--data-dir`, `--years`, and `--workers` (Gemini slots). Unsupported legacy
+arguments fail rather than silently broadening work or forcing partial results.
 
 `setups` also reads the canonical database without changing it, but publishes
 receipts under `data/recommendations/` unless `--no-receipt` is specified.

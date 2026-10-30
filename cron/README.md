@@ -37,6 +37,23 @@ Made checkable by four mechanisms, none of which rely on vigilance:
 
 ## Files
 
+### Ownership and publication
+
+Scheduling offsets are not a concurrency guarantee. Every writable `Database`
+uses the same exclusive owner lease as raw maintenance tools. A scheduled
+repair or price merge must refuse when the coordinator owns canonical; an
+operator must arrange an explicit maintenance handoff before retrying. Do not
+use `fuser`, process-name scans, or removal of the lock file to claim ownership.
+This change does not install cron entries or stop an existing process.
+
+Readers, including `scripts/doctor.py`, resolve and pin the published snapshot.
+They never fall back to the active working file when publication is missing.
+The price merge publishes its committed output before its consumption check.
+Other raw maintenance changes require a subsequent owner publication before
+published readers can observe them; a successful repair is not proof that the
+served version changed. OCR parallel work belongs to the unified coordinator,
+not an independently scheduled writer loop.
+
 - `cron/crontab.txt` — source of truth (`@REPO@` placeholder).
 - `cron/install.sh` — dry-run diff / `-y` apply with timestamped backup.
 - `cron/weekly_prices.sh` — Tue/Thu/Sat 00:17 UTC: refresh + merge + snapshot.

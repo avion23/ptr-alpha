@@ -1,5 +1,4 @@
 """Grounded local review authority, immutable receipts and scoped withdrawal."""
-from copy import deepcopy
 from dataclasses import replace
 from datetime import date
 import hashlib
@@ -240,6 +239,66 @@ def test_withdrawn_raw_result_cannot_reuse_its_old_review_to_readmit(quarantinab
     assert ingest(db, result, root) == "needs_review"
     assert db.work.effective_admission_decision(scope[0]) == withdrawn
     assert db.conn.execute("SELECT * FROM canonical_transactions WHERE doc_id='review'").fetchall() == restored
+    with pytest.raises(ValueError, match="supersedes_admission_decision_id"):
+        review.record_review(result, root, source_report(result), verdict="pass", human_reviewed=True, database=db)
+    directory = Path(review.prepare_review(result, root, database=db))
+    checklist = directory / f"report-template-{withdrawn['result_id']}.json"
+    assert json.loads(checklist.read_text())["omissions_checked"] is False
+    report = source_report(result)
+    report["supersedes_admission_decision_id"] = withdrawn["result_id"]
+    with pytest.raises(ValueError, match="current database"):
+        review.record_review(result, root, report, verdict="pass", human_reviewed=True)
+    review.record_review(result, root, report, verdict="pass", human_reviewed=True, database=db)
+    assert ingest(db, result, root) == "accepted"
+    assert db.work.effective_admission_decision(scope[0])["result_id"] != withdrawn["result_id"]
+
+
+def test_successful_model_empty_claim_requires_grounded_all_page_absence_review(candidate, monkeypatch):
+    db, _, root = candidate
+    pdf = make_text_pdf(root / "2025/pdfs/empty.pdf", [
+        "HOUSE PERIODIC TRANSACTION REPORT", "Filer: Jane Doe", "Filed: 01/20/2025",
+        "No transactions reported. No data rows, continuation pages, or examples.",
+    ])
+    sha = hashlib.sha256(pdf.read_bytes()).hexdigest()
+    db.conn.execute("INSERT INTO house_generation_metadata (archive_year,generation_id,doc_id,first_name,last_name,filing_date,filing_type) VALUES (2025,'g','empty','Jane','Doe','2025-01-20','P')")
+    db.conn.execute("INSERT INTO house_pdf_artifacts (archive_year,generation_id,doc_id,artifact_sha256) VALUES (2025,'g','empty',?)", [sha])
+    work = coordinator._envelope(dict(archive_year=2025, generation_id='g', doc_id='empty',
+                                     artifact_sha256=sha, first_name='Jane', last_name='Doe', filing_date='2025-01-20'),
+                                 root, ExtractionLane.GEMINI, workers.extraction_recipe(ExtractionLane.GEMINI))
+    db.work.register(work)
+    work = db.work.claim(work.task_id)
+    raw = "SCHEMA: 4\nMEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\nNO_TRANSACTIONS"
+    parsed = common.parse_gemini_output(raw, expected_page_count=1)
+
+    def provider(path, **kwargs):
+        return raw, '', common.ArtifactMetadata(sha, 1, len(pdf.read_bytes()), str(path), parsed)
+
+    monkeypatch.setattr(common, 'call_gemini', provider)
+    result = workers.load_result(workers.extract_document(work, str(root / 'pipeline')))
+    assert result.outcome == ExtractionOutcome.CANDIDATE  # Reviewable claim, not verified absence.
+    assert result.rows == []
+    assert [(page['page_number'], page['outcome']) for page in result.evidence['page_outcomes']] == [(1, 'unknown')]
+    assert ingest(db, result, root) == 'needs_review'
+    review.prepare_review(result, root)
+    report = review.review_report_template(result)
+    report['evidence'] = 'Unit oracle: complete one-page source explicitly says no transactions; no table rows.'
+    report['omissions_checked'] = True
+    with pytest.raises(ValueError, match='affirmative source-grounded coverage'):
+        review.record_review(result, root, report, verdict='pass', human_reviewed=True)
+    report['pages'][0].update(outcome='verified_nontransaction', evidence='Whole page checked: filer header and no-transactions statement only.')
+    review.record_review(result, root, report, verdict='pass', human_reviewed=True)
+    assert ingest(db, result, root) == 'verified_empty'
+    assert db.conn.execute("SELECT status,transaction_count FROM pdf_parse_runs WHERE doc_id='empty'").fetchall() == [('no_txs', 0)]
+
+
+@pytest.mark.parametrize('raw,error', [('', None), ('garbage', None),
+    ('SCHEMA: 4\nMEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\nNO_TRANSACTIONS', {'failure': {'type': 'TimeoutError'}})])
+def test_failed_or_garbage_empty_results_cannot_be_prepared_for_positive_review(candidate, raw, error):
+    _, result, root = candidate
+    empty = replace(result, rows=[], raw_response=raw, evidence={**result.evidence, **(error or {}),
+                    'page_outcomes': [{'page_number': 1, 'outcome': 'unknown'}]})
+    with pytest.raises(ValueError):
+        review.prepare_review(empty, root)
 
 
 def test_sql_projection_failure_rolls_back_canonical_rows_before_receipt_acceptance(candidate, monkeypatch):

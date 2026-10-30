@@ -164,7 +164,7 @@ def _current_binding(db: Database, work: WorkEnvelope) -> bool:
 def _ingest(db: Database, result, path: Path, data_dir: Path, source) -> str:
     from analyzer.ocr.ingestion import insert_transactions_outcome
     from analyzer.ocr.normalization import normalize_candidate
-    from analyzer.ocr.workers import admission_decision, admission_guard
+    from analyzer.ocr.workers import admission_guard
 
     work = result.work
     receipt = dict(task_id=work.task_id, attempt_id=work.attempt_id,
@@ -172,33 +172,7 @@ def _ingest(db: Database, result, path: Path, data_dir: Path, source) -> str:
     if db.work.is_finished(receipt):
         row = db.conn.execute("SELECT state FROM extraction_results WHERE result_id = ?",
                               [receipt["result_id"]]).fetchone()
-        # Re-admission is a new decision over the SAME extraction attempt,
-        # not a new extraction or a rewrite of its historical refusal.
-        current = db.conn.execute("SELECT attempt_id, status FROM extraction_work WHERE task_id = ?",
-                                  [work.task_id]).fetchone()
-        if (row[0] != "needs_review" or work.lane != ExtractionLane.GLM
-                or current != (work.attempt_id, "needs_review")
-                or not _current_binding(db, work)):
-            return row[0]
-        gate = admission_decision(result, data_dir)
-        if not gate["allowed"]:
-            return row[0]
-        from analyzer.ocr.workers import _publish
-
-        decision = replace(result, evidence={**result.evidence, "admission_binding": gate["audit_binding"]})
-        if decision == result:
-            return row[0]
-        decision_path = Path(_publish(decision, str(data_dir / "pipeline")))
-        db.conn.execute("BEGIN TRANSACTION")
-        try:
-            db.conn.execute("UPDATE extraction_work SET status = 'running', updated_at = CURRENT_TIMESTAMP WHERE task_id = ?",
-                            [work.task_id])
-            db.work.register_result(decision, str(decision_path))
-            db.conn.execute("COMMIT")
-        except Exception:
-            db.conn.execute("ROLLBACK")
-            raise
-        return _ingest(db, decision, decision_path, data_dir, source)
+        return row[0]  # Finished receipts are immutable; readmission appends a decision.
     db.work.validate_receipt(receipt)
     if not _current_binding(db, work):
         db.work.finish(receipt, "blocked", "source generation/artifact is no longer current")
@@ -226,7 +200,7 @@ def _ingest(db: Database, result, path: Path, data_dir: Path, source) -> str:
         # consolidation/validation, so do not OCR-normalize them a second time.
         local_candidate = (work.lane == ExtractionLane.LOCAL
                            and result.outcome == ExtractionOutcome.CANDIDATE and bool(result.rows))
-        candidate = None if local_candidate else normalize_candidate(work, result)
+        candidate = None if local_candidate else gate.get("candidate") or normalize_candidate(work, result)
         status = result.outcome.value if candidate is None else candidate["status"]
         if not gate["allowed"] or status not in {"candidate", "verified_empty"}:
             permanent = ((status == "blocked" or result.outcome == ExtractionOutcome.BLOCKED)
@@ -251,6 +225,7 @@ def _ingest(db: Database, result, path: Path, data_dir: Path, source) -> str:
             insert_transactions_outcome(
                 work.doc_id, work.archive_year, work.member, candidate["rows"],
                 conn=db.conn, receipt=receipt, evidence=result.evidence,
+                admission=gate,
                 raw_count=len(result.rows), parser_version=work.extraction_recipe,
                 artifact_sha256=work.artifact_sha256, ingestion_generation=work.generation_id,
                 engine_model=model, checkpoint=False,

@@ -778,7 +778,6 @@ def _validate_attempt_bundle(data_dir, doc_dir: Path, record: dict) -> None:
 
 def _emit_attempt_bundle(data_dir, year, doc_id, record_bytes, *, render):
     from scripts.glm_stage import ArtifactRequest, manifest_artifact
-    from analyzer.ocr.common import pdf_page_count
 
     if not render:
         raise ValueError("attempt-scoped bundles require rendered pages")
@@ -797,25 +796,46 @@ def _emit_attempt_bundle(data_dir, year, doc_id, record_bytes, *, render):
         if os.path.lexists(doc_dir):
             _validate_attempt_bundle(data_dir, doc_dir, record)
             return
-        pdf_path, identity = manifest_artifact(ArtifactRequest.from_record(record), data_dir)
+        _, identity = manifest_artifact(ArtifactRequest.from_record(record), data_dir)
         pdf_bytes = identity["pdf_bytes"]
+        emit_bound_review_bundle(data_dir, doc_dir, record_bytes, pdf_bytes)
+
+
+def emit_bound_review_bundle(data_dir, doc_dir: Path, record_bytes: bytes, pdf_bytes: bytes):
+    """Freeze actual source pixels and a bound candidate using the shared seal."""
+    from analyzer.ocr.common import pdf_page_count
+    from analyzer.ocr.ingestion import approved_data_root
+
+    with approved_data_root(data_dir) as root, ExitStack() as stack:
+        doc_dir = Path(root) / doc_dir.relative_to(Path(data_dir))
+        record = json.loads(record_bytes)
         if hashlib.sha256(pdf_bytes).hexdigest() != record.get("pdf_sha256"):
-            raise ValueError("audit snapshot SHA-256 does not match staged artifact")
+            raise ValueError("audit snapshot SHA-256 does not match bound artifact")
+        fd = root.fd
+        for part in doc_dir.parent.relative_to(Path(root)).parts:
+            try:
+                os.mkdir(part, dir_fd=fd)
+            except FileExistsError:
+                pass
+            fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            stack.callback(os.close, fd)
+        if os.path.lexists(doc_dir):
+            _validate_attempt_bundle(root, doc_dir, record)
+            return
         with tempfile.TemporaryDirectory(prefix=".audit-attempt-", dir=f"/proc/{os.getpid()}/fd/{fd}") as directory:
             temporary = Path(directory)
-            snapshot = temporary / pdf_path.name
+            snapshot = temporary / "source.pdf"
             snapshot.write_bytes(pdf_bytes)
             if pdf_page_count(snapshot) != record.get("pages"):
                 raise ValueError("staged page count does not match PDF")
             render_pdf_pages(snapshot, temporary / "pages")
-            snapshot.unlink()
             (temporary / "record.json").write_bytes(record_bytes)
             # Validate through the approved root before publishing the completed directory.
             rooted_temporary = doc_dir.parent / temporary.name
-            seal = _attempt_bundle_seal(data_dir, rooted_temporary, record)
+            seal = _attempt_bundle_seal(root, rooted_temporary, record)
             with (temporary / "bundle-seal.json").open("x", encoding="utf-8") as handle:
                 json.dump(seal, handle, indent=2, sort_keys=True)
-            _validate_attempt_bundle(data_dir, rooted_temporary, record)
+            _validate_attempt_bundle(root, rooted_temporary, record)
             if os.path.lexists(doc_dir):
                 raise ValueError("attempt bundle appeared during rendering; refusing to replace")
             os.rename(temporary.name, doc_dir.name, src_dir_fd=fd, dst_dir_fd=fd)

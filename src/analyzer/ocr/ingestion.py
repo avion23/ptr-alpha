@@ -25,7 +25,6 @@ from pathlib import Path
 
 from analyzer.persistence.database import Database
 from analyzer.ocr.common import (
-    apply_verified_house_corrections,
     GEMINI_PARSER_VERSION,
     MODEL,
     GeminiOutputError as GeminiOutputError,
@@ -38,7 +37,7 @@ from analyzer.ocr.common import (
 from analyzer.ocr.paths import DATA_DIR, STAGING_ROOT
 from analyzer.ocr.normalization import (
     CACHE_ROW_COLUMNS, canonical_row_projection, normalize_rows,
-    typed_instrument_fields, verified_empty_evidence,
+    typed_instrument_fields,
 )
 
 DB_PATH = str(DATA_DIR / "congress.duckdb")
@@ -112,6 +111,10 @@ OCR_INSERT_COLUMNS = [
     "instrument_type",
     "strike_price",
     "expiry_date",
+    "acceptance_datetime",
+    "source_report_path",
+    "member_key",
+    "chamber_member_key",
 ]
 
 
@@ -1723,7 +1726,18 @@ class InsertOutcome:
 def _finish_receipt(conn, receipt, state, detail=None):
     if receipt is not None:
         from analyzer.persistence.work_repository import WorkRepository
-        WorkRepository(conn).finish(receipt, state, detail=detail, in_transaction=True)
+        repository = WorkRepository(conn)
+        if "admission_decision" in receipt:
+            decision = receipt["admission_decision"]
+            repository.append_admission_decision(
+                {key: receipt[key] for key in ("task_id", "attempt_id", "result_id")},
+                decision["result"], decision["path"], state,
+                detail if isinstance(detail, dict) else {"reason": detail},
+                in_transaction=True,
+            )
+            return
+        repository.finish(receipt, state, detail=json.dumps(detail, sort_keys=True)
+                          if isinstance(detail, dict) else detail, in_transaction=True)
 
 
 def _receipt_replay(conn, receipt, doc_id, year, artifact_sha256, ingestion_generation, parser_version):
@@ -1739,6 +1753,8 @@ def _receipt_replay(conn, receipt, doc_id, year, artifact_sha256, ingestion_gene
         raise ValueError("OCR mutation scope does not match result receipt")
     if not repository.is_finished(receipt):
         return None
+    if "admission_decision" in receipt:
+        return None  # New decision; the finished extraction receipt stays immutable.
     state, detail = conn.execute(
         "SELECT state, detail FROM extraction_results WHERE result_id = ?",
         [receipt["result_id"]],
@@ -1818,12 +1834,22 @@ def _insert_transactions(
     force_partial_canonical: bool = False,
     receipt=None,
     evidence=None,
+    admission=None,
 ) -> InsertOutcome:
     """Validate and dispatch a generation-bound rowset; partials stay blocked."""
 
     replay = _receipt_replay(conn, receipt, doc_id, year, artifact_sha256, ingestion_generation, parser_version)
     if replay is not None:
         return replay
+    if admission is None or not admission.get("allowed") or not admission.get("review_binding"):
+        return InsertOutcome(status="needs_review", detail="grounded API source review required")
+    from analyzer.ocr.normalization import NORMALIZATION_RECIPE
+    from analyzer.ocr.review import digest
+    if (receipt is None or admission["binding"]["raw_result_id"] != receipt["result_id"]
+            or admission["binding"]["normalization_recipe"] != NORMALIZATION_RECIPE
+            or admission["candidate"]["rows"] != transactions
+            or digest(admission["projection"]) != admission["binding"]["final_projection_sha256"]):
+        raise ValueError("admission does not bind this receipt, normalization and final rowset")
     require_ocr_schema(conn)
     if not artifact_sha256 or not ingestion_generation:
         raise RuntimeError(
@@ -1842,6 +1868,10 @@ def _insert_transactions(
         raise RuntimeError("OCR insertion requires generation-bound filing metadata")
     filing_date = metadata[0]
     expected_member = " ".join(part for part in metadata[1:] if part).strip()
+    bound_work = admission["binding"]["work"]
+    from analyzer.ocr.common import _strict_date
+    if (_strict_date(filing_date).isoformat(), expected_member) != (bound_work["filing_date"], bound_work["member"]):
+        raise ValueError("review metadata no longer matches the official generation")
     _, identity_rejections = validate_transactions(doc_id, member, [], filing_date, expected_member)
     if identity_rejections:
         record_failed_ocr_attempt(
@@ -1860,7 +1890,7 @@ def _insert_transactions(
         if receipt is not None and not raw_count:
             from analyzer.persistence.work_repository import WorkRepository
             work = WorkRepository(conn).validate_receipt(receipt)
-            if not verified_empty_evidence(evidence) or evidence["page_count"] != work.page_count:
+            if not admission["review_binding"] or work.page_count != bound_work["page_count"]:
                 raise ValueError("verified empty admission requires explicit evidence for every artifact page")
         status = "error" if raw_count else "no_txs"
         message = "semantic_zero_after_raw_rows" if raw_count else ""
@@ -1900,7 +1930,8 @@ def _insert_transactions(
                 ingestion_generation=ingestion_generation,
                 engines_attempted=engine_model,
             )
-            _finish_receipt(conn, receipt, "verified_empty")
+            detail = _verified_final_admission(conn, doc_id, admission)
+            _finish_receipt(conn, receipt, "verified_empty", detail)
             conn.execute("COMMIT")
         except Exception:
             cleanup_ocr_resource(lambda: conn.execute("ROLLBACK"))
@@ -1910,9 +1941,9 @@ def _insert_transactions(
         )
 
     input_count = raw_count if raw_count is not None else len(transactions)
-    validated, rejections = normalize_rows(
-        doc_id, member, transactions, filing_date, expected_member, artifact_sha256
-    )
+    # The guarded candidate already passed the shared normalizer. Do not normalize
+    # it a second time and silently change the reviewed projection.
+    validated, rejections = transactions, {}
     # Identity failures are whole-doc fatal (wrong human). Row-level
     # rejections (impossible dates on individual rows, usually filer typos)
     # keep the valid rows: one bad row must not hold the filing hostage.
@@ -2000,10 +2031,7 @@ def _insert_transactions(
             flush=True,
         )
 
-    rows, errors = _normalize_ocr_rows(
-        doc_id, member, transactions, filing_date,
-        artifact_sha256=artifact_sha256, ingestion_generation=ingestion_generation,
-    )
+    rows, errors = admission["projection"], []
     if errors:
         message = "; ".join(errors)
         record_failed_ocr_attempt(
@@ -2066,6 +2094,7 @@ def _insert_transactions(
         artifact_sha256=artifact_sha256, ingestion_generation=ingestion_generation,
         engine_model=engine_model, checkpoint=checkpoint,
         receipt=receipt,
+        admission=admission,
     )
 
 
@@ -2148,10 +2177,79 @@ def _normalize_ocr_rows(
     return rows, errors
 
 
+def canonical_ocr_projection(rows):
+    """Exact SQL-typed business columns, preserving ordered row occurrences."""
+    from analyzer.ocr.common import _strict_date
+
+    date_columns = {"transaction_date", "disclosure_date", "official_filing_date",
+                    "available_date", "notification_date"}
+    projected = []
+    for row in rows:
+        item = {}
+        for column in OCR_INSERT_COLUMNS:
+            value = row.get(column)
+            if value is None:
+                item[column] = None
+            elif column in date_columns:
+                parsed = _strict_date(value)
+                if parsed is None:
+                    raise ValueError(f"invalid final date: {column}")
+                item[column] = parsed.isoformat()
+            elif column in {"amount_midpoint", "strike_price"}:
+                item[column] = float(value)
+            elif column == "acceptance_datetime":
+                item[column] = value.isoformat() if hasattr(value, "isoformat") else str(value)
+            else:
+                item[column] = str(value)
+        projected.append(item)
+    return projected
+
+
+def final_ocr_projection(work, normalized_rows):
+    """Pure projection used by frozen review and the canonical insert alike."""
+    rows, errors = _normalize_ocr_rows(
+        work.doc_id, work.member, normalized_rows, work.filing_date,
+        artifact_sha256=work.artifact_sha256, ingestion_generation=work.generation_id,
+    )
+    if errors:
+        raise ValueError("invalid persistence projection: " + "; ".join(errors))
+    return canonical_ocr_projection(rows)
+
+
+def _verified_final_admission(conn, doc_id, admission):
+    """Inside the row transaction, compare actual scoped SQL rows before receipt."""
+    from analyzer.ocr.review import digest
+
+    columns = {row[1] for row in conn.execute("PRAGMA table_info('transactions')").fetchall()}
+    if columns != set(OCR_INSERT_COLUMNS) | {"id", "created_at"}:
+        raise ValueError("transaction columns changed; update the final review projection")
+    stored = conn.execute(
+        f"SELECT {', '.join(OCR_INSERT_COLUMNS)} FROM transactions "
+        "WHERE source = 'gemini_ocr' AND doc_id = ? AND (chamber = 'House' OR chamber IS NULL)",
+        [str(doc_id)],
+    ).fetchall()
+    actual = canonical_ocr_projection([dict(zip(OCR_INSERT_COLUMNS, row)) for row in stored])
+    expected = admission["projection"]
+    by_identity = lambda row: row["source_row_id"]
+    if sorted(actual, key=by_identity) != sorted(expected, key=by_identity):
+        raise ValueError("final SQL rows differ from the source-reviewed projection")
+    # Store the reviewed occurrence order, after comparison with actual SQL values.
+    indexed = {row["source_row_id"]: row for row in actual}
+    actual = [indexed[row["source_row_id"]] for row in expected]
+    if len(indexed) != len(expected) or digest(actual) != admission["binding"]["final_projection_sha256"]:
+        raise ValueError("final SQL row count or digest differs from review")
+    return {"schema": "house-api-final-admission-v1",
+            "normalization_recipe": admission["binding"]["normalization_recipe"],
+            "raw_result_id": admission["binding"]["raw_result_id"],
+            "final_projection": actual, "final_projection_sha256": digest(actual),
+            "final_projection_count": len(actual), "review_binding": admission["review_binding"],
+            "audit_binding": admission.get("audit_binding")}
+
+
 def _replace_accepted_ocr_rows(
     conn, doc_id, year, rows, input_count, *, row_rejections, partial_transactions,
     partial_note, parser_version, artifact_sha256, ingestion_generation,
-    engine_model, checkpoint, receipt=None,
+    engine_model, checkpoint, receipt=None, admission=None,
 ) -> InsertOutcome:
     """Own accepted-rowset replacement and historical repair in one transaction."""
     count = 0
@@ -2324,7 +2422,8 @@ def _replace_accepted_ocr_rows(
             ingestion_generation=ingestion_generation,
             engines_attempted=engine_model,
         )
-        _finish_receipt(conn, receipt, "needs_review" if row_rejections else "accepted", partial_note or None)
+        detail = _verified_final_admission(conn, doc_id, admission)
+        _finish_receipt(conn, receipt, "accepted", detail)
         conn.execute("COMMIT")
         committed = True
         if checkpoint:
@@ -2362,13 +2461,15 @@ def insert_transactions_outcome(
     artifact_sha256: str | None = None, ingestion_generation: str | None = None,
     engine_model: str = MODEL, checkpoint: bool = True,
     force_partial_canonical: bool = False,
-    conn=None, receipt=None, evidence=None,
+    conn=None, receipt=None, evidence=None, admission=None,
 ) -> InsertOutcome:
     """Return the committed outcome; partials are evidence-only unless forced.
 
     The explicit force override retains an incomplete outcome and warning.
     Every branch shares this connection lifetime, including schema failures.
     """
+    if admission is None or not admission.get("allowed") or not admission.get("review_binding"):
+        return InsertOutcome(status="needs_review", detail="grounded API source review required")
     with ExitStack() as resources:
         if conn is None:
             from analyzer.persistence.ownership import database_owner
@@ -2381,7 +2482,7 @@ def insert_transactions_outcome(
             artifact_sha256=artifact_sha256, ingestion_generation=ingestion_generation,
             engine_model=engine_model, checkpoint=checkpoint,
             force_partial_canonical=force_partial_canonical,
-            receipt=receipt, evidence=evidence,
+            receipt=receipt, evidence=evidence, admission=admission,
         )
 
 

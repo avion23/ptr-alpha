@@ -733,6 +733,36 @@ def parse(
 
 
 @app.command()
+def ocr_review_prepare(
+    result_path: Path = typer.Argument(..., help="Immutable pipeline result JSON"),
+    data_dir: str = typer.Option("data", help="Data root containing the sealed PDF"),
+):
+    """Freeze all source pixels, raw evidence and final rows for local review (no API)."""
+    from analyzer.ocr.review import prepare_review
+    from analyzer.ocr.workers import load_result
+
+    print(prepare_review(load_result(result_path), data_dir))
+
+
+@app.command()
+def ocr_review_record(
+    result_path: Path = typer.Argument(..., help="The unchanged immutable result JSON"),
+    report: Path = typer.Argument(..., help="Source-grounded JSON report bound to the frozen bundle"),
+    verdict: str = typer.Option(..., help="pass or fail; silver findings may only fail"),
+    human_reviewed: bool = typer.Option(False, "--human-reviewed", help="Operator confirms actual all-pages, all-rows source review"),
+    data_dir: str = typer.Option("data"),
+):
+    """Record a local review; this does not admit rows or release quality holds."""
+    import json
+    from analyzer.ocr.review import record_review
+    from analyzer.ocr.workers import load_result
+
+    entry = record_review(load_result(result_path), data_dir, json.loads(report.read_text()),
+                          verdict=verdict, human_reviewed=human_reviewed)
+    print(json.dumps(entry, sort_keys=True))
+
+
+@app.command()
 def pipeline(
     data_dir: str = typer.Option("data", help="Data directory"),
     year: list[int] | None = typer.Option(None, "--year", help="Official archive year; repeatable"),

@@ -302,16 +302,27 @@ def admission_guard(result: ResultBundle, data_dir):
     commit, including readmission. Do not call admission_decision or acquire
     the audit-root lock again inside the scope: that lock is not reentrant.
     """
-    if result.work.lane != ExtractionLane.GLM:
+    if result.work.lane == ExtractionLane.LOCAL:
         yield _admission_decision_locked(result, data_dir)
         return
     from scripts import glm_stage
+    from contextlib import nullcontext
+    from analyzer.ocr.review import review_decision_locked
+    from analyzer.ocr.ingestion import approved_data_root
 
     with (
-        glm_stage.audit_operation_lock(data_dir),
-        glm_stage.document_publication_lock(data_dir, result.work.archive_year, result.work.doc_id),
+        approved_data_root(data_dir) as root,
+        glm_stage.audit_operation_lock(root),
+        (glm_stage.document_publication_lock(root, result.work.archive_year, result.work.doc_id)
+         if result.work.lane == ExtractionLane.GLM else nullcontext()),
     ):
-        yield _admission_decision_locked(result, data_dir)
+        decision = _admission_decision_locked(result, root)
+        if decision["allowed"]:
+            try:
+                decision = {**decision, **review_decision_locked(result, root)}
+            except ValueError as exc:
+                decision = {**decision, "allowed": False, "reason": str(exc)}
+        yield decision
 
 
 def _admission_decision_locked(result: ResultBundle, data_dir) -> dict:

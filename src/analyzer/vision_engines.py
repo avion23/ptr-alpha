@@ -281,6 +281,7 @@ def read_document_with_vision_b(
     config: VisionBConfig,
     *,
     prompt: str | None = None,
+    response_sink: Callable[[str], None] | None = None,
 ) -> str:
     """Read all page images with engine B and return the raw completion.
 
@@ -345,10 +346,13 @@ def read_document_with_vision_b(
         raise TransientVisionBError(
             f"visionb transport failure: {exc}"
         ) from exc
+    raw_body = _response_body(response)
+    if response_sink is not None:
+        response_sink(raw_body)
     if response.status_code != 200:
         raise _classify_http_error(
             response.status_code,
-            _snippet(_response_body(response)),
+            _snippet(raw_body),
             base_url=config.base_url,
         )
     try:
@@ -505,6 +509,7 @@ def read_document_with_engine_b(
     env: Mapping[str, str] | None = None,
     page_images: Callable[[str, int], list[str]] | None = None,
     page_count: int | None = None,
+    response_sink: Callable[[str], None] | None = None,
 ) -> str:
     """Read one whole document with engine B alone and return the raw output.
 
@@ -531,6 +536,8 @@ def read_document_with_engine_b(
         except OSError as exc:
             raise VisionBUnavailable(f"visionb page count failed: {exc}") from exc
     images = (page_images or _default_page_data_urls)(doc.pdf_path, page_count)
+    if response_sink is not None:
+        return read_document_with_vision_b(images, config, response_sink=response_sink)
     return read_document_with_vision_b(images, config)
 
 

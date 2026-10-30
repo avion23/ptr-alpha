@@ -197,6 +197,8 @@ class StagingRecord(TypedDict):
     asset_review: NotRequired[bool]
     asset_review_reasons: NotRequired[list[str]]
     promotion: NotRequired[dict]
+    extraction_recipe: NotRequired[str]
+    attempt_id: NotRequired[str]
 
 
 def decode_staging_record(raw: str | bytes) -> StagingRecord:
@@ -695,6 +697,9 @@ def build_staging_record(
     never rejects a row; it marks the record so the audit sampler
     oversamples it.
     """
+    from analyzer.ocr.contracts import ExtractionLane
+    from analyzer.ocr.workers import _extraction_recipe
+
     record: StagingRecord = {
         "doc_id": str(doc_id),
         "year": int(year),
@@ -716,6 +721,7 @@ def build_staging_record(
         "asset_review": False,
         "asset_review_reasons": [],
         "audit": None,
+        "extraction_recipe": _extraction_recipe(ExtractionLane.GLM, model=getattr(config, "model", None)),
     }
     raw_output = None
     try:
@@ -917,6 +923,8 @@ def select_candidates_from_manifest(
     *,
     check_canonical: bool = False,
     db_path: str | Path | None = None,
+    resolved_artifacts: dict | None = None,
+    config: VisionBConfig | None = None,
 ) -> tuple[list[str], list[str]]:
     """Authoritative-queue candidate selection (finding 8).
 
@@ -941,11 +949,16 @@ def select_candidates_from_manifest(
     if not isinstance(data_dir, ocr.ApprovedDataRoot):
         with ocr.approved_data_root(data_dir) as root:
             return select_candidates_from_manifest(items, year, limit, root,
-                check_canonical=check_canonical, db_path=db_path)
+                check_canonical=check_canonical, db_path=db_path,
+                resolved_artifacts=resolved_artifacts, config=config)
 
     # A frozen old manifest may stage under filing year, then a new export
     # groups the same artifact under archive year. Reuse that reading, not a
     # second staging/canonical identity for the same document and bytes.
+    from analyzer.ocr.contracts import ExtractionLane
+    from analyzer.ocr.workers import _extraction_recipe
+
+    recipe = _extraction_recipe(ExtractionLane.GLM, model=getattr(config, "model", None))
     staged: dict[str, list[tuple[int, dict]]] = {}
     for group_year, record in iter_staging_records(data_dir):
         if isinstance(record, dict) and record.get("doc_id") and record.get("parse_status") in ("success", "no_txs"):
@@ -984,13 +997,21 @@ def select_candidates_from_manifest(
                 and record.get("pdf_sha256") == identity["artifact_sha256"]
                 and record.get("archive_year", group_year) == identity["archive_year"]
                 and record.get("ingestion_generation") == identity["ingestion_generation"]
+                and record.get("extraction_recipe") == recipe
                 for group_year, record in records
             ):
                 continue
-            if records:
+            if records and (identity["ingestion_generation"] is None or not all(
+                record.get("pdf_sha256") == identity["artifact_sha256"]
+                and record.get("archive_year", group_year) == identity["archive_year"]
+                and record.get("ingestion_generation") == identity["ingestion_generation"]
+                for group_year, record in records
+            )):
                 notes.append(f"[{doc_id}] artifact binding refused (staged identity is incompatible; evidence reconciliation required); skipped")
                 continue
             candidates.append(doc_id)
+            if resolved_artifacts is not None and len(candidates) <= max(limit, 0):
+                resolved_artifacts[doc_id] = (pdf_path, identity)
     return candidates[: max(limit, 0)], notes
 
 
@@ -1050,6 +1071,9 @@ def stage_batch(
             f"{MAX_WORKERS} concurrent vision streams; values above "
             f"{MAX_WORKERS} violate the quota budget and are not accepted"
         )
+    resolved_artifacts = {}
+    if config is None and read_fn is None and not dry_run:
+        config = VisionBConfig.from_env()
     if manifest is None:
         candidates = select_candidates(
             year, limit, data_dir, check_canonical=check_canonical, db_path=db_path
@@ -1063,6 +1087,8 @@ def stage_batch(
             data_dir,
             check_canonical=check_canonical,
             db_path=db_path,
+            resolved_artifacts=resolved_artifacts,
+            config=config,
         )
     for note in notes:
         print(f"  {note}", flush=True)
@@ -1125,12 +1151,9 @@ def stage_batch(
         pdf_path = default_pdf_path(data_dir, year, doc_id)
         identity = None
         if manifest is not None:
-            item = next(item for item in manifest if str(item["doc_id"]) == doc_id and int(item["year"]) == year)
-            try:
-                pdf_path, identity = manifest_artifact(ArtifactRequest.from_manifest(item), data_dir, db_path)
-            except (OSError, RuntimeError) as exc:
-                print(f"  [{doc_id}] artifact binding refused ({exc})", flush=True)
-                return "error"
+            # Selection's owner already resolved metadata and snapshotted bytes.
+            # Worker threads never reopen the canonical database per document.
+            pdf_path, identity = resolved_artifacts[doc_id]
         record = build_staging_record(
             doc_id,
             year,

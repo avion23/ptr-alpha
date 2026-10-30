@@ -116,7 +116,8 @@ def load_result(path) -> ResultBundle:
 
 
 def _pages(work, classification):
-    return [{"page_number": n, "outcome": classification} for n in range(1, work.page_count + 1)]
+    return [{"page_number": n, "outcome": "unknown", "basis": classification}
+            for n in range(1, work.page_count + 1)]
 
 
 def _model_pages(work, parsed):
@@ -124,9 +125,9 @@ def _model_pages(work, parsed):
         raise ValueError("parsed page coverage does not match bound artifact")
     row_pages = {row.get("page_number") for row in parsed.transactions}
     return [
-        {"page_number": n, "outcome": (
-            "model_reported_rows" if n in row_pages else "model_reported_no_transactions_unverified"
-        )}
+        {"page_number": n,
+         "outcome": "transactions" if n in row_pages else "unknown",
+         "basis": "model_reported_rows" if n in row_pages else "model_reported_no_transactions_unverified"}
         for n in range(1, work.page_count + 1)
     ]
 

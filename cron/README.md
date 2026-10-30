@@ -54,6 +54,18 @@ published readers can observe them; a successful repair is not proof that the
 served version changed. OCR parallel work belongs to the unified coordinator,
 not an independently scheduled writer loop.
 
+`cron/backlog_ocr.sh` now invokes that coordinator once, with three local and
+two GLM slots (Gemini disabled), rather than running `glm_stage.py` year loops.
+The six-hour deadline reserves five minutes for backup/doctor work; both tail
+steps use the remaining deadline. Its wrapper `flock` prevents duplicate cron
+invocations but is not a substitute for the database owner lease. GLM quota
+exhaustion remains lane-local, with retries/blocked work in structured status;
+no leftover-count regex claims quota exhaustion or archive completion.
+The existing backup preserves the staged GLM audit corpus, not the canonical
+database or the coordinator spool. Coordinator, backup, and doctor failures
+all make the wrapper fail. This tracked change does not deploy a crontab or
+modify running processes.
+
 - `cron/crontab.txt` — source of truth (`@REPO@` placeholder).
 - `cron/install.sh` — dry-run diff / `-y` apply with timestamped backup.
 - `cron/weekly_prices.sh` — Tue/Thu/Sat 00:17 UTC: refresh + merge + snapshot.

@@ -111,6 +111,32 @@ def _tx(asset="Apple Inc. (AAPL)", date="01/15/24", tx_type="Purchase", amount="
     }
 
 
+def _projection(doc_id, transactions, *, member="Jane Doe", filing="2024-01-20", sha="test-artifact-sha256"):
+    from analyzer.ocr.normalization import normalize_rows
+    from analyzer.ocr.ingestion import _normalize_ocr_rows
+
+    typed, findings = normalize_rows(doc_id, member, transactions, filing, member, sha)
+    assert not findings
+    rows, errors = _normalize_ocr_rows(doc_id, member, typed, date.fromisoformat(filing),
+                                     artifact_sha256=sha, ingestion_generation="test-house-generation")
+    assert not errors
+    return rows
+
+
+def _seed_accepted_history(doc_id, transactions, db_path):
+    """Historical fixture setup, not a claim that a fresh API result is approved."""
+    from analyzer.ocr.ingestion import record_parse_run
+
+    assert _insert_transactions(doc_id, 2024, 'Jane Doe', transactions, db_path=str(db_path)) == 0
+    with Database(db_path) as db:
+        rows = _projection(doc_id, transactions)
+        db.upsert_transactions(pd.DataFrame(rows), source='gemini_ocr')
+        record_parse_run(db.conn, doc_id, 2024, 'success', len(rows), len(rows),
+                         parser_version='historical-gemini', artifact_sha256='test-artifact-sha256',
+                         ingestion_generation='test-house-generation')
+    return len(rows)
+
+
 def test_normalize_date_accepts_slash_and_hyphen_formats():
     assert normalize_date("1/5/24") == "2024-01-05"
     assert normalize_date("01-05-2024") == "2024-01-05"
@@ -201,7 +227,7 @@ def test_validation_nulls_future_notification_without_filing_bound(monkeypatch):
     assert tx["notif_date"] == "10/16/26"
 
 
-def test_verified_8220049_corrections_survive_raw_and_validated_reingestion(tmp_path):
+def test_verified_8220049_corrections_survive_raw_and_validated_projection(tmp_path):
     output = (Path(__file__).parent / "fixtures/8220049-ocr.txt").read_text()
     parsed = gemini_ocr_common.parse_gemini_output(output, expected_page_count=3)
     original = json.dumps(parsed.transactions, sort_keys=True)
@@ -223,17 +249,20 @@ def test_verified_8220049_corrections_survive_raw_and_validated_reingestion(tmp_
         assert _insert_transactions(
             "8220049", 2023, parsed.member, txs, db_path=str(db_path),
             artifact_sha256=sha,
-        ) == 13
+        ) == 0  # Historical correction evidence is not new API admission authority.
         with duckdb.connect(str(db_path)) as conn:
             rows = conn.execute("""
                 SELECT source_row_id, transaction_type, notification_date
                 FROM transactions ORDER BY source_row_id
             """).fetchall()
+        assert rows == []
+        projected = _projection('8220049', txs, member=parsed.member, filing='2023-11-17', sha=sha)
+        rows = [(row['source_row_id'], row['transaction_type'], row['notification_date']) for row in projected]
         assert len(rows) == 13
         by_row = {row[0]: row[1:] for row in rows}
         for number in range(7, 12):
             assert by_row[f"8220049:page:2:row:{number}"] == (
-                "Purchase", date(2023, 11, 1)
+                "Purchase", '2023-11-01'
             )
         assert by_row["8220049:page:2:row:6"] == ("Sale", None)
         assert by_row["8220049:page:3:row:12"] == ("Sale", None)
@@ -507,14 +536,16 @@ def test_call_uses_one_immutable_pdf_snapshot(monkeypatch, tmp_path):
             db_path=str(db_path),
             artifact_sha256=metadata.sha256,
         )
-        == 1
+        == 0
     )
     connection = duckdb.connect(str(db_path))
     stored = connection.execute(
         "SELECT artifact_sha256 FROM transactions WHERE doc_id='snapshot'"
-    ).fetchone()[0]
+    ).fetchone()
     connection.close()
-    assert stored == gemini_ocr_common.hashlib.sha256(original).hexdigest()
+    assert stored is None
+    projected, = _projection('snapshot', parsed.transactions, sha=metadata.sha256)
+    assert projected['artifact_sha256'] == gemini_ocr_common.hashlib.sha256(original).hexdigest()
 
 
 def test_cache_path_sanitizes_doc_id(tmp_path):
@@ -707,7 +738,7 @@ def test_insert_fails_clearly_before_provenance_schema_exists(tmp_path):
         get_ocr_work_items(db_path=str(db_path), data_dir=tmp_path)
 
 
-def test_insert_transactions_sets_source_and_is_idempotent(tmp_path):
+def test_unreviewed_insert_is_idempotent_and_projection_retains_source(tmp_path):
     db_path = tmp_path / "congress.duckdb"
     db = Database(db_path)
     _enable_ocr_schema(db.conn)
@@ -720,11 +751,11 @@ def test_insert_transactions_sets_source_and_is_idempotent(tmp_path):
     txs = [_tx()]
     assert (
         _insert_transactions("doc-insert", 2024, "Jane Doe", txs, db_path=str(db_path))
-        == 1
+        == 0
     )
     assert (
         _insert_transactions("doc-insert", 2024, "Jane Doe", txs, db_path=str(db_path))
-        == 1
+        == 0
     )
 
     con = duckdb.connect(str(db_path), read_only=True)
@@ -741,13 +772,13 @@ def test_insert_transactions_sets_source_and_is_idempotent(tmp_path):
     """).fetchall()
     con.close()
 
-    assert rows == [("Jane Doe", "AAPL", "Apple Inc. (AAPL)", "gemini_ocr")]
-    assert parse_runs == [
-        (gemini_ocr_common.GEMINI_PARSER_VERSION, "success", 1, 1)
-    ]
+    assert rows == [] and parse_runs == []
+    projected, = _projection('doc-insert', txs)
+    assert tuple(projected[key] for key in ('member', 'ticker', 'asset_description', 'source')) == (
+        "Jane Doe", "AAPL", "Apple Inc. (AAPL)", "gemini_ocr")
 
 
-def test_validated_ocr_replaces_semantically_invalid_deterministic_rows(tmp_path):
+def test_unreviewed_ocr_cannot_replace_semantically_invalid_deterministic_rows(tmp_path):
     db_path = tmp_path / "replace-invalid.duckdb"
     db = Database(db_path)
     _enable_ocr_schema(db.conn)
@@ -793,7 +824,7 @@ def test_validated_ocr_replaces_semantically_invalid_deterministic_rows(tmp_path
             [_tx()],
             db_path=str(db_path),
         )
-        == 1
+        == 0
     )
 
     con = duckdb.connect(str(db_path), read_only=True)
@@ -807,21 +838,18 @@ def test_validated_ocr_replaces_semantically_invalid_deterministic_rows(tmp_path
     ).fetchall()
     con.close()
 
-    assert rows == [("gemini_ocr", datetime(2024, 1, 15).date())]
-    assert runs == [
-        ("v5-deterministic", "invalidated", 0),
-        (gemini_ocr_common.GEMINI_PARSER_VERSION, "success", 1),
-    ]
+    assert rows == [("house_pdf", datetime(2024, 1, 21).date())]
+    assert runs == [("v5-deterministic", "success", 1)]
 
 
 @pytest.mark.parametrize(
     ("notification_date", "expected_sources", "expected_deterministic_status"),
     [
-        (datetime(2024, 1, 14), ["gemini_ocr"], "invalidated"),
-        (datetime(2024, 1, 15), ["gemini_ocr", "house_pdf"], "success"),
+        (datetime(2024, 1, 14), ["house_pdf"], "success"),
+        (datetime(2024, 1, 15), ["house_pdf"], "success"),
     ],
 )
-def test_supersession_checks_house_notification_chronology(
+def test_unreviewed_supersession_cannot_change_house_notification_chronology(
     notification_date,
     expected_sources,
     expected_deterministic_status,
@@ -877,7 +905,7 @@ def test_supersession_checks_house_notification_chronology(
             [_tx()],
             db_path=str(db_path),
         )
-        == 1
+        == 0
     )
 
     con = duckdb.connect(str(db_path), read_only=True)
@@ -898,7 +926,7 @@ def test_supersession_checks_house_notification_chronology(
     )
 
 
-def test_insert_preserves_repeated_lots_with_distinct_source_rows(tmp_path):
+def test_projection_preserves_repeated_lots_with_distinct_source_rows(tmp_path):
     db_path = tmp_path / "lots.duckdb"
     db = Database(db_path)
     _enable_ocr_schema(db.conn)
@@ -910,17 +938,20 @@ def test_insert_preserves_repeated_lots_with_distinct_source_rows(tmp_path):
         _insert_transactions(
             "lots", 2024, "Jane Doe", [_tx(), _tx()], db_path=str(db_path)
         )
-        == 2
+        == 0
     )
     con = duckdb.connect(str(db_path))
     rows = con.execute(
         "SELECT source_record_id, source_row_id FROM transactions WHERE doc_id='lots' ORDER BY source_row_id"
     ).fetchall()
     con.close()
-    assert rows == [("lots", "lots:row:1"), ("lots", "lots:row:2")]
+    assert rows == []
+    projected = _projection('lots', [_tx(), _tx()])
+    assert [(row['source_record_id'], row['source_row_id']) for row in projected] == [
+        ("lots", "lots:row:1"), ("lots", "lots:row:2")]
 
 
-def test_insert_transactions_plumbs_authoritative_provenance_when_schema_supports_it(
+def test_projection_retains_authoritative_provenance_without_authorizing_insertion(
     tmp_path,
 ):
     db_path = tmp_path / "congress.duckdb"
@@ -939,18 +970,21 @@ def test_insert_transactions_plumbs_authoritative_provenance_when_schema_support
         db_path=str(db_path),
         artifact_sha256="abc123",
     )
-    assert inserted == 1
+    assert inserted == 0
     connection = duckdb.connect(str(db_path), read_only=True)
     row = connection.execute(
         "SELECT chamber, source_record_id, source_row_id, official_filing_date, notification_date, raw_asset_description, ingestion_generation, artifact_sha256 FROM transactions WHERE doc_id='doc-provenance'"
     ).fetchone()
     connection.close()
-    assert row == (
+    assert row is None
+    projected, = _projection('doc-provenance', [_tx()], sha='abc123')
+    assert tuple(projected[key] for key in ('chamber', 'source_record_id', 'source_row_id',
+        'official_filing_date', 'notification_date', 'raw_asset_description', 'ingestion_generation', 'artifact_sha256')) == (
         "House",
         "doc-provenance",
         "doc-provenance:row:1",
-        datetime(2024, 1, 20).date(),
-        datetime(2024, 1, 20).date(),
+        date(2024, 1, 20),
+        '2024-01-20',
         "Apple Inc. (AAPL)",
         "test-house-generation",
         "abc123",
@@ -978,7 +1012,7 @@ def test_tickerless_resolver_is_unverified_candidate_not_canonical(
             [_tx(asset="Acme Holdings")],
             db_path=str(db_path),
         )
-        == 1
+        == 0
     )
     connection = duckdb.connect(str(db_path))
     row = connection.execute(
@@ -986,7 +1020,10 @@ def test_tickerless_resolver_is_unverified_candidate_not_canonical(
         "FROM transactions WHERE doc_id='candidate'"
     ).fetchone()
     connection.close()
-    assert row == (
+    assert row is None
+    projected, = _projection('candidate', [_tx(asset='Acme Holdings')])
+    assert tuple(projected.get(key) for key in ('ticker', 'raw_ticker', 'ticker_candidate',
+                                               'ticker_origin', 'available_date', 'raw_asset_class')) == (
         None,
         "ACME",
         "ACME",
@@ -1014,7 +1051,7 @@ def test_mixed_ticker_provenance_rows_use_fixed_full_staging_schema(
         _insert_transactions(
             "mixed-schema", 2024, "Jane Doe", rows, db_path=str(db_path)
         )
-        == 2
+        == 0
     )
     connection = duckdb.connect(str(db_path))
     stored = connection.execute(
@@ -1022,7 +1059,10 @@ def test_mixed_ticker_provenance_rows_use_fixed_full_staging_schema(
         "WHERE doc_id='mixed-schema' ORDER BY source_row_id"
     ).fetchall()
     connection.close()
-    assert stored == [("AAPL", None, "official"), (None, "PRIVATE", "unverified")]
+    assert stored == []
+    projected = _projection('mixed-schema', rows)
+    assert [(row.get('ticker'), row.get('ticker_candidate'), row['ticker_origin']) for row in projected] == [
+        ("AAPL", None, "official"), (None, "PRIVATE", "unverified")]
 
 
 def test_ticker_provenance_matrix_rejects_inconsistent_rows():
@@ -1039,7 +1079,7 @@ def test_ticker_provenance_matrix_rejects_inconsistent_rows():
         )
 
 
-def test_insert_transactions_empty_list_retires_existing_ocr_rows(tmp_path):
+def test_unreviewed_empty_list_preserves_existing_ocr_rows(tmp_path):
     db_path = tmp_path / "congress.duckdb"
     db = Database(db_path)
     _enable_ocr_schema(db.conn)
@@ -1050,9 +1090,7 @@ def test_insert_transactions_empty_list_retires_existing_ocr_rows(tmp_path):
     db.close()
 
     assert (
-        _insert_transactions(
-            "doc-preserve", 2024, "Jane Doe", [_tx()], db_path=str(db_path)
-        )
+        _seed_accepted_history("doc-preserve", [_tx()], db_path)
         == 1
     )
     assert (
@@ -1073,12 +1111,12 @@ def test_insert_transactions_empty_list_retires_existing_ocr_rows(tmp_path):
     """).fetchone()
     con.close()
 
-    assert row_count == 0
+    assert row_count == 1
     assert latest_run is not None
-    assert latest_run == ("no_txs", 0, 0)
+    assert latest_run == ("success", 1, 1)
 
 
-def test_insert_transactions_all_bad_rows_retires_current_artifact_rows(tmp_path):
+def test_unreviewed_bad_rows_preserve_current_artifact_rows(tmp_path):
     db_path = tmp_path / "congress.duckdb"
     db = Database(db_path)
     _enable_ocr_schema(db.conn)
@@ -1089,7 +1127,7 @@ def test_insert_transactions_all_bad_rows_retires_current_artifact_rows(tmp_path
     db.close()
 
     assert (
-        _insert_transactions("doc-bad", 2024, "Jane Doe", [_tx()], db_path=str(db_path))
+        _seed_accepted_history("doc-bad", [_tx()], db_path)
         == 1
     )
     bad_txs = [_tx(date="not a date")]
@@ -1111,11 +1149,13 @@ def test_insert_transactions_all_bad_rows_retires_current_artifact_rows(tmp_path
     """).fetchone()
     con.close()
 
-    assert rows == []
-    assert latest_run == ("error", 1, 0, '{"invalid_transaction_date": 1}')
+    assert rows == [('AAPL', 'Apple Inc. (AAPL)')]
+    assert latest_run[:3] == ('success', 1, 1)
+    valid, findings = gemini_ocr_common.validate_transactions('doc-bad', 'Jane Doe', bad_txs, date(2024,1,20), 'Jane Doe')
+    assert valid == [] and findings == {'invalid_transaction_date': 1}
 
 
-def test_insert_transactions_mixed_invalid_batch_retires_current_artifact_rows(tmp_path):
+def test_unreviewed_mixed_and_later_valid_batches_preserve_current_artifact_rows(tmp_path):
     db_path = tmp_path / "congress.duckdb"
     db = Database(db_path)
     _enable_ocr_schema(db.conn)
@@ -1126,23 +1166,15 @@ def test_insert_transactions_mixed_invalid_batch_retires_current_artifact_rows(t
     db.close()
 
     assert (
-        _insert_transactions(
-            "doc-mixed",
-            2024,
-            "Jane Doe",
-            [_tx(asset="Old Inc. (OLD)")],
-            db_path=str(db_path),
-        )
+        _seed_accepted_history('doc-mixed', [_tx(asset='Old Inc. (OLD)')], db_path)
         == 1
     )
     txs = [
         _tx(asset="Microsoft Corp. (MSFT)"),
         _tx(asset="Bad Corp. (BAD)", date="bad"),
     ]
-    # Fail-closed partial (FP review OCR-4): a batch with a rejected row does
-    # NOT commit — the existing artifact row is never deleted without a
-    # replacement, the partial result is retained as evidence, and the run
-    # records the canonical block.
+    # Neither malformed nor syntactically valid API results can replace
+    # accepted history without independent, bound source review.
     assert (
         _insert_transactions("doc-mixed", 2024, "Jane Doe", txs, db_path=str(db_path))
         == 0
@@ -1156,28 +1188,24 @@ def test_insert_transactions_mixed_invalid_batch_retires_current_artifact_rows(t
         ORDER BY parsed_at DESC
         LIMIT 1
     """).fetchone()
-    partial_retained = con.execute(
-        "SELECT COUNT(*) FROM ocr_partial_results WHERE doc_id = 'doc-mixed'"
-    ).fetchone()[0]
+    assert 'ocr_partial_results' not in {row[0] for row in con.execute('SHOW TABLES').fetchall()}
     kept_rows = con.execute(
         "SELECT ticker FROM transactions WHERE doc_id = 'doc-mixed'"
     ).fetchall()
     con.close()
 
-    assert blocked_run is not None
-    assert blocked_run[0:3] == ("partial", 2, 0)
-    assert "canonical commit blocked" in blocked_run[3]
-    assert "invalid_transaction_date" in blocked_run[3]
-    assert partial_retained == 1
+    assert blocked_run is None
+    valid, findings = gemini_ocr_common.validate_transactions('doc-mixed', 'Jane Doe', txs, date(2024,1,20), 'Jane Doe')
+    assert len(valid) == 1 and findings == {'invalid_transaction_date': 1}
     assert [row[0] for row in kept_rows] == ["OLD"], "existing artifact row must survive"
 
-    # A subsequent fully-valid batch commits and retires the old artifact row.
+    # A later syntactically valid batch still cannot replace without review.
     assert (
         _insert_transactions(
             "doc-mixed", 2024, "Jane Doe", [_tx(asset="Microsoft Corp. (MSFT)")],
             db_path=str(db_path),
         )
-        == 1
+        == 0
     )
 
     con = duckdb.connect(str(db_path), read_only=True)
@@ -1193,15 +1221,13 @@ def test_insert_transactions_mixed_invalid_batch_retires_current_artifact_rows(t
     """).fetchone()
     con.close()
 
-    # The later full batch replaced the old artifact row (retirement) and
-    # recorded success; the blocked partial stays visible in the attempts
-    # history and ocr_partial_results evidence.
+    # Neither fresh result may retag the historical acceptance.
     assert latest_run[0] == "success"
     assert latest_run[1:3] == (1, 1)
-    assert [row[0] for row in rows] == ["MSFT"]
+    assert [row[0] for row in rows] == ["OLD"]
 
 
-def test_row_construction_failure_retires_current_artifact_rows(
+def test_unreviewed_row_construction_failure_cannot_retire_current_artifact_rows(
     monkeypatch, tmp_path
 ):
     from analyzer.ocr import ingestion as ocr_zero_rows
@@ -1214,13 +1240,7 @@ def test_row_construction_failure_retires_current_artifact_rows(
     )
     db.close()
     assert (
-        _insert_transactions(
-            "doc-construction",
-            2024,
-            "Jane Doe",
-            [_tx(asset="Old Inc. (OLD)")],
-            db_path=str(db_path),
-        )
+        _seed_accepted_history('doc-construction', [_tx(asset='Old Inc. (OLD)')], db_path)
         == 1
     )
 
@@ -1241,13 +1261,14 @@ def test_row_construction_failure_retires_current_artifact_rows(
     con = duckdb.connect(str(db_path), read_only=True)
     assert con.execute(
         "SELECT asset_description FROM transactions WHERE doc_id='doc-construction'"
-    ).fetchall() == []
+    ).fetchall() == [('Old Inc. (OLD)',)]
     status, error = con.execute(
         "SELECT status, error_message FROM pdf_parse_runs WHERE doc_id='doc-construction' ORDER BY parsed_at DESC LIMIT 1"
     ).fetchone()
     con.close()
-    assert status == "error"
-    assert "alias construction failed" in error
+    assert status == "success"
+    with pytest.raises(AssertionError, match="alias construction failed"):
+        _projection('doc-construction', [_tx(asset='New Inc. (NEW)'), _tx(asset='Break Alias')])
 
 
 def test_bound_worker_reports_quota_without_retry_or_database(monkeypatch, tmp_path):
@@ -1523,10 +1544,10 @@ def test_semantic_zero_error_preserves_prior_ocr_rows(tmp_path):
     ).fetchone()
     connection.close()
     assert rows == [("OLD",)]
-    assert latest == ("error", 3, 0, "semantic_zero_after_raw_rows")
+    assert latest is None  # Unauthorized empty claims cannot retag historical rows.
 
 
-def test_failed_exact_artifact_revalidation_retires_current_ocr_rows(tmp_path):
+def test_unreviewed_failed_exact_artifact_revalidation_preserves_current_ocr_rows(tmp_path):
     db_path = tmp_path / "failed-revalidation.duckdb"
     db = Database(db_path)
     _enable_ocr_schema(db.conn)
@@ -1566,16 +1587,16 @@ def test_failed_exact_artifact_revalidation_retires_current_ocr_rows(tmp_path):
     try:
         assert connection.execute(
             "SELECT COUNT(*) FROM transactions WHERE doc_id='failed-revalidation'"
-        ).fetchone()[0] == 0
+        ).fetchone()[0] == 1
         assert connection.execute(
             "SELECT status, transaction_count, error_message FROM pdf_parse_runs "
             "WHERE doc_id='failed-revalidation' ORDER BY parsed_at DESC LIMIT 1"
-        ).fetchone() == ("error", 0, '{"notification_before_transaction": 1}')
+        ).fetchone() is None
     finally:
         connection.close()
 
 
-def test_no_transactions_atomically_retires_legacy_null_ocr_rows(tmp_path):
+def test_unreviewed_no_transactions_preserves_legacy_null_and_unrelated_rows(tmp_path):
     from analyzer.ocr.ingestion import get_ocr_work_items
 
     db_path = tmp_path / "no-txs.duckdb"
@@ -1657,9 +1678,9 @@ def test_no_transactions_atomically_retires_legacy_null_ocr_rows(tmp_path):
         "WHERE doc_id='no-txs' ORDER BY parsed_at DESC LIMIT 1"
     ).fetchone()
     connection.close()
-    assert rows == [("capitol_trades", 1), ("gemini_ocr", 1)]
-    assert latest == ("no_txs", 0, 0)
-    assert get_ocr_work_items(db_path=str(db_path), data_dir=tmp_path, year=2024) == []
+    assert rows == [("capitol_trades", 1), ("gemini_ocr", 2)]
+    assert latest == ("zero_rows", 0, 0)
+    assert [item[0] for item in get_ocr_work_items(db_path=str(db_path), data_dir=tmp_path, year=2024)] == ['no-txs']
 
     assert (
         _insert_transactions(
@@ -1667,7 +1688,7 @@ def test_no_transactions_atomically_retires_legacy_null_ocr_rows(tmp_path):
         )
         == 0
     )
-    assert get_ocr_work_items(db_path=str(db_path), data_dir=tmp_path, year=2024) == []
+    assert [item[0] for item in get_ocr_work_items(db_path=str(db_path), data_dir=tmp_path, year=2024)] == ['no-txs']
 
 
 def test_work_selection_uses_current_db_not_progress(tmp_path):
@@ -1781,7 +1802,7 @@ def test_work_selection_uses_current_db_not_progress(tmp_path):
             db_path=str(db_path),
             artifact_sha256=digest,
         )
-        == 1
+        == 0
     )
     connection = duckdb.connect(str(db_path))
     counts = connection.execute(
@@ -1793,9 +1814,10 @@ def test_work_selection_uses_current_db_not_progress(tmp_path):
     assert counts == [
         ("capitol_trades", "v1", 1),
         ("gemini_ocr", "test-house-generation", 1),
+        ("gemini_ocr", "v4-gemini", 1),
     ]
     work = get_ocr_work_items(db_path=str(db_path), data_dir=tmp_path, year=2024)
-    assert [item[0] for item in work] == ["rejected", "retry"]
+    assert [item[0] for item in work] == ["done", "rejected", "retry"]
 
     connection = duckdb.connect(str(db_path))
     connection.execute(

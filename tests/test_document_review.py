@@ -23,12 +23,12 @@ def no_network(monkeypatch):
 
 
 @pytest.fixture
-def candidate(tmp_path):
+def candidate(tmp_path, request):
+    occurrences = getattr(request, 'param', 1)
     pdf = make_text_pdf(tmp_path / "2025/pdfs/review.pdf", [
         "HOUSE PERIODIC TRANSACTION REPORT", "Filer: Jane Doe", "Filed: 01/20/2025",
         "Asset | Type | Transaction Date | Notification Date | Amount | Owner",
-        "Apple Inc. (AAPL) | Purchase | 01/15/25 | 01/20/25 | $12,345.67 | SP",
-    ])
+    ] + ["Apple Inc. (AAPL) | Purchase | 01/15/25 | 01/20/25 | $12,345.67 | SP"] * occurrences)
     digest = hashlib.sha256(pdf.read_bytes()).hexdigest()
     with Database(tmp_path / "congress.duckdb") as db:
         db.conn.execute("INSERT INTO house_archive_generations (archive_year,generation_id,metadata_count,ptr_count) VALUES (2025,'g',1,1)")
@@ -40,6 +40,7 @@ def candidate(tmp_path):
         db.work.register(work)
         work = db.work.claim(work.task_id)
         raw = make_ocr_output(date="01/15/25", notif_date="01/20/25")
+        raw += ('\n' + raw.splitlines()[-1]) * (occurrences - 1)
         parsed = common.parse_gemini_output(raw, expected_page_count=1)
         result = ResultBundle(work, ExtractionOutcome.CANDIDATE, parsed.transactions, raw, {
             "artifact_verified": True, "output_schema_version": 4, "page_count": 1,
@@ -49,20 +50,21 @@ def candidate(tmp_path):
 
 
 def source_report(result):
-    """Unit oracle for the literal one-row source above, not provider approval."""
+    """Unit oracle for the literal source above, not provider approval."""
     material = review.review_material(result)
-    row, = material["projection"]
-    assert row["member"] == "Jane Doe"
-    assert row["ticker"] == "AAPL"
-    assert row["transaction_type"] == "Purchase"
-    assert row["transaction_date"] == "2025-01-15"
-    assert row["notification_date"] == "2025-01-20"
-    assert row["amount_raw"] == "$12,345.67"
-    assert row["owner_code"] == "SP"
+    for row in material["projection"]:
+        assert row["member"] == "Jane Doe"
+        assert row["ticker"] == "AAPL"
+        assert row["transaction_type"] == "Purchase"
+        assert row["transaction_date"] == "2025-01-15"
+        assert row["notification_date"] == "2025-01-20"
+        assert row["amount_raw"] == "$12,345.67"
+        assert row["owner_code"] == "SP"
     report = review.review_report_template(result)
     report["evidence"] = "Synthetic source: complete one-page House PTR, Jane Doe, filed January 20."
-    report["pages"][0].update(outcome="transactions", evidence="One actual Apple row; no other rows or examples.")
-    report["rows"][0]["evidence"] = "Page 1 sole row: AAPL Purchase 01/15/25 notified 01/20/25 $12,345.67 SP; no instrument/option/account terms."
+    report["pages"][0].update(outcome="transactions", evidence=f"{len(result.rows)} actual Apple row occurrences; no other rows or examples.")
+    for number, row in enumerate(report['rows'], 1):
+        row["evidence"] = f"Page 1 row {number}: AAPL Purchase 01/15/25 notified 01/20/25 $12,345.67 SP; no instrument/option/account terms."
     report["omissions_checked"] = True
     return report
 
@@ -93,6 +95,21 @@ def test_provider_self_assertions_and_silver_observations_never_authorize(candid
     assert not workers.admission_decision(result, root)["allowed"]
     with pytest.raises(ValueError, match="re-extraction"):
         review.record_review(result, root, report, verdict="pass", human_reviewed=True)
+
+
+def test_coherent_wrong_checkbox_claim_is_not_source_verification(candidate):
+    from analyzer.ocr.normalization import normalize_candidate
+
+    db, result, root = candidate  # The literal source says Purchase.
+    raw = make_ocr_output(type='Sale', date='01/15/25', notif_date='01/20/25')
+    parsed = common.parse_gemini_output(raw, expected_page_count=1)
+    wrong = replace(result, rows=parsed.transactions, raw_response=raw)
+    normalized = normalize_candidate(wrong.work, wrong)
+    assert normalized['status'] == 'candidate' and not normalized['findings']
+    assert wrong.rows[0]['type'] == wrong.rows[0]['raw_cells']['type'] == 'Sale'
+    # Agreement between two model-produced fields cannot establish pixel fidelity.
+    assert ingest(db, wrong, root) == 'needs_review'
+    assert db.conn.execute('SELECT COUNT(*) FROM transactions').fetchone() == (0,)
 
 
 @pytest.mark.parametrize("missing", ["pages", "rows", "critical_fields", "omissions", "evidence", "binding", "policy"])
@@ -336,3 +353,39 @@ def test_review_authority_expires_at_guard_exit(candidate):
         ingestion_generation="g", parser_version=result.work.extraction_recipe, checkpoint=False)
     assert outcome.status == "needs_review"
     assert db.conn.execute("SELECT COUNT(*) FROM transactions").fetchone() == (0,)
+
+
+@pytest.mark.parametrize('candidate', [2], indirect=True)
+def test_reviewed_repeated_lots_keep_distinct_occurrences_and_replay_does_not_duplicate(candidate):
+    db, result, root = candidate
+    review.prepare_review(result, root)
+    review.record_review(result, root, source_report(result), verdict='pass', human_reviewed=True)
+    assert ingest(db, result, root) == 'accepted'
+    accepted = db.conn.execute('SELECT * FROM extraction_results').fetchall()
+    rows = db.conn.execute('SELECT source_row_id FROM canonical_transactions ORDER BY source_row_id').fetchall()
+    assert len(rows) == 2 and rows[0] != rows[1]
+    assert ingest(db, result, root) == 'accepted'
+    assert db.conn.execute('SELECT * FROM extraction_results').fetchall() == accepted
+    assert db.conn.execute('SELECT source_row_id FROM canonical_transactions ORDER BY source_row_id').fetchall() == rows
+
+
+@pytest.mark.parametrize('trade,notification,expected_sources,local_status', [
+    ('2025-01-21', '2025-01-21', ['gemini_ocr'], 'invalidated'),
+    ('2025-01-15', '2025-01-14', ['gemini_ocr'], 'invalidated'),
+    ('2025-01-15', '2025-01-15', ['gemini_ocr', 'house_pdf'], 'success'),
+])
+def test_reviewed_replacement_invalidates_only_semantically_invalid_local_rows(candidate, trade, notification, expected_sources, local_status):
+    import pandas as pd
+
+    db, result, root = candidate
+    local = {**review.review_material(result)['projection'][0], 'source': 'house_pdf',
+             'source_row_id': 'local:r1', 'transaction_date': trade, 'notification_date': notification}
+    db.upsert_transactions(pd.DataFrame([local]), source='house_pdf')
+    db.parse_runs.upsert(doc_id='review', year=2025, parser_version='pdftotext', status='success',
+                         engines_attempted='pdftotext', raw_row_count=1, transaction_count=1,
+                         artifact_sha256=result.work.artifact_sha256, ingestion_generation='g')
+    review.prepare_review(result, root)
+    review.record_review(result, root, source_report(result), verdict='pass', human_reviewed=True)
+    assert ingest(db, result, root) == 'accepted'
+    assert [row[0] for row in db.conn.execute('SELECT source FROM transactions ORDER BY source').fetchall()] == expected_sources
+    assert db.conn.execute("SELECT status FROM pdf_parse_runs WHERE parser_version='pdftotext'").fetchone() == (local_status,)

@@ -66,9 +66,8 @@ def parse_year(year: int, db: Database, settings: Settings):
         return 0
 
     # Get metadata from DB
-    src = HouseTransactionSource(settings)
-    metadata = src.fetch_metadata(year)
-    src.close()
+    with HouseTransactionSource(settings, db=db) as src:
+        metadata = src.fetch_metadata(year)
 
     ptrs = cast(pd.DataFrame, metadata[metadata["FilingType"] == FilingType.PTR.value])
     pdf_paths, existing_docs = filter_existing_pdfs(ptrs, pdf_dir)

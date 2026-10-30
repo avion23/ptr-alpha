@@ -272,10 +272,10 @@ def house_fetch(args) -> None:
             src.close()
 
 
-def _house_source(staging: Path):
+def _house_source(staging: Path, *, db: Database | None = None):
     from analyzer.download import HouseTransactionSource  # noqa: PLC0415
 
-    return HouseTransactionSource(_settings_for(staging))
+    return HouseTransactionSource(_settings_for(staging), db=db)
 
 
 def _tolerant_parse_worker(pdf_path: Path):
@@ -422,7 +422,7 @@ def _persist_house_parse_batch(
 
 def _parse_house_year_tolerant(staging: Path, db: Database, year: int) -> dict:
     """Mirror HouseTransactionSource.parse_cached_pdfs with per-PDF quarantine."""
-    src = _house_source(staging)
+    src = _house_source(staging, db=db)
     try:
         ingestion_generation = db.get_latest_house_generation(year)
         if ingestion_generation is None:
@@ -1239,13 +1239,14 @@ def senate(args) -> None:
     generation = manifest["generation"]
     end = date.today()
     db = Database(staging / "congress.duckdb", read_only=False)
-    src = SenateEFDSource(
-        data_dir=str(staging),
-        read_only=False,
-        db=db,
-        ingestion_generation=generation,
-    )
+    src = None
     try:
+        src = SenateEFDSource(
+            data_dir=str(staging),
+            read_only=False,
+            db=db,
+            ingestion_generation=generation,
+        )
         try:
             df = src.fetch_all_trades(SENATE_START, end)
         except SenateEFDError as exc:
@@ -1328,8 +1329,11 @@ def senate(args) -> None:
             f"paper_only={summary.paper_only} inserted={inserted}"
         )
     finally:
-        src.close()
-        db.close()
+        try:
+            if src is not None:
+                src.close()
+        finally:
+            db.close()
 
 
 # --------------------------------------------------------------------------

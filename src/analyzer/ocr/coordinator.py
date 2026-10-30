@@ -193,7 +193,8 @@ def _ingest(db: Database, result, path: Path, data_dir: Path, source) -> str:
     candidate = None if local_candidate else normalize_candidate(work, result)
     status = result.outcome.value if candidate is None else candidate["status"]
     if not gate["allowed"] or status not in {"candidate", "verified_empty"}:
-        permanent = (status == "blocked" and not local_uncertain) or gate["reason"] in {
+        permanent = ((status == "blocked" or result.outcome == ExtractionOutcome.BLOCKED)
+                     and not local_uncertain) or gate["reason"] in {
             "extraction recipe changed", "artifact verification evidence missing"}
         disposition = "blocked" if permanent else "needs_review"
         db.work.finish(receipt, disposition, result.detail or gate["reason"] or str(candidate["findings"] if candidate else []))
@@ -281,11 +282,19 @@ def run_pipeline(
                 db.work.register_blocked(f"missing-generation:{year}", "no official PTR generation scope",
                                          scope={"archive_year": year})
 
+            eligible = set()
+            satisfied = set()
+            replayed_reviews = []
+            replaying = True
+
+            def binding(work):
+                return (work.archive_year, work.generation_id, work.doc_id, work.artifact_sha256)
+
             def escalate(result, state):
                 if state != "needs_review" or result.work.lane not in lanes:
                     return
                 old = result.work
-                if old.doc_id not in db.get_unresolved_house_doc_ids(old.archive_year, old.generation_id):
+                if binding(old) not in eligible:
                     return
                 priority = db.conn.execute("SELECT priority FROM extraction_work WHERE task_id = ?",
                                            [old.task_id]).fetchone()[0]
@@ -301,8 +310,18 @@ def run_pipeline(
                 key = (result.work.archive_year, result.work.generation_id, result.work.doc_id)
                 if key not in scoped:
                     return
+                result_id = db.work.register_result(result, str(path))
+                prior = db.conn.execute("SELECT state FROM extraction_results WHERE result_id = ?",
+                                        [result_id]).fetchone()[0]
                 state = _ingest(db, result, Path(path), base, source)
-                escalate(result, state)
+                if state in {"accepted", "verified_empty"} and prior not in {"accepted", "verified_empty"}:
+                    satisfied.add(binding(result.work))
+                    eligible.discard(binding(result.work))
+                    db.work.supersede_pending(result.work, "binding satisfied by an admitted extraction")
+                if replaying and state == "needs_review":
+                    replayed_reviews.append(result)
+                else:
+                    escalate(result, state)
 
             # Import durable responses before recovering leases or dispatching
             # replacements. A completed response must not trigger another bill.
@@ -314,9 +333,54 @@ def run_pipeline(
             db.work.recover_expired()
             unresolved = { (y, g): set(db.get_unresolved_house_doc_ids(y, g))
                            for y, g in {(s["archive_year"], s["generation_id"]) for s in scope} }
+            # Resolve canonical scope once, not through the global canonical
+            # view for every dispatch. Ledger timestamps distinguish a resumed
+            # refresh from an older success on the same immutable binding.
+            import json
+
+            known = {}
+            accepted_at = {}
+            for envelope, state, claimed_at, finished_at in db.conn.execute("""
+                SELECT w.envelope, w.status, a.claimed_at,
+                       (SELECT MAX(r.finished_at) FROM extraction_results r
+                        WHERE r.task_id = w.task_id AND r.state IN ('accepted', 'verified_empty'))
+                FROM extraction_work w LEFT JOIN extraction_attempts a ON a.attempt_id = w.attempt_id
+                WHERE w.lane IS NOT NULL
+            """).fetchall():
+                work = WorkEnvelope.from_dict(json.loads(envelope))
+                known[work.task_id] = (work, state, claimed_at)
+                if finished_at is not None:
+                    key = binding(work)
+                    accepted_at[key] = max(accepted_at.get(key, finished_at), finished_at)
+            for item in scope:
+                key = (item["archive_year"], item["generation_id"], item["doc_id"], item["artifact_sha256"])
+                needed = item["doc_id"] in unresolved[item["archive_year"], item["generation_id"]]
+                if needed:
+                    eligible.add(key)
+                    continue
+                if not refresh_recipe or key in satisfied:
+                    continue
+                root_id = task_key(item["doc_id"], item["archive_year"], item["generation_id"],
+                                   item["artifact_sha256"], recipes[lanes[0]], lanes[0])
+                root = known.get(root_id)
+                if root is None or root[1] in {"pending", "retry_wait", "running"}:
+                    eligible.add(key)
+                elif (root[1] == "needs_review" and root[2] is not None
+                      and (key not in accepted_at or accepted_at[key] < root[2])):
+                    eligible.add(key)
+            for work, state, _ in known.values():
+                key = (work.archive_year, work.generation_id, work.doc_id)
+                if key in scoped and binding(work) not in eligible and state in {"pending", "retry_wait"}:
+                    db.work.supersede_pending(work, "binding already resolved; no outstanding recipe refresh")
+            replaying = False
+            for result in replayed_reviews:
+                escalate(result, "needs_review")
+
             def seed(item):
                 needed = item["doc_id"] in unresolved[item["archive_year"], item["generation_id"]]
                 if not needed and not refresh_recipe:
+                    return
+                if (item["archive_year"], item["generation_id"], item["doc_id"], item["artifact_sha256"]) not in eligible:
                     return
                 if item["artifact_sha256"]:
                     key = task_key(item["doc_id"], item["archive_year"], item["generation_id"],
@@ -342,7 +406,9 @@ def run_pipeline(
 
             def ready(lane, limit):
                 # Scope and recipe filters prevent an older/year-excluded queue
-                # head from hiding ready work. The repository owns claiming.
+                # head from hiding ready work. Resolved queued bindings were
+                # superseded above (and on each admission), without repeatedly
+                # evaluating the canonical view or shipping the whole scope.
                 return db.conn.execute("""
                     WITH latest AS (
                         SELECT archive_year, generation_id FROM house_archive_generations
@@ -358,6 +424,14 @@ def run_pipeline(
                     WHERE w.lane = ? AND json_extract_string(w.envelope, '$.extraction_recipe') = ?
                       AND m.filing_type = 'P' AND g.archive_year IN (SELECT UNNEST(?))
                       AND (w.status = 'pending' OR (w.status = 'retry_wait' AND w.retry_at <= CURRENT_TIMESTAMP))
+                      AND NOT EXISTS (
+                          SELECT 1 FROM extraction_work active
+                          WHERE active.status = 'running'
+                            AND json_extract_string(active.envelope, '$.doc_id') = m.doc_id
+                            AND CAST(json_extract_string(active.envelope, '$.archive_year') AS INTEGER) = g.archive_year
+                            AND json_extract_string(active.envelope, '$.generation_id') = g.generation_id
+                            AND json_extract_string(active.envelope, '$.artifact_sha256') = json_extract_string(w.envelope, '$.artifact_sha256')
+                      )
                     ORDER BY w.priority DESC, w.task_id LIMIT ?
                 """, [lane.value, recipes[lane], sorted({s["archive_year"] for s in scope}), limit]).fetchall()
 

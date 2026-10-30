@@ -1777,11 +1777,12 @@ def promote_docs(
     cooldown_note: str | None = None,
 ) -> dict:
     """Promote under the shared audit-root lock and require a fresh report."""
-    if not require_audit_pass:
+    if not require_audit_pass or force_unaudited:
         raise ValueError(
-            "audit approval is mandatory: require_audit_pass=False is no "
-            "longer accepted (pass audit:'pass' records or force_unaudited)"
+            "Both GLM audit gates and grounded API source review are mandatory; overrides are forbidden"
         )
+    from analyzer.persistence.ownership import assert_publication_allowed
+    assert_publication_allowed(db_path or default_db_path(data_dir))
     ocr = _ocr_ingestion()
     if not isinstance(data_dir, ocr.ApprovedDataRoot):
         with ocr.approved_data_root(data_dir) as root:
@@ -1811,11 +1812,10 @@ def _promote_docs_locked(
 ) -> dict:
     """Promote AUDITED staged records into canonical via the insert path.
 
-    Audit approval is MANDATORY at this boundary (FP review finding 1): a
-    record without ``audit == "pass"`` is refused unless
-    ``force_unaudited=True`` (the operator's explicit override, printed
-    with a loud warning). ``require_audit_pass=False`` is refused loudly —
-    there is no permissive default anymore.
+    Audit approval is MANDATORY at this boundary. Neither force_unaudited
+    nor require_audit_pass=False can bypass either legacy audit gate or the
+    producer-neutral source review gate. Legacy staging records alone lack
+    the immutable pipeline receipt needed for the additional review gate.
 
     ``insert_transactions_outcome`` (from ``analyzer.ocr.ingestion``) writes
     the transactions AND the pdf_parse_runs record transactionally, exactly
@@ -1831,10 +1831,9 @@ def _promote_docs_locked(
     parsed_at_utc). A metadata-only legacy verdict cannot authorize
     promotion; a re-staged attempt must be re-audited.
     """
-    if not require_audit_pass:
+    if not require_audit_pass or force_unaudited:
         raise ValueError(
-            "audit approval is mandatory: require_audit_pass=False is no "
-            "longer accepted (pass audit:'pass' records or force_unaudited)"
+            "Both GLM audit gates and grounded API source review are mandatory; overrides are forbidden"
         )
     ocr = _ocr_ingestion()
 
@@ -1862,15 +1861,7 @@ def _promote_docs_locked(
             if yr == int(year)
         ]
 
-    if force_unaudited:
-        print(
-            "WARNING: --force-unaudited: promoting records WITHOUT a "
-            "passing pixel audit. This bypasses the only verified quality "
-            "gate on GLM-only readings; output must not be treated as "
-            "audited.",
-            flush=True,
-        )
-    else:
+    if not force_unaudited:
         # Report-level gate (finding 9 contract): the pixel audit report
         # must be COMPLETE with the material-error budget MET before any
         # audited record promotes. A missing/incomplete/failing report
@@ -1922,8 +1913,7 @@ def _promote_docs_locked(
         if record.get("audit") != "pass" and not force_unaudited:
             print(
                 f"  [{doc_id}] refused: audit approval is mandatory and the "
-                "staging record lacks audit: pass (run the pixel audit or "
-                "pass --force-unaudited explicitly)",
+                "staging record lacks audit: pass (run the pixel audit)",
                 flush=True,
             )
             refused += 1
@@ -1987,6 +1977,10 @@ def _promote_docs_locked(
             failed += 1
             return
 
+        if outcome.status == "needs_review":
+            print(f"  [{doc_id}] refused: {outcome.detail}; use the immutable pipeline result review commands", flush=True)
+            refused += 1
+            return
         if outcome.complete:
             ok, progress_key = True, (
                 "no_txs" if outcome.status == "no_txs" else "completed"

@@ -169,6 +169,8 @@ def _ingest(db: Database, result, path: Path, data_dir: Path, source) -> str:
     work = result.work
     receipt = dict(task_id=work.task_id, attempt_id=work.attempt_id,
                    result_id=db.work.register_result(result, str(path)), path=str(path))
+    receipt["path"] = db.conn.execute("SELECT path FROM extraction_results WHERE result_id = ?",
+                                      [receipt["result_id"]]).fetchone()[0]
     finished = db.work.is_finished(receipt)
     predecessor = db.work.effective_admission_decision(receipt) if finished else None
     if finished:
@@ -322,6 +324,8 @@ def run_pipeline(
                 result_id = db.work.register_result(result, str(path))
                 raw_receipt = dict(task_id=result.work.task_id, attempt_id=result.work.attempt_id,
                                    result_id=result_id, path=str(path))
+                raw_receipt["path"] = db.conn.execute("SELECT path FROM extraction_results WHERE result_id = ?",
+                                                      [result_id]).fetchone()[0]
                 prior = (db.work.effective_admission_decision(raw_receipt)["state"]
                          if db.work.is_finished(raw_receipt) else "extracted")
                 state = _ingest(db, result, Path(path), base, source)

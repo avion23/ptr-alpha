@@ -1053,7 +1053,7 @@ def _ingest_cached_gemini_year(
         pdf_page_count,
         validate_transactions,
     )
-    from analyzer.ocr.ingestion import insert_transactions  # noqa: PLC0415
+    from analyzer.ocr.ingestion import insert_transactions_outcome  # noqa: PLC0415
 
     generation = db.get_latest_house_generation(year)
     if generation is None:
@@ -1136,7 +1136,7 @@ def _ingest_cached_gemini_year(
                     "semantic validation failed: "
                     + json.dumps(fatal_rejections, sort_keys=True)
                 )
-            inserted = insert_transactions(
+            outcome = insert_transactions_outcome(
                 doc_id,
                 year,
                 parsed.member,
@@ -1150,6 +1150,11 @@ def _ingest_cached_gemini_year(
                 engine_model=model,
                 checkpoint=False,
             )
+            if not outcome.complete:
+                rejected.append({"doc_id": doc_id, "status": outcome.status,
+                                 "error": outcome.detail or "grounded API source review required"})
+                continue
+            inserted = outcome.inserted
             expected_count = len(validated)
             run = db.conn.execute(
                 """
@@ -1201,6 +1206,8 @@ def house_cache_ocr(args) -> None:
     manifest = _load_manifest(staging)
     years = [int(y) for y in args.years] if args.years else list(REQUIRED_HOUSE_YEARS)
     cache_dir = Path(args.cache_dir) if args.cache_dir else _REPO_ROOT / "data" / "gemini_cache"
+    from analyzer.persistence.ownership import assert_publication_allowed
+    assert_publication_allowed(staging / "congress.duckdb")
     db = Database(staging / "congress.duckdb", read_only=False)
     try:
         records = manifest.setdefault("house_cache_ocr", {})

@@ -66,6 +66,7 @@ def review_material(result):
         "normalization_recipe": candidate["normalization_recipe"],
         "final_projection_sha256": digest(projection),
         "final_projection_count": len(projection),
+        "policy_identity": POLICY["identity"],
         "policy_sha256": digest(POLICY),
     }
     return {"candidate": candidate, "projection": projection, "binding": binding}

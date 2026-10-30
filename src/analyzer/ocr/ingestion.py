@@ -2123,6 +2123,8 @@ def _verified_final_admission(conn, doc_id, admission):
         raise ValueError("final SQL row count or digest differs from review")
     return {"schema": "house-api-final-admission-v1",
             "normalization_recipe": admission["binding"]["normalization_recipe"],
+            "policy_identity": admission["binding"]["policy_identity"],
+            "policy_sha256": admission["binding"]["policy_sha256"],
             "raw_result_id": admission["binding"]["raw_result_id"],
             "final_projection": actual, "final_projection_sha256": digest(actual),
             "final_projection_count": len(actual), "review_binding": admission["review_binding"],

@@ -1262,7 +1262,7 @@ def test_unreviewed_row_construction_failure_cannot_retire_current_artifact_rows
     assert con.execute(
         "SELECT asset_description FROM transactions WHERE doc_id='doc-construction'"
     ).fetchall() == [('Old Inc. (OLD)',)]
-    status, error = con.execute(
+    status, _error = con.execute(
         "SELECT status, error_message FROM pdf_parse_runs WHERE doc_id='doc-construction' ORDER BY parsed_at DESC LIMIT 1"
     ).fetchone()
     con.close()

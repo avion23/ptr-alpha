@@ -1,16 +1,17 @@
 """Grounded local review authority, immutable receipts and scoped withdrawal."""
-from dataclasses import replace
-from datetime import date
 import hashlib
 import json
-from pathlib import Path
 import socket
+from dataclasses import replace
+from datetime import date
+from pathlib import Path
 
 import pytest
 
 from analyzer.ocr import common, coordinator, review, workers
 from analyzer.ocr.contracts import ExtractionLane, ExtractionOutcome, ResultBundle
 from analyzer.persistence.database import Database
+
 from .conftest import make_ocr_output, make_text_pdf
 
 
@@ -115,6 +116,7 @@ def test_coherent_wrong_checkbox_claim_is_not_source_verification(candidate):
 @pytest.mark.parametrize('partial_detection', [False, True])
 def test_offline_grid_observations_cannot_authorize_api_admission(candidate, monkeypatch, partial_detection):
     import sys
+
     from scripts import house_grid_evidence
 
     _, result, root = candidate
@@ -257,8 +259,8 @@ def test_quarantine_restores_prior_business_rows_preserves_temporal_history_and_
 
 
 def test_quarantine_failure_rolls_back_rows_runs_and_decisions(quarantinable, monkeypatch):
-    from scripts.quarantine_model_admissions import quarantine
     from analyzer.persistence.work_repository import WorkRepository
+    from scripts.quarantine_model_admissions import quarantine
 
     db, _, root, baseline, scope, _ = quarantinable
     tables = ("transactions", "transaction_versions", "pdf_parse_runs", "parse_run_versions", "extraction_results", "extraction_work")
@@ -299,9 +301,14 @@ def test_withdrawn_raw_result_cannot_reuse_its_old_review_to_readmit(quarantinab
 def test_actual_review_cli_is_database_free_with_active_writer_and_held_lagging_snapshot(quarantinable, monkeypatch):
     import duckdb
     from typer.testing import CliRunner
+
     from analyzer import cli
     from analyzer.persistence import database as database_module
-    from analyzer.persistence.ownership import publication_pointer, publication_state, resolve_read_path
+    from analyzer.persistence.ownership import (
+        publication_pointer,
+        publication_state,
+        resolve_read_path,
+    )
     from scripts.quarantine_model_admissions import quarantine
 
     db, result, root, baseline, scope, _ = quarantinable
@@ -368,8 +375,8 @@ def test_successful_model_empty_claim_requires_grounded_all_page_absence_review(
     sha = hashlib.sha256(pdf.read_bytes()).hexdigest()
     db.conn.execute("INSERT INTO house_generation_metadata (archive_year,generation_id,doc_id,first_name,last_name,filing_date,filing_type) VALUES (2025,'g','empty','Jane','Doe','2025-01-20','P')")
     db.conn.execute("INSERT INTO house_pdf_artifacts (archive_year,generation_id,doc_id,artifact_sha256) VALUES (2025,'g','empty',?)", [sha])
-    work = coordinator._envelope(dict(archive_year=2025, generation_id='g', doc_id='empty',
-                                     artifact_sha256=sha, first_name='Jane', last_name='Doe', filing_date='2025-01-20'),
+    work = coordinator._envelope({'archive_year': 2025, 'generation_id': 'g', 'doc_id': 'empty',
+                                 'artifact_sha256': sha, 'first_name': 'Jane', 'last_name': 'Doe', 'filing_date': '2025-01-20'},
                                  root, ExtractionLane.GEMINI, workers.extraction_recipe(ExtractionLane.GEMINI))
     db.work.register(work)
     work = db.work.claim(work.task_id)

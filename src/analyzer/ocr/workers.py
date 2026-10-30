@@ -41,6 +41,7 @@ def _extraction_recipe(lane: ExtractionLane, *, model: str | None = None) -> str
     if lane == ExtractionLane.LOCAL:
         paths.extend(sorted((root / "parsing").glob("*.py")))
         paths.append(root / "models.py")
+        paths.append(root / "download.py")  # tolerant worker/watchdog policy is extraction code
         options["skip_docling"] = os.environ.get("PTR_SKIP_DOCLING") == "1"
         versions = {}
         for package in ("pdfplumber", "camelot-py", "pdf2image", "pytesseract", "docling"):

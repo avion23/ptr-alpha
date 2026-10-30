@@ -1,3 +1,4 @@
+import json
 import shutil
 import sys
 import tempfile
@@ -13,6 +14,17 @@ import pandas as pd
 
 from analyzer.persistence.database import Database
 from analyzer.models import TickerOrigin
+
+
+def make_ocr_output(member="Jane Doe", **overrides):
+    """A current provider response with explicit source cells, not legacy defaults."""
+    row = {"asset": "Apple Inc. (AAPL)", "type": "Purchase", "date": "01/15/24",
+           "notif_date": "01/20/24", "amount_raw": "$12,345.67", "owner": "SP",
+           "account": None, "instrument_type": "unknown", **overrides}
+    if "raw_cells" not in row:
+        row["raw_cells"] = {name: row[name] for name in (
+            "asset", "type", "date", "notif_date", "amount_raw", "owner")}
+    return "SCHEMA: 4\nMEMBER: " + member + "\nPAGES: 1\nPAGE: 1\nROW: " + json.dumps(row)
 
 
 def make_entry_prices(transactions_df, prices_df):

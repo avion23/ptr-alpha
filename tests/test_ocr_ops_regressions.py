@@ -11,6 +11,7 @@ from analyzer.ocr import common as common
 from analyzer.ocr import ingestion as ops
 from analyzer.ocr import runner
 from analyzer.persistence.database import Database
+from .conftest import make_ocr_output
 
 
 @pytest.fixture(autouse=True)
@@ -332,7 +333,7 @@ def test_cached_response_is_parsed_once(stored, monkeypatch):
 def test_fresh_response_is_parsed_once(stored, monkeypatch):
     from types import SimpleNamespace
     path, pdf, _ = stored
-    output = 'MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\nNO_TRANSACTIONS'
+    output = 'SCHEMA: 4\nMEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\nNO_TRANSACTIONS'
     monkeypatch.setattr(common.subprocess, 'run', lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=output, stderr=''))
     original = common.parse_gemini_output
     calls = []
@@ -392,7 +393,7 @@ def test_year_runner_parses_fresh_response_once(stored, monkeypatch):
     from types import SimpleNamespace
 
     path, pdf, _ = stored
-    output = 'MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\nNO_TRANSACTIONS'
+    output = 'SCHEMA: 4\nMEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\nNO_TRANSACTIONS'
     run = common.subprocess.run
 
     def provider(command, *args, **kwargs):
@@ -460,7 +461,7 @@ def test_quota_stops_year_batch(stored, monkeypatch):
 @pytest.mark.parametrize("reported_pages,metadata_pages", [(1, 1), (2, 1), (1, 2)])
 def test_runner_admission_requires_bound_physical_page_coverage(stored, monkeypatch, reported_pages, metadata_pages):
     path, pdf, digest = stored
-    output = f'MEMBER: Jane Doe\nPAGES: {reported_pages}\nPAGE: 1\nApple (AAPL) | Purchase | 01/15/24 | N/A | A'
+    output = make_ocr_output().replace('PAGES: 1', f'PAGES: {reported_pages}')
     parsed = common.parse_gemini_output(output, expected_page_count=1)
     assert parsed.page_count == 1  # Existing policy clamps unreported blank trailing pages.
     assert parsed.covered_pages == frozenset({1})
@@ -481,7 +482,7 @@ def test_year_runner_validation_failure_preserves_accepted_rows(stored, monkeypa
     cache_and_insert(stored)
     path, pdf, digest = stored
     member = 'Other Person' if failure == 'member' else 'Jane Doe'
-    output = f'MEMBER: {member}\nPAGES: 1\nPAGE: 1\nApple (AAPL) | Purchase | 01/15/24 | N/A | A'
+    output = make_ocr_output(member=member)
     metadata = common.ArtifactMetadata(
         'b' * 64 if failure == 'artifact_binding' else digest,
         2 if failure == 'page_binding' else 1, len(pdf.read_bytes()), str(pdf),
@@ -495,6 +496,41 @@ def test_year_runner_validation_failure_preserves_accepted_rows(stored, monkeypa
         assert db.conn.execute('SELECT COUNT(*) FROM transactions').fetchone()[0] == 1
     finally:
         db.close()
+
+
+def test_fresh_legacy_provider_response_requires_review_without_upgrading_published_rows(stored, monkeypatch):
+    from analyzer.ocr.normalization import normalize_candidate
+    from analyzer.ocr.workers import load_result
+
+    cache_and_insert(stored)  # An old trusted materialization remains valid history.
+    path, pdf, digest = stored
+    with Database(path) as db:
+        original = db.conn.execute("SELECT * FROM transactions").fetchall()
+    legacy = 'MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\nApple (AAPL) | Purchase | 01/15/24 | N/A | A'
+    parsed = common.parse_gemini_output(legacy, expected_page_count=1)
+    calls = []
+
+    def provider(*args, **kwargs):
+        calls.append(kwargs["doc_id"])
+        return legacy, '', common.ArtifactMetadata(digest, 1, len(pdf.read_bytes()), str(pdf), parsed)
+
+    monkeypatch.setattr(common, 'call_gemini', provider)
+    for index in range(2):
+        summary = runner.run_gemini_ocr_for_year(2024, str(path.parent), refresh=True)
+        assert summary['completed_attempts'] == (1 if index == 0 else 0)
+        assert summary['work']['by_state'] == {'needs_review': 1}
+        assert summary['unresolved'] == 0  # The earlier accepted materialization is not erased.
+    assert calls == ['1']
+    bundle = load_result(next((path.parent / 'pipeline' / 'results').glob('*.json')))
+    normalized = normalize_candidate(bundle.work, bundle)
+    assert normalized['legacy_limited']
+    assert normalized['findings']['obsolete_output_schema'] == 1
+    assert normalized['status'] == 'needs_review'
+    assert bundle.raw_response == legacy
+    assert bundle.rows == parsed.transactions
+    with Database(path) as db:
+        assert db.conn.execute("SELECT * FROM transactions").fetchall() == original
+        assert db.conn.execute("SELECT state FROM extraction_results").fetchall() == [('needs_review',)]
 
 
 @pytest.mark.parametrize(

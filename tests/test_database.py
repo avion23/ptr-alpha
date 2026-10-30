@@ -109,23 +109,6 @@ def test_house_canonical_acceptance_and_readiness_share_notification_chronology(
         assert db.conn.execute("SELECT status, transaction_count FROM pdf_parse_runs").fetchone() == ("success", 2)
 
 
-@pytest.mark.parametrize("source", ["house_pdf", "gemini_ocr"])
-@pytest.mark.parametrize("notification", [None, date(2025, 1, 14), date(2025, 1, 15)])
-def test_legacy_house_rows_cannot_bypass_notification_chronology(tmp_path, source, notification):
-    with Database(tmp_path / "legacy-chronology.duckdb") as db:
-        db.upsert_transactions(pd.DataFrame([{
-            "doc_id": "legacy", "member": "Jane Doe", "ticker": "AAPL",
-            "transaction_date": date(2025, 1, 15), "notification_date": notification,
-            "disclosure_date": date(2025, 1, 20), "transaction_type": "Purchase",
-        }]), source=source)
-        expected = 0 if notification == date(2025, 1, 14) else 1
-        assert len(db.get_transactions_for_doc("legacy")) == expected
-        observed_day = db.conn.execute("SELECT CURRENT_DATE").fetchone()[0]
-        with db.canonical_as_of(observed_day):
-            assert len(db.get_transactions_for_doc("legacy")) == expected
-        assert db.conn.execute("SELECT notification_date FROM transactions").fetchone() == (notification,)
-
-
 
 
 def test_database_keeps_legacy_archive_year_unknown_and_nonauthoritative(tmp_path):

@@ -30,6 +30,7 @@ from analyzer.vision_engines import (
 from scripts import audit_sample, glm_stage, ocr_zero_rows as operational_ocr_zero_rows
 from analyzer.ocr import ingestion as ocr_zero_rows
 from analyzer.ocr.common import PROMPT_SHA256
+from .conftest import make_ocr_output
 
 pytestmark = pytest.mark.slow
 
@@ -2946,7 +2947,7 @@ def test_glm_audit_guard_holds_real_verdict_authorization_through_commit(data_di
     from analyzer.persistence.database import Database
 
     path, digests = seed_house_queue(data_dir, ["guard"])
-    record = stage_one_audited(data_dir, 2024, "guard", GLM_OUTPUT_ONE_ROW)
+    record = stage_one_audited(data_dir, 2024, "guard", make_ocr_output())
     recipe = workers.extraction_recipe(ExtractionLane.GLM)
     work = WorkEnvelope(
         task_key("guard", 2024, "current", digests["guard"], recipe, ExtractionLane.GLM),
@@ -2974,7 +2975,7 @@ def test_glm_audit_guard_holds_real_verdict_authorization_through_commit(data_di
         result = ResultBundle(claimed, ExtractionOutcome.CANDIDATE, parsed.transactions,
                               record["raw_output"], evidence={"artifact_verified": True,
                               "member": "Jane Doe", "staging_record": record,
-                              "page_count": 1, "output_schema_version": 3,
+                              "page_count": 1, "output_schema_version": 4,
                               "page_outcomes": [{"page_number": 1, "outcome": "transactions"}]})
         bundle_path = workers._publish(result, str(data_dir / "pipeline"))
         real_commit = ingestion.insert_transactions_outcome

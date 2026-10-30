@@ -52,6 +52,7 @@ from analyzer.ocr import runner as ocr_zero_rows
 from analyzer.ocr import ingestion
 from analyzer.ocr.ingestion import get_ocr_work_items
 from scripts import purge_unaccepted_house_rowsets
+from .conftest import make_ocr_output
 
 pytestmark = pytest.mark.slow
 
@@ -1442,10 +1443,11 @@ def test_visionb_pipeline_stages_and_replays_without_unreviewed_admission(coordi
     monkeypatch.setenv("VISION_B_BASE_URL", "https://stub.invalid")
     monkeypatch.setenv("VISION_B_MODEL", "stub-model")
     calls = []
+    output = make_ocr_output()
 
     def read_b(doc, **kwargs):
         calls.append(doc.doc_id)
-        return A_OUTPUT
+        return output
 
     monkeypatch.setattr(vision_engines, "read_document_with_engine_b", read_b)
     monkeypatch.setattr(gem, "call_gemini", lambda *a, **kw: pytest.fail("GLM mode contacted Gemini"))
@@ -1457,8 +1459,11 @@ def test_visionb_pipeline_stages_and_replays_without_unreviewed_admission(coordi
     for doc in ("a", "b"):
         record = glm_stage.load_staging_record(root, 2024, doc)
         assert record["parse_status"] == "success"
-        assert record["raw_output"] == A_OUTPUT
-        assert record["rows"] == [["Apple Inc. (AAPL)", "Purchase", "01/15/24", "01/20/24", "A"]]
+        assert record["raw_output"] == output
+        assert record["output_schema_version"] == 4
+        assert record["rows"] == gem.parse_gemini_output(output, expected_page_count=1).transactions
+        assert record["rows"][0]["amount_raw"] == "$12,345.67"
+        assert record["rows"][0]["owner"] == "SP"
     assert ocr_zero_rows.main() == 1
     assert json.loads(capsys.readouterr().out)["completed_attempts"] == 0
     assert sorted(calls) == ["a", "b"]  # Durable evidence, not progress.json, prevents another bill.
@@ -1477,11 +1482,12 @@ def test_single_engine_default_spends_only_gemini_and_replays_without_reread(coo
     else:
         monkeypatch.setenv("OCR_ENGINE", mode)
     calls = []
+    output = make_ocr_output()
 
     def read_a(path, *, doc_id, **kwargs):
         calls.append(doc_id)
-        parsed = gem.parse_gemini_output(A_OUTPUT, expected_page_count=1)
-        return A_OUTPUT, "", gem.ArtifactMetadata(gem.pdf_sha256(path), 1, len(Path(path).read_bytes()), str(path), parsed)
+        parsed = gem.parse_gemini_output(output, expected_page_count=1)
+        return output, "", gem.ArtifactMetadata(gem.pdf_sha256(path), 1, len(Path(path).read_bytes()), str(path), parsed)
 
     monkeypatch.setattr(gem, "call_gemini", read_a)
     monkeypatch.setattr(vision_engines, "read_document_with_engine_b", lambda *a, **kw: pytest.fail("Gemini mode contacted GLM"))

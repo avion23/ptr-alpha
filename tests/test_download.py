@@ -918,6 +918,71 @@ def test_local_notification_before_transaction_is_reviewable_without_guessing_or
         db.close()
 
 
+def test_historical_unresolved_acceptance_gets_separate_idempotent_review_receipt(tmp_path, monkeypatch):
+    from uuid import uuid4
+    from analyzer.ocr import coordinator, workers
+    from analyzer.ocr.contracts import ExtractionLane, ExtractionOutcome, ResultBundle, WorkEnvelope, task_key
+    from analyzer.parsing.metadata import consolidate_transactions
+
+    source, db = _pipeline_source(tmp_path, monkeypatch, ["historical"], filing_date="2021-01-03")
+    pdf = tmp_path / "2021" / "pdfs" / "historical.pdf"
+    digest = hashlib.sha256(pdf.read_bytes()).hexdigest()
+    recipe = workers.extraction_recipe(ExtractionLane.LOCAL)
+    row = _local_transaction(notification_date="2021-01-01", raw_cells={"NF": "01/01/2021"})
+    frame = consolidate_transactions({pdf: [row]}, {"historical": {"First": "First", "Last": "Last", "FilingDate": "2021-01-03"}})
+    frame["chamber"] = "house"
+    frame["official_filing_date"] = pd.Timestamp("2021-01-03")
+    frame["source_record_id"] = "historical"
+    frame["ingestion_generation"] = "captured-g1"
+    frame["artifact_sha256"] = digest
+    db.upsert_transactions(frame, source="house_pdf")
+    db.upsert_parse_run(doc_id="historical", year=2021, parser_version=recipe,
+                        engines_attempted="pdftotext", status="success", raw_row_count=1,
+                        transaction_count=1, artifact_sha256=digest, ingestion_generation="captured-g1")
+    work = WorkEnvelope(task_key("historical", 2021, "captured-g1", digest, recipe, ExtractionLane.LOCAL),
+                        str(uuid4()), "historical", 2021, "captured-g1", digest, str(pdf),
+                        "First Last", "2021-01-03", 1, recipe, ExtractionLane.LOCAL)
+    db.work.register(work)
+    claimed = db.work.claim(work.task_id)
+    bundle = ResultBundle(claimed, ExtractionOutcome.CANDIDATE, [row], pdf.read_text(),
+                          evidence={"artifact_verified": True, "page_count": 1,
+                                    "page_outcomes": [{"page_number": 1, "outcome": "unknown"}]})
+    original_path = Path(workers._publish(bundle, str(tmp_path / "pipeline")))
+    receipt = dict(task_id=claimed.task_id, attempt_id=claimed.attempt_id,
+                   result_id=db.work.register_result(bundle, str(original_path)))
+    db.work.finish(receipt, "accepted")  # Reproduce the previously inconsistent admission.
+    original_bytes = original_path.read_bytes()
+    original_verdict = db.conn.execute("SELECT state, finished_at FROM extraction_results WHERE result_id=?", [receipt["result_id"]]).fetchone()
+    raw_rows = db.conn.execute("SELECT * FROM transactions").fetchall()
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("reviewing historical admission must not redispatch extraction")
+
+    monkeypatch.setattr(workers, "extract_document", forbidden)
+    try:
+        for _ in range(2):
+            summary = coordinator.run_pipeline(tmp_path, [2021], database=db)
+            assert summary["completed_attempts"] == 0
+            assert summary["unresolved"] == 1
+            assert summary["documents"]["by_state"] == {"needs_review": 1}
+            assert db.work.status()["by_state"] == {"needs_review": 1}
+            assert original_path.read_bytes() == original_bytes
+            assert db.conn.execute("SELECT state, finished_at FROM extraction_results WHERE result_id=?", [receipt["result_id"]]).fetchone() == original_verdict
+            assert db.conn.execute("SELECT * FROM transactions").fetchall() == raw_rows
+        assert db.conn.execute("SELECT state FROM extraction_results ORDER BY state").fetchall() == [("accepted",), ("needs_review",)]
+        assert db.conn.execute("SELECT COUNT(*) FROM extraction_attempts").fetchone() == (1,)
+        review_paths = list((tmp_path / "pipeline" / "admission-reviews" / "results").glob("*.json"))
+        assert len(review_paths) == 1
+        review = workers.load_result(review_paths[0])
+        assert review.work == claimed
+        assert review.outcome == ExtractionOutcome.NEEDS_REVIEW
+        assert review.rows == [row]
+        assert db.get_transactions_for_doc("historical").empty
+    finally:
+        source.close()
+        db.close()
+
+
 
 def test_house_get_transactions_includes_pdf_and_gemini_but_not_capitol(tmp_path):
     source, db = _source(tmp_path)

@@ -3,10 +3,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime, timedelta
 from uuid import uuid4
 
-from analyzer.ocr.contracts import WorkEnvelope, ResultBundle
+from analyzer.ocr.contracts import ResultBundle, WorkEnvelope
 
 
 def _json(value):
@@ -14,7 +13,7 @@ def _json(value):
 
 
 class WorkRepository:
-    STATES = {"accepted", "verified_empty", "needs_review", "blocked", "retry_wait", "failed"}
+    STATES = frozenset({"accepted", "verified_empty", "needs_review", "blocked", "retry_wait", "failed"})
 
     def __init__(self, conn):
         self.conn = conn
@@ -70,8 +69,9 @@ class WorkRepository:
             data["attempt_id"] = str(uuid4())
             work = WorkEnvelope.from_dict(data)
             self.conn.execute("""UPDATE extraction_work SET status = 'running', attempt_id = ?,
-                envelope = ?, lease_until = ?, retry_at = NULL, updated_at = CURRENT_TIMESTAMP
-                WHERE task_id = ?""", [work.attempt_id, _json(data), datetime.now() + timedelta(seconds=lease_seconds), task_id])
+                envelope = ?, lease_until = CURRENT_TIMESTAMP + (? * INTERVAL '1 SECOND'),
+                retry_at = NULL, updated_at = CURRENT_TIMESTAMP
+                WHERE task_id = ?""", [work.attempt_id, _json(data), lease_seconds, task_id])
             self.conn.execute("INSERT INTO extraction_attempts (attempt_id, task_id, envelope) VALUES (?, ?, ?)", [work.attempt_id, task_id, _json(data)])
             self.conn.execute("COMMIT")
             return work
@@ -82,8 +82,21 @@ class WorkRepository:
     def recover_expired(self) -> int:
         rows = self.conn.execute("""UPDATE extraction_work SET status = 'pending',
             lease_until = NULL, updated_at = CURRENT_TIMESTAMP
-            WHERE status = 'running' AND lease_until <= CURRENT_TIMESTAMP RETURNING task_id""").fetchall()
+            WHERE status = 'running' AND lease_until <= CURRENT_TIMESTAMP
+              AND NOT EXISTS (SELECT 1 FROM extraction_results r
+                  WHERE r.task_id = extraction_work.task_id
+                    AND r.attempt_id = extraction_work.attempt_id
+                    AND r.finished_at IS NULL)
+            RETURNING task_id""").fetchall()
         return len(rows)
+
+    def pending_results(self, limit=100) -> list[dict]:
+        """Replay durable deliveries before dispatching fresh extraction work."""
+        rows = self.conn.execute("""SELECT r.task_id, r.attempt_id, r.result_id, r.path
+            FROM extraction_results r JOIN extraction_work w USING (task_id, attempt_id)
+            WHERE r.finished_at IS NULL AND w.status = 'running'
+            ORDER BY r.received_at, r.result_id LIMIT ?""", [limit]).fetchall()
+        return [dict(zip(("task_id", "attempt_id", "result_id", "path"), row)) for row in rows]
 
     def register_result(self, result: ResultBundle, path: str) -> str:
         row = self.conn.execute("SELECT envelope FROM extraction_attempts WHERE attempt_id = ? AND task_id = ?", [result.work.attempt_id, result.work.task_id]).fetchone()
@@ -103,12 +116,17 @@ class WorkRepository:
             raise ValueError("Unknown result receipt")
         return row[0] is not None
 
-    def validate_receipt(self, receipt: dict):
-        if self.is_finished(receipt):
-            return
-        row = self.conn.execute("SELECT attempt_id, status FROM extraction_work WHERE task_id = ?", [receipt["task_id"]]).fetchone()
-        if row is None or row[0] != receipt["attempt_id"] or row[1] != "running":
-            raise ValueError("Result belongs to an inactive attempt")
+    def validate_receipt(self, receipt: dict) -> WorkEnvelope:
+        finished = self.is_finished(receipt)
+        if not finished:
+            row = self.conn.execute("SELECT attempt_id, status FROM extraction_work WHERE task_id = ?", [receipt["task_id"]]).fetchone()
+            if row is None or row[0] != receipt["attempt_id"] or row[1] != "running":
+                raise ValueError("Result belongs to an inactive attempt")
+        row = self.conn.execute("SELECT envelope FROM extraction_attempts WHERE task_id = ? AND attempt_id = ?",
+                                [receipt["task_id"], receipt["attempt_id"]]).fetchone()
+        if row is None:
+            raise ValueError("Unknown receipt attempt")
+        return WorkEnvelope.from_dict(json.loads(row[0]))
 
     def finish(self, receipt: dict, state: str, detail=None, retry_at=None, in_transaction=False):
         if state not in self.STATES:

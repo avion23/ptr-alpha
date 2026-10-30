@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-import logging
 import json
+import logging
 import os
 import re
 import shutil
-from uuid import uuid4
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 import duckdb
 import pandas as pd
@@ -17,18 +17,23 @@ import pandas as pd
 from analyzer.exceptions import AnalysisError
 from analyzer.member_names import canonical_member_key
 from analyzer.persistence.metadata_repository import MetadataRepository
+from analyzer.persistence.ownership import (
+    database_owner,
+    publication_pointer,
+    resolve_read_path,
+)
 from analyzer.persistence.parse_run_repository import ParseRunRepository
 from analyzer.persistence.price_repository import PriceRepository
 from analyzer.persistence.source_report_repository import SourceReportRepository
-from analyzer.persistence.ownership import database_owner, resolve_read_path, publication_pointer
-from analyzer.persistence.work_repository import WorkRepository
-# Compatibility export for operational callers; the leaf owns the fragment.
-from analyzer.sql_fragments import HOUSE_PARSE_SOURCE as _HOUSE_PARSE_SOURCE
-from analyzer.ticker_resolver import TickerResolver
 from analyzer.persistence.transaction_repository import (
     SOURCE_TRANSACTION_COLUMNS,
     TransactionRepository,
 )
+from analyzer.persistence.work_repository import WorkRepository
+
+# Compatibility export for operational callers; the leaf owns the fragment.
+from analyzer.sql_fragments import HOUSE_PARSE_SOURCE as _HOUSE_PARSE_SOURCE
+from analyzer.ticker_resolver import TickerResolver
 
 
 logger = logging.getLogger(__name__)
@@ -91,12 +96,14 @@ class Database:
             self._bind_repositories()
             if not read_only:
                 self.work.init_schema()
-        except Exception:
+        except Exception as error:
             if hasattr(self, "conn"):
                 self.conn.close()
             if self._owner is not None:
                 self._owner.__exit__(None, None, None)
             self._closed = True
+            if isinstance(error, duckdb.Error):
+                raise DatabaseError(f"Failed to open database at {self.db_path}: {error}") from error
             raise
 
     def _bind_repositories(self):
@@ -120,7 +127,7 @@ class Database:
         directory.mkdir(parents=True, exist_ok=True)
         target = directory / f"{version}.duckdb"
         temporary = directory / f".{version}.tmp"
-        watermark = datetime.now().isoformat()
+        watermark = datetime.now(timezone.utc).isoformat()
         self.conn.execute("CHECKPOINT")
         self.conn.close()
         try:
@@ -1653,7 +1660,9 @@ class Database:
         try:
             replay = False
             if receipt is not None:
-                self.work.validate_receipt(receipt)
+                work = self.work.validate_receipt(receipt)
+                if attempted_set != {work.doc_id} or ingestion_generation != work.generation_id:
+                    raise ValueError("Replacement scope does not match receipt")
                 replay = self.work.is_finished(receipt)
             if replay:
                 replacements = []

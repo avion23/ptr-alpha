@@ -67,6 +67,8 @@ def publication_state(db_path) -> dict:
 
 
 def resolve_read_path(db_path) -> Path:
+    if str(db_path) == ":memory:":
+        return Path(":memory:")
     state = publication_state(db_path)
     if state["published"]:
         return Path(state["path"])

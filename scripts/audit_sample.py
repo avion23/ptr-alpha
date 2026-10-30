@@ -1285,15 +1285,20 @@ def load_ground_truth_rows(ground_truth_dir: str | Path, doc_id: str) -> list | 
     raise ValueError(f"unsupported ground-truth format in {path}")
 
 
-def _normalize_row(row) -> tuple[str, str, str, str, str]:
+def _normalize_row(row) -> tuple[str, ...]:
     """Normalized (asset, type, tx_date, notif_date, amount) tuple."""
     if isinstance(row, dict):
+        if "raw_cells" in row:
+            # Full-schema omission checks compare the complete named source
+            # row, including owner/account/instrument and any extra cells.
+            # A historical five-field lot cannot certify this richer row.
+            return ("schema4", json.dumps(row, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
         values = [
             row.get("asset"),
             row.get("type"),
             row.get("tx_date", row.get("date")),
             row.get("notif_date"),
-            row.get("amount", row.get("amount_letter")),
+            row.get("amount_raw", row.get("amount", row.get("amount_letter"))),
         ]
     elif isinstance(row, (list, tuple)):
         padded = list(row) + [None] * (5 - len(row))

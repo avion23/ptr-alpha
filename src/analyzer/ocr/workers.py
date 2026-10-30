@@ -116,13 +116,15 @@ def load_result(path) -> ResultBundle:
 
 
 def _pages(work, classification):
-    return [{"page_number": n, "classification": classification} for n in range(1, work.page_count + 1)]
+    return [{"page_number": n, "outcome": classification} for n in range(1, work.page_count + 1)]
 
 
-def _model_pages(work, rows):
-    row_pages = {row.get("page_number") for row in rows}
+def _model_pages(work, parsed):
+    if parsed.page_count != work.page_count or parsed.covered_pages != frozenset(range(1, work.page_count + 1)):
+        raise ValueError("parsed page coverage does not match bound artifact")
+    row_pages = {row.get("page_number") for row in parsed.transactions}
     return [
-        {"page_number": n, "classification": (
+        {"page_number": n, "outcome": (
             "model_reported_rows" if n in row_pages else "model_reported_no_transactions_unverified"
         )}
         for n in range(1, work.page_count + 1)
@@ -138,7 +140,10 @@ def extract_document(work: WorkEnvelope, spool_dir: str) -> str:
     """
     from analyzer import vision_engines as vision
 
-    evidence = {"pages": _pages(work, "not_processed"), "provider_responses": []}
+    evidence = {"page_count": work.page_count,
+                "page_outcomes": _pages(work, "not_processed"),
+                "output_schema_version": None, "legacy_limited": None,
+                "provider_responses": []}
     rows = []
     raw = None
     outcome = ExtractionOutcome.BLOCKED
@@ -169,7 +174,7 @@ def extract_document(work: WorkEnvelope, spool_dir: str) -> str:
                 _, rows, engines = parse_pdf_worker(snapshot.path)
                 # Preserve the exact parser row objects (including raw extras).
                 evidence["engines"] = engines
-                evidence["pages"] = _pages(work, "local_parser_coverage_unattributed")
+                evidence["page_outcomes"] = _pages(work, "local_parser_coverage_unattributed")
                 outcome = ExtractionOutcome.CANDIDATE if rows else ExtractionOutcome.NEEDS_REVIEW
                 detail = None if rows else "local empty result has no source-policy proof"
             elif work.lane == ExtractionLane.GEMINI:
@@ -193,7 +198,9 @@ def extract_document(work: WorkEnvelope, spool_dir: str) -> str:
                     parsed = common.parse_gemini_output(raw, expected_page_count=work.page_count)
                     rows = parsed.transactions
                     evidence["member"] = parsed.member
-                    evidence["pages"] = _model_pages(work, rows)
+                    evidence["page_outcomes"] = _model_pages(work, parsed)
+                    evidence["output_schema_version"] = parsed.output_schema_version
+                    evidence["legacy_limited"] = parsed.legacy_limited
                     outcome = ExtractionOutcome.CANDIDATE if rows else ExtractionOutcome.NEEDS_REVIEW
                     detail = None if rows else "model no_txs has no source-policy proof"
             else:
@@ -239,7 +246,9 @@ def extract_document(work: WorkEnvelope, spool_dir: str) -> str:
                     parsed = common.parse_gemini_output(raw, expected_page_count=work.page_count)
                     rows = parsed.transactions
                     evidence["member"] = parsed.member
-                    evidence["pages"] = _model_pages(work, rows)
+                    evidence["page_outcomes"] = _model_pages(work, parsed)
+                    evidence["output_schema_version"] = parsed.output_schema_version
+                    evidence["legacy_limited"] = parsed.legacy_limited
                     outcome = ExtractionOutcome.CANDIDATE if rows else ExtractionOutcome.NEEDS_REVIEW
                     detail = "GLM pixel audit required" if rows else "model no_txs has no source-policy proof"
     except Exception as exc:  # noqa: BLE001 -- failure evidence is the worker's durable output

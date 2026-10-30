@@ -94,6 +94,7 @@ import tempfile
 import threading
 import time
 from contextlib import contextmanager, nullcontext
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
@@ -178,7 +179,7 @@ class StagingRecord(TypedDict):
     pdf_sha256: str | None
     prompt_sha256: str
     parsed_at_utc: str
-    rows: list[list]
+    rows: list[dict | list]
     member: str | None
     parse_status: str
     model: str | None
@@ -199,6 +200,8 @@ class StagingRecord(TypedDict):
     promotion: NotRequired[dict]
     extraction_recipe: NotRequired[str]
     attempt_id: NotRequired[str]
+    output_schema_version: NotRequired[int | None]
+    legacy_limited: NotRequired[bool | None]
 
 
 def decode_staging_record(raw: str | bytes) -> StagingRecord:
@@ -255,17 +258,24 @@ def decode_staging_record(raw: str | bytes) -> StagingRecord:
         raise ValueError("staging record audit must be pass, fail, or null")
 
     rows = record["rows"]
-    if not isinstance(rows, list) or any(
-        not isinstance(row, list)
-        or len(row) != 5
-        or any(
-            not isinstance(row[index], str) or not row[index].strip()
-            for index in (0, 1, 2, 4)
-        )
-        or (row[3] is not None and not isinstance(row[3], str))
-        for row in rows
-    ):
-        raise ValueError("staging record rows must be a list of five-field string rows")
+    if not isinstance(rows, list):
+        raise ValueError("staging record rows must be a list")
+    for row in rows:
+        if isinstance(row, dict):
+            required_row_fields = {"asset", "type", "date", "notif_date", "amount_raw", "owner", "account", "instrument_type", "raw_cells", "page_number"}
+            if (record.get("output_schema_version") != 4
+                    or record.get("legacy_limited") is not False
+                    or not required_row_fields <= row.keys()
+                    or not isinstance(row["raw_cells"], dict)
+                    or type(row["page_number"]) is not int
+                    or pages is None or not 1 <= row["page_number"] <= pages):
+                raise ValueError("named staging rows require explicit schema 4 provenance and page attribution")
+        elif (not isinstance(row, list) or len(row) != 5
+              or any(not isinstance(row[index], str) or not row[index].strip() for index in (0, 1, 2, 4))
+              or (row[3] is not None and not isinstance(row[3], str))):
+            raise ValueError("legacy staging rows must have five string fields")
+        elif record.get("output_schema_version", 3) >= 4 or record.get("legacy_limited") is False:
+            raise ValueError("five-field staging rows cannot claim full schema provenance")
     if status in ("success", "no_txs"):
         if bool(rows) != (status == "success"):
             raise ValueError(f"{status} staging record has inconsistent rows")
@@ -722,6 +732,8 @@ def build_staging_record(
         "asset_review_reasons": [],
         "audit": None,
         "extraction_recipe": _extraction_recipe(ExtractionLane.GLM, model=getattr(config, "model", None)),
+        "output_schema_version": None,
+        "legacy_limited": None,
     }
     raw_output = None
     try:
@@ -752,7 +764,7 @@ def build_staging_record(
         review_reasons = detect_asset_review_reasons(parsed.transactions)
         record.update(
             member=parsed.member,
-            rows=[
+            rows=deepcopy(parsed.transactions) if not parsed.legacy_limited else [
                 [
                     tx["asset"],
                     tx["type"],
@@ -763,6 +775,8 @@ def build_staging_record(
                 for tx in parsed.transactions
             ],
             row_pages=[tx.get("page_number") for tx in parsed.transactions],
+            output_schema_version=parsed.output_schema_version,
+            legacy_limited=parsed.legacy_limited,
             raw_output=raw_output,
             parse_status="success" if parsed.transactions else "no_txs",
             error=None,
@@ -782,12 +796,25 @@ def build_staging_record(
     return record
 
 
+@contextmanager
+def _metadata_connection(db_path, conn=None):
+    """Borrow the owner, otherwise pin the published read path for this scope."""
+    if conn is not None:
+        yield conn
+        return
+    import duckdb
+    from analyzer.persistence.ownership import resolve_read_path
+
+    path = resolve_read_path(db_path)
+    with duckdb.connect(str(path), read_only=True) if path.exists() else nullcontext(None) as owned:
+        yield owned
+
+
 def canonical_parsed_doc_ids(db_path: str | Path) -> set[str]:
     """Doc ids with ANY successful/no_txs canonical parse run (best effort)."""
-    import duckdb
-
-    conn = duckdb.connect(str(db_path), read_only=True)
-    try:
+    with _metadata_connection(db_path) as conn:
+        if conn is None:
+            return set()
         rows = conn.execute(
             """
             SELECT DISTINCT CAST(doc_id AS VARCHAR)
@@ -795,8 +822,6 @@ def canonical_parsed_doc_ids(db_path: str | Path) -> set[str]:
             WHERE status IN ('success', 'no_txs')
             """
         ).fetchall()
-    finally:
-        conn.close()
     return {row[0] for row in rows}
 
 
@@ -827,22 +852,21 @@ def canonical_terminal_artifacts(db_path: str | Path) -> set[tuple[str, str, str
         db.close()
 
 
-def manifest_artifact(request: ArtifactRequest, data_dir: str | Path, db_path: str | Path | None = None):
+def manifest_artifact(request: ArtifactRequest, data_dir: str | Path, db_path: str | Path | None = None, *, conn=None):
     """Return a verified byte snapshot and identity; path is naming only.
 
     Consumers use identity['pdf_bytes']/['artifact_sha256'], never reopen the
     returned display path after verification.
     """
-    import duckdb
     ocr = _ocr_ingestion()
 
     if not isinstance(data_dir, ocr.ApprovedDataRoot):
         with ocr.approved_data_root(data_dir) as root:
-            return manifest_artifact(request, root, db_path)
+            return manifest_artifact(request, root, db_path, conn=conn)
 
     path = Path(db_path or default_db_path(data_dir))
-    with duckdb.connect(str(path), read_only=True) if path.exists() else nullcontext(None) as conn:
-        return ocr.local_work_artifact(conn, data_dir, request.resolver_fields())
+    with _metadata_connection(path, conn) as metadata:
+        return ocr.local_work_artifact(metadata, data_dir, request.resolver_fields())
 
 
 def select_candidates(
@@ -925,6 +949,7 @@ def select_candidates_from_manifest(
     db_path: str | Path | None = None,
     resolved_artifacts: dict | None = None,
     config: VisionBConfig | None = None,
+    conn=None,
 ) -> tuple[list[str], list[str]]:
     """Authoritative-queue candidate selection (finding 8).
 
@@ -943,14 +968,13 @@ def select_candidates_from_manifest(
     metadata and recorded acquisitions; explicit hash/generation mismatches
     are refused, never replaced with another same-ID artifact.
     """
-    import duckdb
     ocr = _ocr_ingestion()
 
     if not isinstance(data_dir, ocr.ApprovedDataRoot):
         with ocr.approved_data_root(data_dir) as root:
             return select_candidates_from_manifest(items, year, limit, root,
                 check_canonical=check_canonical, db_path=db_path,
-                resolved_artifacts=resolved_artifacts, config=config)
+                resolved_artifacts=resolved_artifacts, config=config, conn=conn)
 
     # A frozen old manifest may stage under filing year, then a new export
     # groups the same artifact under archive year. Reuse that reading, not a
@@ -968,7 +992,7 @@ def select_candidates_from_manifest(
     notes: list[str] = []
     seen: set[str] = set()
     path = Path(db_path or default_db_path(data_dir))
-    with duckdb.connect(str(path), read_only=True) if path.exists() else nullcontext(None) as conn:
+    with _metadata_connection(path, conn) as conn:
         for item in items:
             try:
                 item_year = int(item["year"])
@@ -1370,6 +1394,13 @@ def staged_row_to_tx(row, page_number=None) -> dict:
     attribution recorded at stage time, finding 6) so the canonical
     ``source_row_id`` identity is page-bound exactly like the Gemini path.
     """
+    if isinstance(row, dict):
+        transaction = deepcopy(row)
+        if page_number is not None:
+            if transaction.get("page_number") not in (None, page_number):
+                raise ValueError("staged row page attribution disagrees with row_pages")
+            transaction["page_number"] = page_number
+        return transaction
     values = list(row)
     if len(values) != 5:
         raise ValueError(f"staged row must have 5 fields, got {len(values)}")

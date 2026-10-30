@@ -781,6 +781,7 @@ def run_dual_read_for_doc(
     read_a: Callable[..., tuple[str | None, str | None, ArtifactMetadata | None]] | None = None,
     read_b: Callable[[list[str]], str] | None = None,
     page_images: Callable[[str, int], list[str]] | None = None,
+    conn=None,
 ) -> DualLoopOutcome:
     """Dual-read one doc and persist the outcome (opt-in DUAL_READ=1 path).
 
@@ -819,9 +820,7 @@ def run_dual_read_for_doc(
             )
         artifact_sha256 = getattr(decision.metadata, "sha256", None)
         try:
-            ingestion_generation = ocr.resolve_ingestion_generation(
-                doc.resolved_db_path, doc.doc_id, doc.year, artifact_sha256
-            )
+            ingestion_generation = _dual_ingestion_generation(doc, artifact_sha256, conn)
         except RuntimeError:
             ingestion_generation = None
         record_unresolved(
@@ -829,6 +828,7 @@ def run_dual_read_for_doc(
             decision,
             artifact_sha256=artifact_sha256,
             ingestion_generation=ingestion_generation,
+            conn=conn,
         )
         return DualLoopOutcome(
             True, decision, 0, "errors", metadata=decision.metadata
@@ -844,9 +844,7 @@ def run_dual_read_for_doc(
 
     artifact_sha256 = getattr(decision.metadata, "sha256", None)
     try:
-        ingestion_generation = ocr.resolve_ingestion_generation(
-            doc.resolved_db_path, doc.doc_id, doc.year, artifact_sha256
-        )
+        ingestion_generation = _dual_ingestion_generation(doc, artifact_sha256, conn)
     except RuntimeError as exc:
         fallback = DualDecision(
             A_ERROR,
@@ -865,6 +863,7 @@ def run_dual_read_for_doc(
             decision,
             artifact_sha256=artifact_sha256,
             ingestion_generation=ingestion_generation,
+            conn=conn,
         )
         return DualLoopOutcome(
             True, decision, 0, "errors", metadata=decision.metadata
@@ -885,6 +884,7 @@ def run_dual_read_for_doc(
         ingestion_generation=ingestion_generation,
         parser_version=DUAL_PARSER_VERSION,
         engine_model=DUAL_ENGINES_ATTEMPTED,
+        conn=conn,
     )
     inserted = outcome.inserted
     # Never call a partial or rejected output complete: only a full committed
@@ -906,12 +906,23 @@ def run_dual_read_for_doc(
     )
 
 
+def _dual_ingestion_generation(doc, artifact_sha256, conn):
+    if conn is not None:
+        return ocr._resolve_ingestion_generation(conn, doc.doc_id, doc.year, artifact_sha256)
+    from analyzer.persistence.ownership import resolve_read_path
+
+    return ocr.resolve_ingestion_generation(
+        str(resolve_read_path(doc.resolved_db_path)), doc.doc_id, doc.year, artifact_sha256
+    )
+
+
 def record_unresolved(
     doc: DualReadDoc,
     decision: DualDecision,
     *,
     artifact_sha256: str | None,
     ingestion_generation: str | None,
+    conn=None,
 ) -> None:
     """Land an UNRESOLVED dual read in the retry state.
 
@@ -925,6 +936,7 @@ def record_unresolved(
         doc, raw_row_count=decision.raw_row_count, status="error",
         diagnostic=f"dual-read unresolved: {decision.diff_summary}",
         artifact_sha256=artifact_sha256, ingestion_generation=ingestion_generation,
+        conn=conn,
     )
 
 
@@ -934,6 +946,7 @@ def record_disagreement(
     *,
     artifact_sha256: str | None,
     ingestion_generation: str | None,
+    conn=None,
 ) -> None:
     """Land a DISAGREE in the existing manual-review inventory.
 
@@ -947,60 +960,59 @@ def record_disagreement(
         doc, raw_row_count=decision.raw_row_count, status="invalid",
         diagnostic=decision.notes_json or decision.diff_summary or "dual-read disagreement",
         artifact_sha256=artifact_sha256, ingestion_generation=ingestion_generation,
+        conn=conn,
     )
 
 
 def _record_dual_failure(
     doc: DualReadDoc, *, raw_row_count: int, status: str, diagnostic: str,
     artifact_sha256: str | None, ingestion_generation: str | None,
+    conn=None,
 ) -> None:
     """Retire only this artifact's OCR rows and persist the selected failure."""
     import duckdb
 
-    conn = duckdb.connect(doc.resolved_db_path)
+    if conn is None:
+        from analyzer.persistence.ownership import database_owner
+
+        # The lease covers even the publication close/reopen gap: acquire
+        # before connecting, not merely before the first write statement.
+        with database_owner(doc.resolved_db_path, "dual-read failure maintenance"):
+            with duckdb.connect(doc.resolved_db_path) as owned:
+                return _record_dual_failure(
+                    doc, raw_row_count=raw_row_count, status=status, diagnostic=diagnostic,
+                    artifact_sha256=artifact_sha256, ingestion_generation=ingestion_generation,
+                    conn=owned,
+                )
+    conn.execute("BEGIN TRANSACTION")
     try:
-        conn.execute("BEGIN TRANSACTION")
-        try:
-            if artifact_sha256 and ingestion_generation:
-                predicate = (
-                    "source = 'gemini_ocr' AND doc_id = ? "
-                    "AND (chamber = 'House' OR chamber IS NULL) "
-                    "AND ingestion_generation = ? AND artifact_sha256 = ?"
-                )
-                parameters = [
-                    str(doc.doc_id),
-                    ingestion_generation,
-                    artifact_sha256,
-                ]
-                ocr.archive_rows(conn, "transactions", predicate, parameters)
-                conn.execute(
-                    """
-                    DELETE FROM transactions
-                    WHERE source = 'gemini_ocr' AND doc_id = ?
-                      AND (chamber = 'House' OR chamber IS NULL)
-                      AND ingestion_generation = ? AND artifact_sha256 = ?
-                    """,
-                    parameters,
-                )
-            ocr.record_parse_run(
-                conn,
-                doc.doc_id,
-                doc.year,
-                status,
-                raw_row_count,
-                0,
-                diagnostic,
-                parser_version=DUAL_PARSER_VERSION,
-                artifact_sha256=artifact_sha256,
-                ingestion_generation=ingestion_generation,
-                engines_attempted=DUAL_ENGINES_ATTEMPTED,
+        if artifact_sha256 and ingestion_generation:
+            predicate = (
+                "source = 'gemini_ocr' AND doc_id = ? "
+                "AND (chamber = 'House' OR chamber IS NULL) "
+                "AND ingestion_generation = ? AND artifact_sha256 = ?"
             )
-            conn.execute("COMMIT")
-        except Exception:
-            ocr.cleanup_ocr_resource(lambda: conn.execute("ROLLBACK"))
-            raise
-    finally:
-        ocr.cleanup_ocr_resource(conn.close)
+            parameters = [str(doc.doc_id), ingestion_generation, artifact_sha256]
+            ocr.archive_rows(conn, "transactions", predicate, parameters)
+            conn.execute(
+                """
+                DELETE FROM transactions
+                WHERE source = 'gemini_ocr' AND doc_id = ?
+                  AND (chamber = 'House' OR chamber IS NULL)
+                  AND ingestion_generation = ? AND artifact_sha256 = ?
+                """, parameters,
+            )
+        ocr.record_parse_run(
+            conn, doc.doc_id, doc.year, status, raw_row_count, 0, diagnostic,
+            parser_version=DUAL_PARSER_VERSION,
+            artifact_sha256=artifact_sha256,
+            ingestion_generation=ingestion_generation,
+            engines_attempted=DUAL_ENGINES_ATTEMPTED,
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        ocr.cleanup_ocr_resource(lambda: conn.execute("ROLLBACK"))
+        raise
 
 
 def dual_read_enabled(env: Mapping[str, str] | None = None) -> bool:

@@ -13,7 +13,7 @@ def _json(value):
 
 
 class WorkRepository:
-    STATES = frozenset({"accepted", "verified_empty", "needs_review", "blocked", "retry_wait", "failed"})
+    STATES = frozenset({"accepted", "verified_empty", "needs_review", "blocked", "retry_wait", "failed", "superseded"})
 
     def __init__(self, conn):
         self.conn = conn
@@ -48,6 +48,21 @@ class WorkRepository:
         self.conn.execute("""INSERT INTO extraction_work
             (task_id, envelope, status, priority, detail) VALUES (?, ?, 'blocked', ?, ?)
             ON CONFLICT DO NOTHING""", [task_id, _json(scope), priority, detail])
+
+    def supersede_pending(self, work: WorkEnvelope, detail: str) -> int:
+        """Cancel queued producers for an accepted binding; retain all attempts/results."""
+        if not isinstance(detail, str) or not detail.strip():
+            raise ValueError("Superseding work requires a reason")
+        rows = self.conn.execute("""UPDATE extraction_work SET status = 'superseded',
+            detail = ?, lease_until = NULL, retry_at = NULL, updated_at = CURRENT_TIMESTAMP
+            WHERE status IN ('pending', 'retry_wait')
+              AND json_extract_string(envelope, '$.doc_id') = ?
+              AND json_extract_string(envelope, '$.archive_year') = ?
+              AND json_extract_string(envelope, '$.generation_id') = ?
+              AND json_extract_string(envelope, '$.artifact_sha256') = ?
+            RETURNING task_id""", [detail, work.doc_id, str(work.archive_year),
+                                    work.generation_id, work.artifact_sha256]).fetchall()
+        return len(rows)
 
     def pending(self, lane, limit=100):
         rows = self.conn.execute("""SELECT envelope FROM extraction_work
@@ -103,9 +118,18 @@ class WorkRepository:
         if row is None or json.loads(row[0]) != result.work.to_dict():
             raise ValueError("Result does not match a registered attempt")
         identity = hashlib.sha256(_json(result.to_dict()).encode()).hexdigest()
+        current = self.conn.execute("SELECT attempt_id, status FROM extraction_work WHERE task_id = ?",
+                                    [result.work.task_id]).fetchone()
+        superseded = current is None or current != (result.work.attempt_id, "running")
         self.conn.execute("""INSERT INTO extraction_results
-            (result_id, task_id, attempt_id, path) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING""",
-            [identity, result.work.task_id, result.work.attempt_id, path])
+            (result_id, task_id, attempt_id, path, state, detail, finished_at)
+            VALUES (?, ?, ?, ?, ?, ?, CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL END)
+            ON CONFLICT (result_id) DO UPDATE SET state = excluded.state,
+                detail = excluded.detail, finished_at = excluded.finished_at
+            WHERE extraction_results.finished_at IS NULL AND excluded.state = 'superseded'""",
+            [identity, result.work.task_id, result.work.attempt_id, path,
+             "superseded" if superseded else "extracted",
+             "Result belongs to an inactive attempt" if superseded else None, superseded])
         return identity
 
     def is_finished(self, receipt: dict) -> bool:

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import logging
+import json
+import os
 import re
+import shutil
+from uuid import uuid4
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -16,6 +20,8 @@ from analyzer.persistence.metadata_repository import MetadataRepository
 from analyzer.persistence.parse_run_repository import ParseRunRepository
 from analyzer.persistence.price_repository import PriceRepository
 from analyzer.persistence.source_report_repository import SourceReportRepository
+from analyzer.persistence.ownership import database_owner, resolve_read_path, publication_pointer
+from analyzer.persistence.work_repository import WorkRepository
 # Compatibility export for operational callers; the leaf owns the fragment.
 from analyzer.sql_fragments import HOUSE_PARSE_SOURCE as _HOUSE_PARSE_SOURCE
 from analyzer.ticker_resolver import TickerResolver
@@ -54,8 +60,8 @@ _SOURCE_REPORTS_COLUMNS = """
 class TransactionReplacementCounts:
     by_doc_source: dict[str, dict[str, int]]
     by_doc_total: dict[str, int]
-    total_current_rows: int
-    total_raw_rows: int
+    total_current_rows: int | None
+    total_raw_rows: int | None
 
 
 class DatabaseError(AnalysisError):
@@ -65,27 +71,93 @@ class DatabaseError(AnalysisError):
 class Database:
     def __init__(self, db_path: str | Path, read_only: bool = False):
         self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._read_only = read_only
+        self._owner = None
+        self._closed = False
         try:
             if read_only:
-                self.conn = duckdb.connect(str(self.db_path), read_only=True)
+                read_path = resolve_read_path(db_path)
+                self.conn = duckdb.connect(str(read_path), read_only=True)
             else:
+                self._owner = database_owner(db_path, "Database")
+                self._owner.__enter__()
+                if str(db_path) != ":memory:":
+                    self.db_path = self.db_path.expanduser().resolve()
                 self.conn = duckdb.connect(str(self.db_path))
-        except duckdb.Error as e:
-            raise DatabaseError(f"Failed to open database at {self.db_path}: {e}")
-        if read_only:
-            # Shadow any persisted legacy definition without mutating the file.
-            # This keeps read-only analysis on the current canonical-source
-            # contract before the next write-side schema initialization.
-            self._init_canonical_transactions_view()
-        else:
-            self._init_schema()
+            if read_only:
+                self._init_canonical_transactions_view()
+            else:
+                self._init_schema()
+            self._bind_repositories()
+            if not read_only:
+                self.work.init_schema()
+        except Exception:
+            if hasattr(self, "conn"):
+                self.conn.close()
+            if self._owner is not None:
+                self._owner.__exit__(None, None, None)
+            self._closed = True
+            raise
+
+    def _bind_repositories(self):
         self._transactions = TransactionRepository(self.conn)
         self._prices = PriceRepository(self.conn)
         self._metadata = MetadataRepository(self.conn)
         self._parse_runs = ParseRunRepository(self.conn)
         self._source_reports = SourceReportRepository(self.conn)
+        self._work = WorkRepository(self.conn)
+
+    @property
+    def work(self) -> WorkRepository:
+        return self._work
+
+    def publish_snapshot(self) -> dict:
+        """Seal a full checkpointed copy; announce only after writer reopen."""
+        if self._read_only or str(self.db_path) == ":memory:" or self._closed:
+            raise DatabaseError("Publication requires an open file-backed writer")
+        version = uuid4().hex
+        directory = self.db_path.with_suffix(self.db_path.suffix + ".snapshots")
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / f"{version}.duckdb"
+        temporary = directory / f".{version}.tmp"
+        watermark = datetime.now().isoformat()
+        self.conn.execute("CHECKPOINT")
+        self.conn.close()
+        try:
+            shutil.copyfile(self.db_path, temporary)
+            with temporary.open("rb") as snapshot:
+                os.fsync(snapshot.fileno())
+            temporary.chmod(0o444)
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+            try:
+                self.conn = duckdb.connect(str(self.db_path))
+                # Preserve repository references held by the owner/coordinator.
+                for repository in (self._transactions, self._prices, self._metadata,
+                                   self._parse_runs, self._source_reports, self._work):
+                    repository.conn = self.conn
+            except Exception:
+                self.close()
+                raise
+        state = {"version": version, "path": str(target), "watermark": watermark}
+        pointer = publication_pointer(self.db_path)
+        pending = pointer.with_name(f".{pointer.name}.{version}.tmp")
+        try:
+            with pending.open("w") as output:
+                json.dump(state, output)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(pending, pointer)
+            for parent in (directory, pointer.parent):
+                descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+        finally:
+            pending.unlink(missing_ok=True)
+        return state
 
     @property
     def is_read_only(self) -> bool:
@@ -1531,6 +1603,8 @@ class Database:
         replacement_doc_ids: list[str],
         ingestion_generation: str,
         parse_runs: list[dict] | None = None,
+        receipt: dict | None = None,
+        include_global_counts: bool = True,
     ) -> TransactionReplacementCounts:
         """Atomically replace attempted documents for one source.
 
@@ -1577,6 +1651,14 @@ class Database:
 
         self.conn.execute("BEGIN TRANSACTION")
         try:
+            replay = False
+            if receipt is not None:
+                self.work.validate_receipt(receipt)
+                replay = self.work.is_finished(receipt)
+            if replay:
+                replacements = []
+                df = df.iloc[0:0]
+                parse_runs = []
             for doc_id in replacements:
                 predicate = ("doc_id = ? AND source = ? AND ingestion_generation = ?"
                              if source == "house_pdf" else "doc_id = ? AND source = ?")
@@ -1640,10 +1722,19 @@ class Database:
                 self.conn.execute(
                     "SELECT COUNT(*) FROM canonical_transactions"
                 ).fetchone()[0]
-            )
+            ) if include_global_counts else None
             total_raw_rows = int(
                 self.conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
-            )
+            ) if include_global_counts else None
+            if receipt is not None and not replay:
+                state = receipt.get("state")
+                if state is None:
+                    statuses = {run["status"] for run in parse_runs or []}
+                    if not statuses or not statuses <= {"success", "no_txs"}:
+                        raise ValueError("Receipt requires explicit state for nonaccepted parse runs")
+                    state = "verified_empty" if statuses == {"no_txs"} else "accepted"
+                self.work.finish(receipt, state, detail=receipt.get("detail"),
+                                 retry_at=receipt.get("retry_at"), in_transaction=True)
             self.conn.execute("COMMIT")
         except Exception:
             self.conn.execute("ROLLBACK")
@@ -2104,7 +2195,14 @@ class Database:
     # -- lifecycle ------------------------------------------------------------
 
     def close(self) -> None:
-        self.conn.close()
+        if self._closed:
+            return
+        try:
+            self.conn.close()
+        finally:
+            self._closed = True
+            if self._owner is not None:
+                self._owner.__exit__(None, None, None)
 
     def __enter__(self):
         return self

@@ -676,6 +676,8 @@ def extract_amount_midpoint(
     amount = clean_text(amount_cell)
     if not amount:
         return None, None
+    if re.search(r"\b(?:over|greater than|less than|under)\b|[<>+]", amount, re.I):
+        return amount, None
     tokens = re.findall(r"\$([\d.,]+)", amount)
     if any(not re.fullmatch(_US_CURRENCY, token) for token in tokens):
         return amount, None

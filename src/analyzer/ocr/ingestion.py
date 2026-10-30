@@ -36,6 +36,7 @@ from analyzer.ocr.common import (
 )
 
 from analyzer.ocr.paths import DATA_DIR, STAGING_ROOT
+from analyzer.ocr.normalization import normalize_rows, verified_empty_evidence
 
 DB_PATH = str(DATA_DIR / "congress.duckdb")
 PROGRESS_PATH = str(DATA_DIR / "ocr_progress_gemini_manual.json")
@@ -105,6 +106,9 @@ OCR_INSERT_COLUMNS = [
     "raw_owner",
     "ingestion_generation",
     "artifact_sha256",
+    "instrument_type",
+    "strike_price",
+    "expiry_date",
 ]
 
 
@@ -168,6 +172,7 @@ def get_ocr_work_items(
     year: int | None = None,
     parser_version: str = GEMINI_PARSER_VERSION,
     require_schema: bool = True,
+    conn=None,
 ):
     """Select work from current artifacts, validated cache, schema, and DB rows.
 
@@ -175,7 +180,14 @@ def get_ocr_work_items(
     not filing-date years. This keeps default and year-scoped work identical
     for late filings instead of emitting two identities for the same document.
     """
-    conn = duckdb.connect(db_path, read_only=True)
+    if conn is None:
+        from analyzer.persistence.ownership import resolve_read_path
+        owned = duckdb.connect(str(resolve_read_path(db_path)), read_only=True)
+        try:
+            return get_ocr_work_items(db_path=db_path, data_dir=data_dir, year=year,
+                                      parser_version=parser_version, require_schema=require_schema, conn=owned)
+        finally:
+            owned.close()
     existing_columns = {
         row[1] for row in conn.execute("PRAGMA table_info('transactions')").fetchall()
     }
@@ -185,8 +197,8 @@ def get_ocr_work_items(
     base = Path(data_dir) if data_dir is not None else Path(db_path).parent
     generation_work = []
     if schema_ready and year is not None:
-        conn.close()
-        db = Database(db_path, read_only=True)
+        db = Database.__new__(Database)
+        db.conn = conn
         try:
             generation = db.get_latest_house_generation(year)
             scoped_ptrs = 0
@@ -212,8 +224,7 @@ def get_ocr_work_items(
                     for doc_id in unresolved
                 ]
         finally:
-            db.close()
-        conn = duckdb.connect(db_path, read_only=True)
+            pass  # borrowed coordinator connection
 
     if not schema_ready:
         legacy_rows = conn.execute(
@@ -244,7 +255,6 @@ def get_ocr_work_items(
             """,
             [year, year],
         ).fetchall()
-        conn.close()
         return [
             (
                 doc_id,
@@ -369,7 +379,8 @@ def get_ocr_work_items(
         matching_rows = conn.execute(
             """
             SELECT source_row_id, raw_asset_description, raw_transaction_subtype,
-                   transaction_date, notification_date, amount_raw
+                   transaction_date, notification_date, amount_raw, owner_code, raw_owner,
+                   instrument_type, strike_price, expiry_date
             FROM transactions
             WHERE doc_id = ? AND source = 'gemini_ocr'
               AND (chamber = 'House' OR chamber IS NULL)
@@ -391,9 +402,21 @@ def get_ocr_work_items(
             """,
             [doc_id, ingestion_generation, cached.pdf_sha256],
         ).fetchone()[0]
+        bound_metadata = conn.execute(
+            "SELECT filing_date, first_name, last_name FROM house_generation_metadata "
+            "WHERE archive_year = ? AND generation_id = ? AND doc_id = ? AND filing_type = 'P'",
+            [doc_year, ingestion_generation, doc_id],
+        ).fetchone()
+        if bound_metadata is None:
+            unresolved.append((doc_id, doc_year, pdf_path))
+            continue
+        normalized, findings = normalize_rows(
+            doc_id, cached.parsed.member, cached.parsed.transactions,
+            bound_metadata[0], " ".join(part for part in bound_metadata[1:] if part), cached.pdf_sha256,
+        )
         expected_rows = []
         for source_row_number, transaction in enumerate(
-            cached.parsed.transactions, start=1
+            normalized, start=1
         ):
             page_number = transaction.get("page_number")
             source_row_id = (
@@ -406,15 +429,21 @@ def get_ocr_work_items(
                     source_row_id,
                     transaction["asset"][:500],
                     transaction["type"],
-                    datetime.date.fromisoformat(normalize_date(transaction["date"])),
+                    datetime.date.fromisoformat(transaction["date"]),
                     datetime.date.fromisoformat(
-                        normalize_date(transaction["notif_date"])
+                        transaction["notif_date"]
                     ) if transaction["notif_date"] is not None else None,
-                    transaction["amount_letter"],
+                    transaction["amount_raw"],
+                    transaction.get("owner_code"),
+                    transaction.get("raw_owner"),
+                    transaction.get("instrument_type", "unknown"),
+                    transaction.get("strike_price"),
+                    transaction.get("expiry_date"),
                 )
             )
         success_matches = (
             status == "success"
+            and not findings
             and recorded_raw_count == cached.parsed.raw_row_count
             and recorded_count == parsed_count
             and current_ocr_row_count == parsed_count
@@ -429,7 +458,6 @@ def get_ocr_work_items(
         )
         if not (success_matches or no_txs_matches):
             unresolved.append((doc_id, doc_year, pdf_path))
-    conn.close()
     return sorted(set(unresolved) | set(generation_work))
 
 
@@ -1623,6 +1651,7 @@ def record_failed_ocr_attempt(
     artifact_sha256: str | None = None,
     ingestion_generation: str | None = None,
     engine_model: str = MODEL,
+    receipt=None,
 ) -> None:
     """Record a failed OCR attempt and retire rows for that exact artifact."""
     conn.execute("BEGIN TRANSACTION")
@@ -1655,6 +1684,7 @@ def record_failed_ocr_attempt(
             ingestion_generation=ingestion_generation,
             engines_attempted=engine_model,
         )
+        _finish_receipt(conn, receipt, "needs_review", error_message)
         conn.execute("COMMIT")
     except Exception:
         cleanup_ocr_resource(lambda: conn.execute("ROLLBACK"))
@@ -1696,6 +1726,12 @@ class InsertOutcome:
             "rejections": self.rejections,
             "detail": self.detail,
         }
+
+
+def _finish_receipt(conn, receipt, state, detail=None):
+    if receipt is not None:
+        from analyzer.persistence.work_repository import WorkRepository
+        WorkRepository(conn).finish(receipt, state, detail=detail, in_transaction=True)
 
 
 def insert_outcome_from_report(
@@ -1759,6 +1795,8 @@ def _insert_transactions(
     engine_model: str = MODEL,
     checkpoint: bool = True,
     force_partial_canonical: bool = False,
+    receipt=None,
+    evidence=None,
 ) -> InsertOutcome:
     """Validate and dispatch a generation-bound rowset; partials stay blocked."""
 
@@ -1787,6 +1825,7 @@ def _insert_transactions(
             json.dumps(identity_rejections, sort_keys=True),
             parser_version=parser_version, artifact_sha256=artifact_sha256,
             ingestion_generation=ingestion_generation, engine_model=engine_model,
+            receipt=receipt,
         )
         # Member-level rejection: a no_txs-looking zero is NOT a no_txs.
         return InsertOutcome(
@@ -1794,6 +1833,8 @@ def _insert_transactions(
             rejections=dict(identity_rejections),
         )
     if not transactions:
+        if receipt is not None and not raw_count and not verified_empty_evidence(evidence):
+            raise ValueError("verified empty admission requires explicit evidence for every page")
         status = "error" if raw_count else "no_txs"
         message = "semantic_zero_after_raw_rows" if raw_count else ""
         if raw_count:
@@ -1803,6 +1844,7 @@ def _insert_transactions(
                 artifact_sha256=artifact_sha256,
                 ingestion_generation=ingestion_generation,
                 engine_model=engine_model,
+                receipt=receipt,
             )
             return InsertOutcome(
                 status="rejected", inserted=0, expected=input_expected, detail=message,
@@ -1831,6 +1873,7 @@ def _insert_transactions(
                 ingestion_generation=ingestion_generation,
                 engines_attempted=engine_model,
             )
+            _finish_receipt(conn, receipt, "verified_empty")
             conn.execute("COMMIT")
         except Exception:
             cleanup_ocr_resource(lambda: conn.execute("ROLLBACK"))
@@ -1840,11 +1883,8 @@ def _insert_transactions(
         )
 
     input_count = raw_count if raw_count is not None else len(transactions)
-    transactions = apply_verified_house_corrections(
-        doc_id, artifact_sha256, transactions
-    )
-    validated, rejections = validate_transactions(
-        doc_id, member, transactions, filing_date, expected_member
+    validated, rejections = normalize_rows(
+        doc_id, member, transactions, filing_date, expected_member, artifact_sha256
     )
     # Identity failures are whole-doc fatal (wrong human). Row-level
     # rejections (impossible dates on individual rows, usually filer typos)
@@ -1857,6 +1897,8 @@ def _insert_transactions(
     row_rejections = {
         key: count for key, count in rejections.items() if key not in identity_fatal
     }
+    if input_count != len(transactions):
+        row_rejections["raw_row_count_mismatch"] = abs(input_count - len(transactions))
     if identity_fatal or not validated:
         record_failed_ocr_attempt(
             conn,
@@ -1868,6 +1910,7 @@ def _insert_transactions(
             artifact_sha256=artifact_sha256,
             ingestion_generation=ingestion_generation,
             engine_model=engine_model,
+            receipt=receipt,
         )
         return InsertOutcome(
             status="rejected", inserted=0, expected=input_count,
@@ -1911,6 +1954,7 @@ def _insert_transactions(
                 ingestion_generation=ingestion_generation,
                 engines_attempted=engine_model,
             )
+            _finish_receipt(conn, receipt, "needs_review", detail)
             conn.execute("COMMIT")
         except Exception:
             cleanup_ocr_resource(lambda: conn.execute("ROLLBACK"))
@@ -1945,6 +1989,7 @@ def _insert_transactions(
             artifact_sha256=artifact_sha256,
             ingestion_generation=ingestion_generation,
             engine_model=engine_model,
+            receipt=receipt,
         )
         return InsertOutcome(
             status="error", inserted=0, expected=input_count, detail=message,
@@ -1993,6 +2038,7 @@ def _insert_transactions(
         partial_note=partial_note, parser_version=parser_version,
         artifact_sha256=artifact_sha256, ingestion_generation=ingestion_generation,
         engine_model=engine_model, checkpoint=checkpoint,
+        receipt=receipt,
     )
 
 
@@ -2004,8 +2050,11 @@ def _normalize_ocr_rows(
     rows: list[dict] = []
     for source_row_number, tx in enumerate(transactions, start=1):
         try:
-            tx_date = normalize_date(tx["date"])
-            notification_date = normalize_date(tx.get("notif_date"))
+            from analyzer.ocr.common import _strict_date
+            parsed_date = _strict_date(tx["date"])
+            parsed_notification = _strict_date(tx.get("notif_date"))
+            tx_date = parsed_date.isoformat() if parsed_date else None
+            notification_date = parsed_notification.isoformat() if parsed_notification else None
             disclosure_date = filing_date or notification_date or tx_date
             disclosed_ticker = extract_ticker(tx["asset"], explicit_only=True)
             ticker_candidate = None
@@ -2032,11 +2081,14 @@ def _normalize_ocr_rows(
                 "transaction_date": tx_date,
                 "disclosure_date": disclosure_date,
                 "transaction_type": tx["type"],
-                "amount_raw": tx["amount_letter"],
+                "amount_raw": tx.get("amount_raw", tx.get("amount_letter")),
                 "amount_midpoint": tx["amount_midpoint"],
-                "owner_code": None,
+                "owner_code": tx.get("owner_code"),
                 "asset_description": tx["asset"][:500],
                 "source": "gemini_ocr",
+                "instrument_type": tx.get("instrument_type", "unknown"),
+                "strike_price": tx.get("strike_price"),
+                "expiry_date": tx.get("expiry_date"),
             }
             page_number = tx.get("page_number")
             row_identity = (
@@ -2055,7 +2107,8 @@ def _normalize_ocr_rows(
                 "ticker_origin": ticker_origin,
                 "raw_ticker": raw_ticker,
                 "ticker_candidate": ticker_candidate,
-                "raw_asset_class": "Not separately reported",
+                "raw_asset_class": tx.get("raw_asset_class", tx.get("instrument_type", "Not separately reported")),
+                "raw_owner": tx.get("raw_owner", tx.get("owner")),
                 "raw_asset_description": tx["asset"][:500],
                 "ingestion_generation": ingestion_generation,
                 "artifact_sha256": artifact_sha256,
@@ -2072,7 +2125,7 @@ def _normalize_ocr_rows(
 def _replace_accepted_ocr_rows(
     conn, doc_id, year, rows, input_count, *, row_rejections, partial_transactions,
     partial_note, parser_version, artifact_sha256, ingestion_generation,
-    engine_model, checkpoint,
+    engine_model, checkpoint, receipt=None,
 ) -> InsertOutcome:
     """Own accepted-rowset replacement and historical repair in one transaction."""
     count = 0
@@ -2245,6 +2298,7 @@ def _replace_accepted_ocr_rows(
             ingestion_generation=ingestion_generation,
             engines_attempted=engine_model,
         )
+        _finish_receipt(conn, receipt, "needs_review" if row_rejections else "accepted", partial_note or None)
         conn.execute("COMMIT")
         committed = True
         if checkpoint:
@@ -2267,6 +2321,7 @@ def _replace_accepted_ocr_rows(
                     artifact_sha256=artifact_sha256,
                     ingestion_generation=ingestion_generation,
                     engine_model=engine_model,
+                    receipt=receipt,
                 )
             except Exception:
                 logging.getLogger(__name__).exception("Failed to record OCR insertion failure")
@@ -2276,18 +2331,21 @@ def _replace_accepted_ocr_rows(
 
 
 def insert_transactions_outcome(
-    doc_id, year, member, transactions, *, db_path: str,
+    doc_id, year, member, transactions, *, db_path: str = DB_PATH,
     parser_version: str = GEMINI_PARSER_VERSION, raw_count: int | None = None,
     artifact_sha256: str | None = None, ingestion_generation: str | None = None,
     engine_model: str = MODEL, checkpoint: bool = True,
     force_partial_canonical: bool = False,
+    conn=None, receipt=None, evidence=None,
 ) -> InsertOutcome:
     """Return the committed outcome; partials are evidence-only unless forced.
 
     The explicit force override retains an incomplete outcome and warning.
     Every branch shares this connection lifetime, including schema failures.
     """
-    conn = duckdb.connect(db_path)
+    owned = conn is None
+    if owned:
+        conn = duckdb.connect(db_path)
     try:
         return _insert_transactions(
             conn, doc_id, year, member, transactions,
@@ -2295,9 +2353,11 @@ def insert_transactions_outcome(
             artifact_sha256=artifact_sha256, ingestion_generation=ingestion_generation,
             engine_model=engine_model, checkpoint=checkpoint,
             force_partial_canonical=force_partial_canonical,
+            receipt=receipt, evidence=evidence,
         )
     finally:
-        cleanup_ocr_resource(conn.close)
+        if owned:
+            cleanup_ocr_resource(conn.close)
 
 
 def insert_transactions(doc_id, year, member, transactions, *, report=None, **kwargs):

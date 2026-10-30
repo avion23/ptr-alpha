@@ -24,7 +24,7 @@ GEMINI_PARSER_VERSION = "v5-gemini-validated"
 GEMINI_35_MODEL = "gemini/gemini-3.5-flash"
 GEMINI_35_PARSER_VERSION = "v6-gemini-3.5-flash"
 CACHE_ENVELOPE_VERSION = 1
-OUTPUT_SCHEMA_VERSION = 3
+OUTPUT_SCHEMA_VERSION = 4
 CACHE_DIR = str(DATA_DIR / "gemini_cache")
 AMOUNT_MIDPOINTS = {
     "A": 8000,
@@ -43,10 +43,13 @@ AMOUNT_MIDPOINTS = {
 PROMPT = """This is a US House Periodic Transaction Report (PTR). The first data row may be an EXAMPLE labeled "Example: Mega Corp. Common Stock"; skip it. Extract every real transaction from every page.
 
 Output format:
+SCHEMA: 4
 MEMBER: [full name of filer]
 PAGES: [total PDF page count]
 PAGE: [page number]
-[asset name] | [Purchase/Sale/Exchange] | [MM/DD/YY] | [MM/DD/YY] | [amount range letter A-J]
+ROW: {"asset": "verbatim asset", "type": "Purchase/Sale/Exchange or unknown", "date": "MM/DD/YY or unknown", "notif_date": null, "amount_raw": "verbatim amount cell", "owner": "verbatim owner cell or null", "account": "verbatim account or null", "instrument_type": "explicit instrument or unknown", "raw_cells": {"column heading": "verbatim cell"}}
+
+Use one ROW JSON object per real transaction, including repeated identical lots. Preserve exact dollar amounts, ranges, and open bounds verbatim; NEVER convert them to range letters. Copy every source column in raw_cells. Null means not reported; use "unknown" for unreadable text. Do not infer ownership, account, instrument, dates, or amounts. Preserve option terms and all additional source fields as named JSON fields.
 
 For each page with no real transactions, output PAGE followed by exactly NO_TRANSACTIONS. Every PDF page must appear exactly once and must contain transactions or NO_TRANSACTIONS.
 For checkbox forms, read each row's marked box under PURCHASE, SALE, or EXCHANGE; these are separate subcolumns. Never carry the preceding row's direction or notification date forward. Rotate sideways pages before reading the column headers and marks.
@@ -67,6 +70,11 @@ class ParsedGeminiOutput:
     no_transactions: bool
     page_count: int
     covered_pages: frozenset[int]
+    output_schema_version: int = 3
+
+    @property
+    def legacy_limited(self):
+        return self.output_schema_version < 4
 
 
 def _strict_date(value: object) -> date | None:
@@ -77,6 +85,11 @@ def _strict_date(value: object) -> date | None:
     if not isinstance(value, str):
         return None
     text = value.strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        try:
+            return date.fromisoformat(text)
+        except ValueError:
+            return None
     match = re.fullmatch(r"\d{1,2}([/-])\d{1,2}\1\d{2}(?:\d{2})?", text)
     if match is None:
         return None
@@ -127,6 +140,7 @@ def parse_gemini_output(
     """Parse a complete response and require an outcome for every PDF page."""
     if not isinstance(output, str) or not output.strip():
         raise GeminiOutputError("empty_response")
+    schema_version = 4 if "SCHEMA: 4" in output.splitlines() else 3
 
     # Attachment-capable models may emit reasoning before the requested
     # schema. Parse only the final MEMBER block; that block still must satisfy
@@ -152,6 +166,8 @@ def parse_gemini_output(
     for line_number, raw_line in enumerate(output.splitlines(), start=1):
         line = raw_line.strip()
         if not line:
+            continue
+        if line == "SCHEMA: 4":
             continue
         if line.upper().startswith("MEMBER:"):
             candidate = line.split(":", 1)[1].strip()
@@ -198,6 +214,23 @@ def parse_gemini_output(
             page_has_no_transactions.add(current_page)
             current_page = None
             continue
+        if line.startswith("ROW:"):
+            if current_page is None:
+                raise GeminiOutputError(f"line {line_number}: transaction before PAGE")
+            try:
+                row = json.loads(line[4:].strip())
+            except ValueError as exc:
+                raise GeminiOutputError(f"line {line_number}: invalid ROW JSON") from exc
+            required = {"asset", "type", "date", "notif_date", "amount_raw", "owner", "account", "instrument_type", "raw_cells"}
+            if not isinstance(row, dict) or not required <= row.keys() or not isinstance(row["raw_cells"], dict):
+                raise GeminiOutputError(f"line {line_number}: incomplete ROW")
+            if _is_example(str(row["asset"])):
+                continue
+            row["page_number"] = current_page
+            transactions.append(row)
+            raw_row_count += 1
+            page_has_rows.add(current_page)
+            continue
         if "|" not in line:
             raise GeminiOutputError(f"line {line_number}: unexpected text")
         if current_page is None:
@@ -206,6 +239,8 @@ def parse_gemini_output(
             raise GeminiOutputError(f"line {line_number}: mixed page outcome")
 
         parts = [part.strip() for part in line.split("|")]
+        if schema_version == 4:
+            raise GeminiOutputError(f"line {line_number}: schema 4 requires named ROW fields")
         if len(parts) != 5:
             raise GeminiOutputError(f"line {line_number}: expected 5 fields")
         asset, tx_type_raw, tx_date_raw, notification_date_raw, amount_raw = parts
@@ -279,6 +314,7 @@ def parse_gemini_output(
         not transactions,
         effective_page_count,
         frozenset(actual_covered_pages),
+        schema_version,
     )
 
 
@@ -362,7 +398,7 @@ def _cache_envelope(
 ) -> dict:
     return {
         "cache_envelope_version": CACHE_ENVELOPE_VERSION,
-        "output_schema_version": OUTPUT_SCHEMA_VERSION,
+        "output_schema_version": 4 if "SCHEMA: 4" in output.splitlines() else 3,
         "doc_id": str(doc_id),
         "pdf_sha256": pdf_digest,
         "pdf_page_count": page_count,
@@ -572,7 +608,7 @@ def _tx_type(tx: dict):
 
 
 def _tx_amount(tx: dict):
-    return tx.get("amount_letter") or tx.get("amount") or tx.get("amount_raw")
+    return tx.get("amount_raw") or tx.get("amount") or tx.get("amount_letter")
 
 
 def _tx_asset(tx: dict):
@@ -693,8 +729,10 @@ def validate_transactions(doc_id, member, transactions, filing_date, expected_me
         ):
             rejections["invalid_notification_date"] += 1
             continue
-        amount_letter = str(_tx_amount(tx) or "").strip().upper()
-        if amount_letter not in AMOUNT_MIDPOINTS:
+        from analyzer.ocr.normalization import normalize_amount
+        amount = normalize_amount(_tx_amount(tx))
+        amount_letter = str(tx.get("amount_letter") or "").strip().upper()
+        if amount["amount_kind"] == "unknown":
             rejections["invalid_amount"] += 1
             continue
         if filing and parsed_date > filing:
@@ -715,12 +753,13 @@ def validate_transactions(doc_id, member, transactions, filing_date, expected_me
             for alias in ("notification_date", "disclosure_date"):
                 if alias in cleaned:
                     cleaned[alias] = None
+        cleaned.update(amount)
+        if amount["amount_kind"] != "band":
+            cleaned.pop("amount_letter", None)
         cleaned.update(
             member=effective_member,
             asset=asset,
             type=tx_type,
-            amount_letter=amount_letter,
-            amount_midpoint=AMOUNT_MIDPOINTS[amount_letter],
         )
         valid.append(cleaned)
 

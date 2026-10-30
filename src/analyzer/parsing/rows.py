@@ -138,6 +138,8 @@ def _build_row_dict(
         _extract_option_details(asset_cell) if instrument_type != "stock" else {}
     )
     return {
+        "raw_cells": list(row),
+        "raw_owner": _get_cell(source, indexes.get("owner")),
         "ticker": ticker,
         "transaction_type": tx_type,
         "transaction_date": tx_date,

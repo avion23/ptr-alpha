@@ -135,6 +135,7 @@ def consolidate_transactions(
         for tx in transactions:
             all_transactions.append(
                 {
+                    **tx,
                     "doc_id": doc_id,
                     "member": f"{first} {last}".strip(),
                     "transaction_date": tx["transaction_date"],
@@ -145,7 +146,7 @@ def consolidate_transactions(
                     "owner_code": tx.get("owner_code"),
                     "amount_raw": tx.get("amount_raw"),
                     "amount_midpoint": tx.get("amount_midpoint"),
-                    "instrument_type": tx.get("instrument_type", "stock"),
+                    "instrument_type": tx.get("instrument_type", "unknown"),
                     "strike_price": tx.get("strike_price"),
                     "expiry_date": tx.get("expiry_date"),
                     "asset_description": tx.get("asset_description"),

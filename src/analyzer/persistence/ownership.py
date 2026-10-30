@@ -23,6 +23,19 @@ def publication_pointer(db_path) -> Path:
     return _path(db_path).with_suffix(_path(db_path).suffix + ".published.json")
 
 
+def assert_publication_allowed(db_path) -> None:
+    """Refuse publication until an operator explicitly releases a quality hold."""
+    if str(db_path) == ":memory:":
+        return
+    pointer = publication_pointer(db_path)
+    if pointer.exists() and "quality_hold" in json.loads(pointer.read_text()):
+        raise OwnershipError(
+            f"Database publication blocked by quality_hold: {pointer}. "
+            "An operator must explicitly release the hold after quarantine and review; "
+            "the pinned published snapshot is unchanged."
+        )
+
+
 @contextmanager
 def database_owner(db_path, purpose):
     """Acquire before connecting; never wait behind a competing writer."""

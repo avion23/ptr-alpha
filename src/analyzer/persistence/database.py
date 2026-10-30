@@ -18,6 +18,7 @@ from analyzer.exceptions import AnalysisError
 from analyzer.member_names import canonical_member_key
 from analyzer.persistence.metadata_repository import MetadataRepository
 from analyzer.persistence.ownership import (
+    assert_publication_allowed,
     database_owner,
     publication_pointer,
     resolve_read_path,
@@ -127,6 +128,7 @@ class Database:
         """
         if self._read_only or str(self.db_path) == ":memory:" or self._closed:
             raise DatabaseError("Publication requires an open file-backed writer")
+        assert_publication_allowed(self.db_path)
         version = uuid4().hex
         directory = self.db_path.with_suffix(self.db_path.suffix + ".snapshots")
         directory.mkdir(parents=True, exist_ok=True)

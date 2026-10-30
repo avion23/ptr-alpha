@@ -9,12 +9,12 @@ import pandas as pd
 import pytest
 from typer.testing import CliRunner
 
-from analyzer.cli import _open_database, app
+from analyzer.cli import app
 from analyzer.canonical_scope import decision_history
 from analyzer.persistence.database import Database
 from analyzer.persistence.source_report_repository import SOURCE_REPORT_INPUT_COLUMNS
 from analyzer.download import HouseFetchSummary, HouseTransactionSource
-from analyzer.exceptions import DataResult, DataSourceError, StepResult
+from analyzer.exceptions import DataResult, DataSourceError
 from analyzer.member_ranking.buyer_scoring import get_consensus_candidate_tickers
 from analyzer.pipeline import (
     BacktestParams,

@@ -28,14 +28,14 @@ class TestHouseRefreshOwnership(unittest.TestCase):
                     with self.subTest(fails=fails):
                         summary = SimpleNamespace(archive_year=2026)
 
-                        def fetch(year, **kwargs):
+                        def fetch(year, _fails=fails, _summary=summary, **kwargs):
                             self.assertEqual(year, 2026)
                             self.assertEqual(owner.conn.execute("SELECT 1").fetchone(), (1,))
                             with self.assertRaises(OwnershipError):
                                 Database(path)
-                            if fails:
+                            if _fails:
                                 raise ValueError("acquisition failed")
-                            return summary
+                            return _summary
 
                         source = SimpleNamespace(db=owner, fetch_and_cache_pdfs=fetch)
                         result = acquire_house_archives(source, [2026], all_years=False, refresh_metadata=False)

@@ -294,11 +294,13 @@ def test_cron_module_entrypoint_runs_actual_spawn_worker_without_api(tmp_path):
         owner.conn.execute("INSERT INTO house_archive_generations (archive_year, generation_id, metadata_count, ptr_count) VALUES (2025, 'spawn', 1, 1)")
         owner.conn.execute("INSERT INTO house_generation_metadata (archive_year, generation_id, doc_id, first_name, last_name, filing_date, filing_type) VALUES (2025, 'spawn', 'spawn-probe', 'Jane', 'Doe', '2025-01-20', 'P')")
         owner.conn.execute("INSERT INTO house_pdf_artifacts (archive_year, generation_id, doc_id, artifact_sha256) VALUES (2025, 'spawn', 'spawn-probe', ?)", [digest])
-    env = dict(os.environ, PYTHONPATH=str(root / "src"), PTR_SKIP_DOCS="spawn-probe")
+    # snapshot_pdf deliberately uses artifact.pdf; skip that backend input so
+    # this exercises real spawn/dispatch without invoking substantial OCR.
+    env = dict(os.environ, PYTHONPATH=str(root / "src"), PTR_SKIP_DOCS="artifact")
     process = subprocess.run(
         [sys.executable, "-m", "analyzer.cli", "pipeline", "--data-dir", str(data),
          "--year", "2025", "--local-workers", "1", "--gemini-workers", "0", "--glm-workers", "0"],
-        cwd=root, env=env, capture_output=True, text=True, timeout=60,
+        cwd=root, env=env, capture_output=True, text=True, timeout=60, check=False,
     )
     assert process.returncode == 1, process.stdout + process.stderr
     summary = json.loads(process.stdout)
@@ -316,10 +318,14 @@ def test_nonfinite_raw_source_is_durable_refusal_without_stopping_other_document
     from analyzer.ocr import common
 
     root, _ = scope
+    second_pdf = root / "2025" / "pdfs" / "b.pdf"
+    second_bytes = second_pdf.read_bytes() + b"\nsecond-document"
+    second_pdf.write_bytes(second_bytes)
     with Database(root / "congress.duckdb") as owner:
         owner.conn.execute("DELETE FROM house_generation_metadata WHERE doc_id NOT IN ('a', 'b')")
         owner.conn.execute("DELETE FROM house_pdf_artifacts WHERE doc_id NOT IN ('a', 'b')")
         owner.conn.execute("UPDATE house_archive_generations SET metadata_count=2, ptr_count=2")
+        owner.conn.execute("UPDATE house_pdf_artifacts SET artifact_sha256=? WHERE doc_id='b'", [hashlib.sha256(second_bytes).hexdigest()])
     row = {"asset": "Apple (AAPL)", "type": "Purchase", "date": "01/15/25",
            "notif_date": None, "amount_raw": "$1,234", "owner": None, "account": None,
            "instrument_type": "unknown", "raw_cells": {"nested": [{"number": "NUMBER_TOKEN"}]}}
@@ -332,7 +338,8 @@ def test_nonfinite_raw_source_is_durable_refusal_without_stopping_other_document
     def provider(command, *args, **kwargs):
         if command[0] != "llm":
             return run(command, *args, **kwargs)
-        doc = Path(command[command.index("-a") + 1]).stem
+        artifact = Path(command[command.index("-a") + 1])
+        doc = "b" if artifact.read_bytes() == second_bytes else "a"
         calls.append(doc)
         return SimpleNamespace(returncode=0, stdout=invalid if doc == "a" else valid, stderr="")
 

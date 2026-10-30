@@ -2962,7 +2962,7 @@ def test_glm_audit_guard_holds_real_verdict_authorization_through_commit(data_di
         attempted.set()
         try:
             audit_sample.record_verdict(data_dir, "guard", "fail", "new pixel defect")
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001 -- propagate invalidator thread failures to the test
             errors.append(error)
         finally:
             invalidated.set()

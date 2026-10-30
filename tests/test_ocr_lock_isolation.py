@@ -58,6 +58,69 @@ def bound_work(root, digest, doc_id="a", lane=ExtractionLane.LOCAL):
     )
 
 
+@pytest.mark.parametrize("borrow_writer", [False, True])
+def test_quality_hold_refuses_startup_before_writer_recovery_or_work(tmp_path, monkeypatch, borrow_writer):
+    from analyzer.persistence.ownership import publication_pointer
+
+    path = tmp_path / "congress.duckdb"
+    with Database(path) as owner:
+        hold = {"quality_hold": {"reason": "unreviewed fresh API batch", "scope_count": 48}}
+        pointer = publication_pointer(path)
+        pointer.write_text(json.dumps(hold))
+        before = pointer.read_bytes()
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("held startup reached writer/recovery/work")
+
+        monkeypatch.setattr(coordinator, "Database", forbidden)
+        monkeypatch.setattr(type(owner.work), "recover_expired", forbidden)
+        monkeypatch.setattr(workers, "extract_document", forbidden)
+        with pytest.raises(OwnershipError, match="quality_hold"):
+            coordinator.run_pipeline(tmp_path, [2025], database=owner if borrow_writer else None)
+        assert pointer.read_bytes() == before
+        assert owner.conn.execute("SELECT COUNT(*) FROM extraction_work").fetchone() == (0,)
+
+
+def test_quality_hold_keeps_readers_pinned_and_refuses_clone_until_explicit_release(tmp_path, monkeypatch):
+    from analyzer.persistence import database as database_module
+    from analyzer.persistence.ownership import publication_pointer, resolve_read_path
+
+    path = tmp_path / "congress.duckdb"
+    with Database(path) as owner:
+        owner.conn.execute("CREATE TABLE quality_probe (value INTEGER)")
+        owner.conn.execute("INSERT INTO quality_probe VALUES (455)")
+        published = owner.publish_snapshot()
+        pointer = publication_pointer(path)
+        hold = {**published, "quality_hold": {"reason": "48 fresh API results require reconciliation"}}
+        pointer.write_text(json.dumps(hold))
+        owner.conn.execute("UPDATE quality_probe SET value=999")
+        before = pointer.read_bytes()
+        snapshots = sorted(path.parent.glob("*.snapshots/*"))
+        with Database(path, read_only=True) as pinned:
+            assert pinned.conn.execute("SELECT value FROM quality_probe").fetchone() == (455,)
+            assert resolve_read_path(path) == Path(published["path"])
+            assert publication_state(path)["quality_hold"] == hold["quality_hold"]
+
+            def forbidden(*args, **kwargs):
+                raise AssertionError("publication cloned before checking quality hold")
+
+            with monkeypatch.context() as guard:
+                guard.setattr(database_module.subprocess, "run", forbidden)
+                for _ in range(2):
+                    with pytest.raises(OwnershipError, match="quality_hold"):
+                        owner.publish_snapshot()
+            assert pointer.read_bytes() == before
+            assert sorted(path.parent.glob("*.snapshots/*")) == snapshots
+            assert owner.conn.execute("SELECT value FROM quality_probe").fetchone() == (999,)
+            # Only this explicit operator action releases the hold.
+            pointer.write_text(json.dumps(published))
+            replacement = owner.publish_snapshot()
+            assert replacement["version"] != published["version"]
+            assert pinned.conn.execute("SELECT value FROM quality_probe").fetchone() == (455,)
+        with Database(path, read_only=True) as current:
+            assert current.conn.execute("SELECT value FROM quality_probe").fetchone() == (999,)
+
+
 def test_late_superseded_bundle_replays_without_poisoning_current_attempt(scope):
     root, digest = scope
     with Database(root / "congress.duckdb") as db:

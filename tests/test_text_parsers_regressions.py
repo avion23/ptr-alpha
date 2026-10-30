@@ -85,6 +85,113 @@ def test_flattened_owner_row_and_layout_are_one_lot(monkeypatch):
     assert transactions[0]["owner_code"] == "SP"
 
 
+def test_pdfplumber_layout_enrichment_matches_truncated_table_row(monkeypatch):
+    asset_rows = [
+        "JP Morgan 3-year auto callable buffer note [CS]",
+        "JP Morgan 3-year one-time callable barrier note [CS]",
+    ]
+    details = (
+        "  F S: New\n"
+        "  S O: Advisory Account holding Structured Notes\n"
+        "  D: Structured Note\n"
+    )
+    text = "".join(
+        f"  {asset} P 12/30/2025 12/30/2025 $5,000,001 - $25,000,000\n{details}"
+        for asset in asset_rows
+    )
+    header = HEADER + ["Notification Date"]
+    table = [header] + [
+        [asset, "", "P", "12/30/2025", "$5,000,001 - $25,000,000", "12/30/2025"]
+        for asset in asset_rows
+    ]
+    monkeypatch.setattr(
+        "pdfplumber.open",
+        lambda _: nullcontext(SimpleNamespace(pages=[page(text, [table])])),
+    )
+
+    transactions = [
+        tx
+        for extracted in extract_tables_with_pdfplumber(Path("filing.pdf"))
+        for tx in parse_pdf_table(extracted)
+    ]
+
+    assert len(transactions) == 2
+    assert all("Description: Structured Note" in tx["asset_description"] for tx in transactions)
+
+
+def test_pdfplumber_layout_enrichment_preserves_repeated_physical_rows(monkeypatch):
+    asset = "JP Morgan callable note [CS]"
+    details = "  D: Structured Note\n"
+    text = "".join(
+        f"  {asset} P 12/30/2025 12/30/2025 $5,000,001 - $25,000,000\n{details}"
+        for _ in range(2)
+    )
+    header = HEADER + ["Notification Date"]
+    table = [header] + [
+        [asset, "", "P", "12/30/2025", "$5,000,001 - $25,000,000", "12/30/2025"]
+        for _ in range(2)
+    ]
+    monkeypatch.setattr(
+        "pdfplumber.open",
+        lambda _: nullcontext(SimpleNamespace(pages=[page(text, [table])])),
+    )
+
+    transactions = [
+        tx
+        for extracted in extract_tables_with_pdfplumber(Path("filing.pdf"))
+        for tx in parse_pdf_table(extracted)
+    ]
+
+    assert len(transactions) == 2
+    assert [tx["source_row_id"] for tx in transactions] == [
+        "pdfplumber:p1:l0",
+        "pdfplumber:p1:l2",
+    ]
+
+
+def test_pdfplumber_keeps_conflicting_or_ambiguous_layout_observations(monkeypatch):
+    asset = "JP Morgan callable note [CS]"
+    owner_text = (
+        f"  {asset} P 12/30/2025 12/30/2025 $5,000,001 - $25,000,000\n"
+        "  D: Structured Note\n"
+    )
+    extended = [
+        "JP Morgan callable note Series A [CS]",
+        "JP Morgan callable note Series B [CS]",
+    ]
+    ambiguous_text = "".join(
+        f"  {name} P 12/30/2025 12/30/2025 $5,000,001 - $25,000,000\n"
+        "  D: Structured Note\n"
+        for name in extended
+    )
+    header = HEADER + ["Notification Date"]
+    conflicting_owner_table = [
+        header,
+        [asset, "SP", "P", "12/30/2025", "$5,000,001 - $25,000,000", "12/30/2025"],
+    ]
+    ambiguous_table = [
+        header,
+        [asset, "", "P", "12/30/2025", "$5,000,001 - $25,000,000", "12/30/2025"],
+    ]
+
+    for table, source_text, expected_rows in (
+        (conflicting_owner_table, owner_text, 2),
+        (ambiguous_table, ambiguous_text, 3),
+    ):
+        monkeypatch.setattr(
+            "pdfplumber.open",
+            lambda _, table=table, source_text=source_text: nullcontext(
+                SimpleNamespace(pages=[page(source_text, [table])])
+            ),
+        )
+        transactions = [
+            tx
+            for extracted in extract_tables_with_pdfplumber(Path("filing.pdf"))
+            for tx in parse_pdf_table(extracted)
+        ]
+        assert len(transactions) == expected_rows
+
+
 def test_pdfplumber_layout_notification_and_safe_context(monkeypatch):
     text = (
         "  JT Private Foods LLC [OL] P 09/29/2026 09/30/2026 $50,001 - $100,000\n"

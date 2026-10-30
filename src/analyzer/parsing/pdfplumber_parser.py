@@ -79,6 +79,10 @@ def extract_tables_with_pdfplumber(pdf_path: Path) -> list[list[list[str]]]:
     layout_counts = _candidate_counts(layout_transactions)[0]
     if _multiset_subset(table_counts, layout_counts):
         return [[header] + layout_rows]
+    if _layout_observations_cover_table(
+        table_transactions, layout_transactions, _transaction_identity
+    ):
+        return [[header] + layout_rows]
 
     # Keep table-only evidence and add only unmatched validated layout lots.
     unmatched_sources = set()
@@ -92,6 +96,83 @@ def extract_tables_with_pdfplumber(pdf_path: Path) -> list[list[list[str]]]:
     if complementary:
         tables_out.append([header] + complementary)
     return tables_out
+
+
+def _layout_observations_cover_table(
+    table_transactions: list[dict],
+    layout_transactions: list[dict],
+    transaction_identity,
+) -> bool:
+    """Recognize layout rows that only enrich truncated table descriptions.
+
+    This is a one-to-one reconciliation: non-asset identity fields and page
+    must agree, and a table description must be a strict prefix of the layout
+    description. Unmatched or ambiguous observations remain separate evidence.
+    """
+    remaining_layout = list(layout_transactions)
+    unmatched_tables = []
+    for table_row in table_transactions:
+        table_source = str(table_row.get("source_row_id") or "").split(":")
+        match = next(
+            (
+                index
+                for index, layout_row in enumerate(remaining_layout)
+                if _same_pdfplumber_page(table_source, layout_row)
+                and transaction_identity(table_row) == transaction_identity(layout_row)
+            ),
+            None,
+        )
+        if match is None:
+            unmatched_tables.append(table_row)
+        else:
+            remaining_layout.pop(match)
+
+    for table_row in unmatched_tables:
+        table_source = str(table_row.get("source_row_id") or "").split(":")
+        table_asset = " ".join(
+            str(table_row.get("asset_description") or "").casefold().split()
+        )
+        candidates = [
+            index
+            for index, layout_row in enumerate(remaining_layout)
+            if _same_pdfplumber_page(table_source, layout_row)
+            and transaction_identity(table_row)[1:]
+            == transaction_identity(layout_row)[1:]
+            and _is_strict_asset_extension(
+                table_asset, layout_row.get("asset_description")
+            )
+        ]
+        if not candidates:
+            return False
+        candidate_assets = {
+            " ".join(
+                str(remaining_layout[index].get("asset_description") or "")
+                .casefold()
+                .split()
+            )
+            for index in candidates
+        }
+        if len(candidate_assets) != 1:
+            return False
+        remaining_layout.pop(candidates[0])
+
+    return not remaining_layout
+
+
+def _same_pdfplumber_page(source_parts: list[str], transaction: dict) -> bool:
+    layout_parts = str(transaction.get("source_row_id") or "").split(":")
+    return (
+        len(source_parts) >= 3
+        and len(layout_parts) >= 3
+        and source_parts[0] == layout_parts[0] == "pdfplumber"
+        and source_parts[1].startswith("p")
+        and source_parts[:2] == layout_parts[:2]
+    )
+
+
+def _is_strict_asset_extension(shorter: str, longer: str | None) -> bool:
+    longer = " ".join(str(longer or "").casefold().split())
+    return bool(shorter and len(shorter) < len(longer) and longer.startswith(shorter))
 
 
 def _clean_table(tbl: list[list[str | None]]) -> list[list[str]] | None:

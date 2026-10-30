@@ -1,7 +1,10 @@
 from datetime import date, datetime
 from pathlib import Path
 import json
-import queue
+from contextlib import contextmanager
+from dataclasses import replace
+from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 import duckdb
@@ -70,6 +73,31 @@ def _insert_transactions(*args, **kwargs):
 @pytest.fixture(autouse=True)
 def _single_page_pdfinfo(monkeypatch):
     monkeypatch.setattr(gemini_ocr_common, "pdf_page_count", lambda unused: 1)
+
+
+@pytest.fixture(autouse=True)
+def _forbid_network(monkeypatch):
+    import socket
+
+    def refused(*args, **kwargs):
+        raise AssertionError("OCR tests must not access the network")
+
+    monkeypatch.setattr(socket.socket, "connect", refused)
+    monkeypatch.setattr(socket, "create_connection", refused)
+
+
+def _bound_work(tmp_path):
+    from analyzer.ocr.contracts import ExtractionLane, WorkEnvelope, task_key
+    from analyzer.ocr.workers import extraction_recipe
+
+    lane = ExtractionLane.GEMINI
+    recipe = extraction_recipe(lane)
+    identity = ("doc", 2025, "generation", "a" * 64, recipe, lane)
+    return WorkEnvelope(
+        task_key(*identity), str(uuid4()), "doc", 2025, "generation",
+        "a" * 64, str(tmp_path / "doc.pdf"), "Jane Doe", "2025-01-20", 1,
+        recipe, lane,
+    )
 
 
 def _tx(asset="Apple Inc. (AAPL)", date="01/15/24", tx_type="Purchase", amount="A"):
@@ -185,7 +213,7 @@ def test_verified_8220049_corrections_survive_raw_and_validated_reingestion(tmp_
         INSERT INTO metadata (doc_id, first_name, last_name, filing_date, filing_type, fetched_at)
         VALUES ('8220049', 'Charles J.', 'Fleischmann', TIMESTAMP '2023-11-17', 'P', CURRENT_TIMESTAMP)
     """)
-    db.conn.close()
+    db.close()
     validated, _ = gemini_ocr_common.validate_transactions(
         "8220049", parsed.member, parsed.transactions,
         datetime(2023, 11, 17), parsed.member,
@@ -687,7 +715,7 @@ def test_insert_transactions_sets_source_and_is_idempotent(tmp_path):
         INSERT INTO metadata (doc_id, first_name, last_name, filing_date, filing_type, fetched_at)
         VALUES ('doc-insert', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)
     """)
-    db.conn.close()
+    db.close()
 
     txs = [_tx()]
     assert (
@@ -699,7 +727,7 @@ def test_insert_transactions_sets_source_and_is_idempotent(tmp_path):
         == 1
     )
 
-    con = Database(db_path).conn
+    con = duckdb.connect(str(db_path), read_only=True)
     rows = con.execute("""
         SELECT member, ticker, asset_description, source
         FROM transactions
@@ -912,7 +940,7 @@ def test_insert_transactions_plumbs_authoritative_provenance_when_schema_support
         artifact_sha256="abc123",
     )
     assert inserted == 1
-    connection = Database(db_path).conn
+    connection = duckdb.connect(str(db_path), read_only=True)
     row = connection.execute(
         "SELECT chamber, source_record_id, source_row_id, official_filing_date, notification_date, raw_asset_description, ingestion_generation, artifact_sha256 FROM transactions WHERE doc_id='doc-provenance'"
     ).fetchone()
@@ -1019,7 +1047,7 @@ def test_insert_transactions_empty_list_retires_existing_ocr_rows(tmp_path):
         INSERT INTO metadata (doc_id, first_name, last_name, filing_date, filing_type, fetched_at)
         VALUES ('doc-preserve', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)
     """)
-    db.conn.close()
+    db.close()
 
     assert (
         _insert_transactions(
@@ -1032,7 +1060,7 @@ def test_insert_transactions_empty_list_retires_existing_ocr_rows(tmp_path):
         == 0
     )
 
-    con = Database(db_path).conn
+    con = duckdb.connect(str(db_path), read_only=True)
     row_count = con.execute(
         "SELECT COUNT(*) FROM transactions WHERE doc_id = 'doc-preserve'"
     ).fetchone()[0]
@@ -1058,7 +1086,7 @@ def test_insert_transactions_all_bad_rows_retires_current_artifact_rows(tmp_path
         INSERT INTO metadata (doc_id, first_name, last_name, filing_date, filing_type, fetched_at)
         VALUES ('doc-bad', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)
     """)
-    db.conn.close()
+    db.close()
 
     assert (
         _insert_transactions("doc-bad", 2024, "Jane Doe", [_tx()], db_path=str(db_path))
@@ -1070,7 +1098,7 @@ def test_insert_transactions_all_bad_rows_retires_current_artifact_rows(tmp_path
         == 0
     )
 
-    con = Database(db_path).conn
+    con = duckdb.connect(str(db_path), read_only=True)
     rows = con.execute(
         "SELECT ticker, asset_description FROM transactions WHERE doc_id = 'doc-bad'"
     ).fetchall()
@@ -1095,7 +1123,7 @@ def test_insert_transactions_mixed_invalid_batch_retires_current_artifact_rows(t
         INSERT INTO metadata (doc_id, first_name, last_name, filing_date, filing_type, fetched_at)
         VALUES ('doc-mixed', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)
     """)
-    db.conn.close()
+    db.close()
 
     assert (
         _insert_transactions(
@@ -1120,7 +1148,7 @@ def test_insert_transactions_mixed_invalid_batch_retires_current_artifact_rows(t
         == 0
     )
 
-    con = Database(db_path).conn
+    con = duckdb.connect(str(db_path), read_only=True)
     blocked_run = con.execute("""
         SELECT status, raw_row_count, transaction_count, error_message
         FROM pdf_parse_runs
@@ -1152,7 +1180,7 @@ def test_insert_transactions_mixed_invalid_batch_retires_current_artifact_rows(t
         == 1
     )
 
-    con = Database(db_path).conn
+    con = duckdb.connect(str(db_path), read_only=True)
     rows = con.execute(
         "SELECT ticker, asset_description FROM transactions WHERE doc_id = 'doc-mixed'"
     ).fetchall()
@@ -1210,7 +1238,7 @@ def test_row_construction_failure_retires_current_artifact_rows(
         db_path=str(db_path),
     )
     assert result == 0
-    con = Database(db_path).conn
+    con = duckdb.connect(str(db_path), read_only=True)
     assert con.execute(
         "SELECT asset_description FROM transactions WHERE doc_id='doc-construction'"
     ).fetchall() == []
@@ -1222,99 +1250,77 @@ def test_row_construction_failure_retires_current_artifact_rows(
     assert "alias construction failed" in error
 
 
-def test_parallel_request_limiter_paces_model_call_starts(monkeypatch):
+def test_bound_worker_reports_quota_without_retry_or_database(monkeypatch, tmp_path):
+    from analyzer.ocr import workers
+    from analyzer.ocr.contracts import ExtractionOutcome
+
+    work = _bound_work(tmp_path)
+    calls = []
+
+    @contextmanager
+    def snapshot(path):
+        assert str(path) == work.artifact_path
+        yield SimpleNamespace(path=Path(path), sha256=work.artifact_sha256, page_count=1)
+
+    def quota(*args, **kwargs):
+        calls.append(kwargs)
+        kwargs["response_sink"]("raw quota response")
+        return None, "429 RESOURCE_EXHAUSTED", None
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("worker opened a database")
+
+    monkeypatch.setattr(gemini_ocr_common, "snapshot_pdf", snapshot)
+    monkeypatch.setattr(gemini_ocr_common, "call_gemini", quota)
+    monkeypatch.setattr(duckdb, "connect", forbidden)
+    result = workers.load_result(workers.extract_document(work, str(tmp_path / "spool")))
+    assert len(calls) == 1
+    assert result.outcome == ExtractionOutcome.RETRY_WAIT
+    assert result.retry_after > 0
+    assert result.raw_response == "raw quota response"
+    assert not workers.admission_decision(result, tmp_path)["allowed"]
+    assert not list(tmp_path.rglob("*.duckdb"))
+
+
+@pytest.mark.parametrize("flag", ["--timeout", "--doc-ids", "--retry-failed"])
+def test_parallel_rejects_unsupported_legacy_flags(monkeypatch, flag):
     from scripts import ocr_parallel
+    import sys
 
-    clock = [100.0]
-    sleeps = []
-
-    def fake_monotonic():
-        return clock[0]
-
-    def fake_sleep(seconds):
-        sleeps.append(seconds)
-        clock[0] += seconds
-
-    monkeypatch.setattr(ocr_parallel, "REQUEST_INTERVAL_SECONDS", 3.0)
-    monkeypatch.setattr(ocr_parallel, "_NEXT_REQUEST_AT", 0.0)
-    monkeypatch.setattr(ocr_parallel.time, "monotonic", fake_monotonic)
-    monkeypatch.setattr(ocr_parallel.time, "sleep", fake_sleep)
-
-    ocr_parallel._wait_for_request_slot()
-    ocr_parallel._wait_for_request_slot()
-
-    assert sleeps == [3.0]
-    assert ocr_parallel._NEXT_REQUEST_AT == 106.0
+    monkeypatch.setattr(sys, "argv", ["ocr_parallel", flag, "123"])
+    with pytest.raises(SystemExit) as exc:
+        ocr_parallel.main()
+    assert exc.value.code == 2
 
 
-def test_parallel_process_uses_configured_model_timeout(monkeypatch):
-    from scripts import ocr_parallel
+def test_result_cannot_be_normalized_for_another_document(tmp_path):
+    from analyzer.ocr.contracts import ExtractionOutcome, ResultBundle
+    from analyzer.ocr.normalization import normalize_candidate
 
-    captured = {}
-
-    def fake_call_gemini(*args, **kwargs):
-        captured["timeout"] = kwargs["timeout"]
-        captured["thinking_level"] = kwargs["thinking_level"]
-        captured["max_output_tokens"] = kwargs["max_output_tokens"]
-        return None, "boom", None
-
-    monkeypatch.setattr(ocr_parallel, "MODEL_TIMEOUT_SECONDS", 240)
-    monkeypatch.setattr(ocr_parallel, "MODEL_THINKING_LEVEL", "minimal")
-    monkeypatch.setattr(ocr_parallel, "MODEL_MAX_OUTPUT_TOKENS", 65536)
-    monkeypatch.setattr(ocr_parallel, "call_gemini", fake_call_gemini)
-    monkeypatch.setattr(ocr_parallel, "_record_failure", lambda *args, **kwargs: None)
-
-    result = ocr_parallel.process_one(
-        (
-            "doc",
-            2025,
-            "/tmp/doc.pdf",
-            "generation",
-            "artifact-sha",
-            datetime(2025, 1, 20),
-            "Jane Doe",
-        )
-    )
-
-    assert captured == {
-        "timeout": 240,
-        "thinking_level": "minimal",
-        "max_output_tokens": 65536,
-    }
-    assert result[:4] == ("doc", 2025, "error", 0)
+    work = _bound_work(tmp_path)
+    result = ResultBundle(work, ExtractionOutcome.CANDIDATE, [_tx()])
+    for changed in (replace(work, doc_id="other"), replace(work, archive_year=2024),
+                    replace(work, generation_id="other"), replace(work, artifact_sha256="b" * 64)):
+        with pytest.raises(ValueError, match="identity"):
+            normalize_candidate(changed, result)
 
 
-def test_parallel_doc_id_filter_keeps_only_requested_unresolved_items():
-    from scripts import ocr_parallel
+def test_failed_receipt_finish_remains_replayable(tmp_path):
+    from analyzer.ocr.contracts import ExtractionOutcome, ResultBundle
 
-    pending = [
-        ("a", 2025, "/tmp/a.pdf"),
-        ("b", 2025, "/tmp/b.pdf"),
-        ("c", 2026, "/tmp/c.pdf"),
-    ]
-
-    assert ocr_parallel._filter_requested_doc_ids(pending, None) == pending
-    assert ocr_parallel._filter_requested_doc_ids(pending, ["c", "a"]) == [
-        pending[0],
-        pending[2],
-    ]
-
-
-def test_parallel_writer_acknowledges_failure(monkeypatch):
-    from scripts import ocr_parallel
-
-    acknowledgement = queue.Queue(maxsize=1)
-    item = {"ack": acknowledgement}
-    monkeypatch.setattr(
-        ocr_parallel,
-        "_write_item",
-        lambda unused: (_ for _ in ()).throw(RuntimeError("boom")),
-    )
-    ocr_parallel._flush([item])
-    inserted, error = acknowledgement.get_nowait()
-    assert inserted is None
-    assert isinstance(error, RuntimeError)
-    assert str(error) == "boom"
+    with Database(tmp_path / "ledger.duckdb") as db:
+        work = _bound_work(tmp_path)
+        db.work.register(work)
+        claimed = db.work.claim(work.task_id)
+        result = ResultBundle(claimed, ExtractionOutcome.CANDIDATE, [_tx()])
+        result_id = db.work.register_result(result, str(tmp_path / "result.json"))
+        receipt = db.work.pending_results()[0]
+        assert receipt["result_id"] == result_id
+        with pytest.raises(ValueError, match="retry_at"):
+            db.work.finish(receipt, "retry_wait")
+        assert not db.work.is_finished(receipt)
+        assert db.work.pending_results() == [receipt]
+        assert db.work.status()["by_state"] == {"running": 1}
 
 
 def test_semantic_zero_error_preserves_prior_ocr_rows(tmp_path):

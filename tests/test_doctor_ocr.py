@@ -379,8 +379,9 @@ class OcrStagingCheckTest(TestCase):
 
         output = StringIO()
         connection = SimpleNamespace(close=lambda: None)
+        (root / "canonical.duckdb").touch()
         with (
-            patch.object(doctor_mod, "CANONICAL", SimpleNamespace(exists=lambda: True)),
+            patch.object(doctor_mod, "CANONICAL", root / "canonical.duckdb"),
             patch("duckdb.connect", return_value=connection),
             patch.object(doctor_mod, "check", return_value=results),
             redirect_stdout(output),
@@ -920,8 +921,10 @@ class CrontabContractTest(TestCase):
     def test_main_exits_nonzero_when_a_check_is_unknown(self):
         unknown = FreshnessCheck.unknown("crontab.contract", "deployment not verified")
         connection = SimpleNamespace(close=lambda: None)
+        canonical = Path(tempfile.mkdtemp()) / "canonical.duckdb"
+        canonical.touch()
         with (
-            patch.object(doctor_mod, "CANONICAL", SimpleNamespace(exists=lambda: True)),
+            patch.object(doctor_mod, "CANONICAL", canonical),
             patch("duckdb.connect", return_value=connection),
             patch.object(doctor_mod, "check", return_value=[unknown]),
         ):

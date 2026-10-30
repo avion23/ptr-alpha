@@ -1,7 +1,5 @@
 import unittest
-from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
-from threading import Event
 
 import duckdb
 import pandas as pd
@@ -19,6 +17,31 @@ from .conftest import DatabaseTestCase
 import pytest
 
 pytestmark = pytest.mark.slow
+
+
+def test_writer_exclusive_and_readers_pin_published_snapshot(tmp_path):
+    from analyzer.persistence.ownership import OwnershipError, publication_state
+
+    path = tmp_path / "owner.duckdb"
+    with Database(path) as writer:
+        with pytest.raises(OwnershipError, match="writer owner"):
+            Database(path)
+        with pytest.raises(OwnershipError, match="no published snapshot"):
+            Database(path, read_only=True)
+        writer.conn.execute("CREATE TABLE publication_probe (value INTEGER)")
+        writer.conn.execute("INSERT INTO publication_probe VALUES (1)")
+        first = writer.publish_snapshot()
+        with Database(path, read_only=True) as pinned:
+            writer.conn.execute("INSERT INTO publication_probe VALUES (2)")
+            second = writer.publish_snapshot()
+            assert first["version"] != second["version"]
+            assert pinned.conn.execute("SELECT value FROM publication_probe").fetchall() == [(1,)]
+            with Database(path, read_only=True) as current:
+                assert current.conn.execute("SELECT value FROM publication_probe ORDER BY value").fetchall() == [(1,), (2,)]
+        assert publication_state(path)["owner_active"]
+    assert not publication_state(path)["owner_active"]
+    with Database(path):
+        pass  # Closing the Database, not only its raw connection, releases ownership.
 
 
 
@@ -531,15 +554,13 @@ class TestTransactions(DatabaseTestCase):
         after = connection.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
         self.assertEqual(after, before)
 
-    def test_filing_save_serializes_identity_check_across_connections(self):
-        from unittest.mock import patch
-
-        from analyzer.persistence import transaction_repository
+    def test_filing_save_serializes_identity_check_under_single_owner(self):
         from analyzer.persistence.transaction_repository import (
             upsert_filing_transactions,
         )
 
-        second_db = Database(self.db.db_path)
+        # Producers share the owner's connection; competing owners are refused.
+        second_db = self.db
         try:
             base = {
                 "doc_id": "accession-original",
@@ -552,62 +573,14 @@ class TestTransactions(DatabaseTestCase):
                 "source_record_id": "accession-original",
                 "source_row_id": "nonDerivativeTransaction:000001",
             }
-            first_lookup_done = Event()
-            second_save_started = Event()
-            second_lookup_done = Event()
-            first_upsert_done = Event()
-            original_drop = transaction_repository.drop_already_stored
-
-            def controlled_drop(db, frame, *, source):
-                pending = original_drop(db, frame, source=source)
-                generation = frame["ingestion_generation"].iloc[0]
-                if generation == "gen-a":
-                    first_lookup_done.set()
-                    if not second_save_started.wait(timeout=5):
-                        raise AssertionError("second filing save did not start")
-                    second_lookup_done.wait(timeout=0.1)
-                else:
-                    second_lookup_done.set()
-                    if not first_upsert_done.wait(timeout=5):
-                        raise AssertionError("first filing upsert did not finish")
-                return pending
-
-            original_upsert = self.db.upsert_transactions
-
-            def first_upsert(df, *, source):
-                inserted = original_upsert(df, source=source)
-                first_upsert_done.set()
-                return inserted
-
-            self.db.upsert_transactions = first_upsert
-
-            def save_a():
-                return upsert_filing_transactions(
+            inserted = [
+                upsert_filing_transactions(
                     self.db,
-                    pd.DataFrame([base | {"ingestion_generation": "gen-a"}]),
+                    pd.DataFrame([base | {"ingestion_generation": generation}]),
                     source="form4",
                 )
-
-            def save_b():
-                if not first_lookup_done.wait(timeout=5):
-                    raise AssertionError("first filing lookup did not finish")
-                second_save_started.set()
-                return upsert_filing_transactions(
-                    second_db,
-                    pd.DataFrame([base | {"ingestion_generation": "gen-b"}]),
-                    source="form4",
-                )
-
-            try:
-                with patch.object(
-                    transaction_repository, "drop_already_stored", controlled_drop
-                ):
-                    with ThreadPoolExecutor(max_workers=2) as workers:
-                        a = workers.submit(save_a)
-                        b = workers.submit(save_b)
-                        inserted = [a.result(timeout=10), b.result(timeout=10)]
-            finally:
-                del self.db.upsert_transactions
+                for generation in ("gen-a", "gen-b")
+            ]
 
             self.assertEqual(sorted(inserted), [0, 1])
             canonical = self.db.conn.execute(

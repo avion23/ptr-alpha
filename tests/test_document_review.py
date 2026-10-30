@@ -263,11 +263,72 @@ def test_withdrawn_raw_result_cannot_reuse_its_old_review_to_readmit(quarantinab
     assert json.loads(checklist.read_text())["omissions_checked"] is False
     report = source_report(result)
     report["supersedes_admission_decision_id"] = withdrawn["result_id"]
-    with pytest.raises(ValueError, match="current database"):
-        review.record_review(result, root, report, verdict="pass", human_reviewed=True)
     review.record_review(result, root, report, verdict="pass", human_reviewed=True, database=db)
     assert ingest(db, result, root) == "accepted"
     assert db.work.effective_admission_decision(scope[0])["result_id"] != withdrawn["result_id"]
+
+
+def test_actual_review_cli_is_database_free_with_active_writer_and_held_lagging_snapshot(quarantinable, monkeypatch):
+    import duckdb
+    from typer.testing import CliRunner
+    from analyzer import cli
+    from analyzer.persistence import database as database_module
+    from analyzer.persistence.ownership import publication_pointer, publication_state, resolve_read_path
+    from scripts.quarantine_model_admissions import quarantine
+
+    db, result, root, baseline, scope, _ = quarantinable
+    quarantine(db.conn, scope, baseline, root, 'operator withdrawal', apply=True)
+    withdrawn = db.work.effective_admission_decision(scope[0])
+    pointer = publication_pointer(db.db_path)
+    held = {**json.loads(pointer.read_text()), 'quality_hold': {'reason': 'operator reconciliation required'}}
+    pointer.write_text(json.dumps(held))
+    pointer_before = pointer.read_bytes()
+    assert publication_state(db.db_path)['owner_active']
+    assert resolve_read_path(db.db_path) == baseline
+    with Database(db.db_path, read_only=True) as pinned:
+        assert pinned.conn.execute('SELECT COUNT(*) FROM extraction_results').fetchone() == (0,)
+    original_rows = db.conn.execute('SELECT * FROM canonical_transactions').fetchall()
+    raw_path = scope[0]['path']
+    runner = CliRunner()
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError('review CLI opened a database instead of using immutable evidence')
+
+    for acknowledgment in (None, '0' * 64, withdrawn['result_id']):
+        prepare_args = ['ocr-review-prepare', raw_path, '--data-dir', str(root)]
+        if acknowledgment:
+            prepare_args += ['--supersedes-admission-decision', acknowledgment]
+        with monkeypatch.context() as guard:
+            guard.setattr(database_module.Database, '__init__', forbidden)
+            guard.setattr(duckdb, 'connect', forbidden)
+            prepared = runner.invoke(cli.app, prepare_args)
+        assert prepared.exit_code == 0, prepared.output or repr(prepared.exception)
+        directory = Path(prepared.output.strip())
+        template_name = f'report-template-{acknowledgment}.json' if acknowledgment else 'report-template.json'
+        template = json.loads((directory / template_name).read_text())
+        assert template['supersedes_admission_decision_id'] == acknowledgment
+        assert template['omissions_checked'] is False
+        report = source_report(result)
+        report['supersedes_admission_decision_id'] = acknowledgment
+        report_path = root / 'operator-report.json'
+        report_path.write_text(json.dumps(report))
+        record_args = ['ocr-review-record', raw_path, str(report_path), '--data-dir', str(root), '--verdict', 'pass']
+        with monkeypatch.context() as guard:
+            guard.setattr(database_module.Database, '__init__', forbidden)
+            guard.setattr(duckdb, 'connect', forbidden)
+            unconfirmed = runner.invoke(cli.app, record_args)
+            recorded = runner.invoke(cli.app, [*record_args, '--human-reviewed'])
+        assert unconfirmed.exit_code != 0
+        assert recorded.exit_code == 0, recorded.output or repr(recorded.exception)
+        assert pointer.read_bytes() == pointer_before
+        state = ingest(db, result, root)
+        if acknowledgment != withdrawn['result_id']:
+            assert state == 'needs_review'
+            assert db.work.effective_admission_decision(scope[0]) == withdrawn
+            assert db.conn.execute('SELECT * FROM canonical_transactions').fetchall() == original_rows
+        else:
+            assert state == 'accepted'
+        assert pointer.read_bytes() == pointer_before  # Review never publishes or releases the hold.
 
 
 def test_successful_model_empty_claim_requires_grounded_all_page_absence_review(candidate, monkeypatch):

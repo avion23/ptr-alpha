@@ -386,7 +386,7 @@ def test_initials(name, expected):
     assert canonical_member_key(name) == expected
 
 
-def test_year_runner_parses_fresh_response_once(stored, monkeypatch):
+def test_year_runner_revalidates_raw_empty_claim_at_independent_review_boundary(stored, monkeypatch):
     from types import SimpleNamespace
 
     path, pdf, _ = stored
@@ -409,7 +409,7 @@ def test_year_runner_parses_fresh_response_once(stored, monkeypatch):
     summary = runner.run_gemini_ocr_for_year(2024, str(path.parent))
     assert summary['unresolved'] == 1  # Model empty output is not verified absence.
     assert summary['work']['by_state'] == {'needs_review': 1}
-    assert calls == [1]
+    assert calls == [1, 1]  # Extraction parse, then raw empty-claim eligibility check.
 
 
 def test_timeout_retains_artifact_metadata(tmp_path, monkeypatch):

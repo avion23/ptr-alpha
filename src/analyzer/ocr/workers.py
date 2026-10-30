@@ -212,7 +212,7 @@ def extract_document(work: WorkEnvelope, spool_dir: str) -> str:
                     evidence["page_outcomes"] = _model_pages(work, parsed)
                     evidence["output_schema_version"] = parsed.output_schema_version
                     evidence["legacy_limited"] = parsed.legacy_limited
-                    outcome = ExtractionOutcome.CANDIDATE if rows else ExtractionOutcome.NEEDS_REVIEW
+                    outcome = ExtractionOutcome.CANDIDATE  # Empty is an unverified claim, never absence proof.
                     detail = None if rows else "model no_txs has no source-policy proof"
             else:
                 from scripts import glm_stage
@@ -260,7 +260,7 @@ def extract_document(work: WorkEnvelope, spool_dir: str) -> str:
                     evidence["page_outcomes"] = _model_pages(work, parsed)
                     evidence["output_schema_version"] = parsed.output_schema_version
                     evidence["legacy_limited"] = parsed.legacy_limited
-                    outcome = ExtractionOutcome.CANDIDATE if rows else ExtractionOutcome.NEEDS_REVIEW
+                    outcome = ExtractionOutcome.CANDIDATE  # Reviewable parsed empty claim; not VERIFIED_EMPTY.
                     detail = "GLM pixel audit required" if rows else "model no_txs has no source-policy proof"
     except Exception as exc:  # noqa: BLE001 -- failure evidence is the worker's durable output
         # Exceptions can contain complete model bodies; store them only here.

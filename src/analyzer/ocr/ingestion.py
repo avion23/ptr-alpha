@@ -1727,6 +1727,13 @@ def _finish_receipt(conn, receipt, state, detail=None):
     if receipt is not None:
         from analyzer.persistence.work_repository import WorkRepository
         repository = WorkRepository(conn)
+        if state in {"accepted", "verified_empty"}:
+            from analyzer.ocr.review import assert_review_supersession
+
+            # Final authoritative check inside the same SQL transaction as rows
+            # and receipt. The committed binding identifies the revoked decision
+            # this fresh operator review explicitly supersedes.
+            assert_review_supersession(repository, receipt["result_id"], detail["review_binding"])
         if "admission_decision" in receipt:
             from dataclasses import replace
             from analyzer.ocr.contracts import ExtractionOutcome

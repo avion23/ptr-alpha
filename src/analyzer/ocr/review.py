@@ -56,6 +56,16 @@ def review_material(result):
         raise ValueError("source review is for API candidates")
     if result.outcome not in (ExtractionOutcome.CANDIDATE, ExtractionOutcome.VERIFIED_EMPTY):
         raise ValueError("only an unchanged candidate or empty claim can be reviewed")
+    if not result.rows:
+        from analyzer.ocr.common import parse_gemini_output
+
+        if (not isinstance(result.raw_response, str) or not result.raw_response.strip()
+                or result.evidence.get("failure") or result.evidence.get("provider_error")):
+            raise ValueError("empty review requires a successfully parsed source claim, not extraction failure")
+        parsed = parse_gemini_output(result.raw_response, expected_page_count=result.work.page_count)
+        if (parsed.transactions or parsed.raw_row_count or not parsed.no_transactions
+                or parsed.covered_pages != frozenset(range(1, result.work.page_count + 1))):
+            raise ValueError("empty review requires an explicit parsed claim covering every source page")
     candidate = normalize_candidate(result.work, result)
     if candidate["findings"] or (result.rows and candidate["status"] != "candidate"):
         raise ValueError("candidate fails deterministic validation; re-extract before review")
@@ -83,11 +93,35 @@ def bundle_record(result, material):
     }
 
 
-def review_report_template(result, material=None):
+def required_review_supersession(repository, raw_result_id):
+    """An appended refusal/retraction is not an ordinary pending raw review."""
+    row = repository.conn.execute(
+        "SELECT task_id, attempt_id, path, finished_at FROM extraction_results WHERE result_id = ?",
+        [raw_result_id],
+    ).fetchone()
+    if row is None or row[3] is None:
+        return None
+    receipt = dict(result_id=raw_result_id, task_id=row[0], attempt_id=row[1], path=row[2])
+    effective = repository.effective_admission_decision(receipt)
+    event = effective["detail"]
+    if (effective["state"] in {"needs_review", "blocked"} and isinstance(event, dict)
+            and event.get("kind") == "admission_decision"):
+        return effective["result_id"]
+    return None
+
+
+def assert_review_supersession(repository, raw_result_id, binding):
+    required = required_review_supersession(repository, raw_result_id)
+    if binding.get("supersedes_admission_decision_id") != required:
+        raise ValueError(f"fresh local source review must acknowledge supersedes_admission_decision_id={required}")
+
+
+def review_report_template(result, material=None, *, supersedes_admission_decision_id=None):
     """Unapproved checklist for the operator; blanks/unknowns cannot pass."""
     material = review_material(result) if material is None else material
     return {
         "binding": material["binding"], "policy_sha256": digest(POLICY), "evidence": "",
+        "supersedes_admission_decision_id": supersedes_admission_decision_id,
         "pages": [{"page_number": number, "outcome": "unknown", "evidence": ""}
                   for number in range(1, result.work.page_count + 1)],
         "rows": [{"source_row_id": row["source_row_id"],
@@ -117,7 +151,7 @@ def _validate_bundle(data_dir, directory, record):
         raise ValueError("frozen source PDF changed")
 
 
-def prepare_review(result, data_dir):
+def prepare_review(result, data_dir, *, database=None):
     """Local command: freeze actual PDF, rendered pixels, raw and final rows."""
     from scripts.audit_sample import audit_operation_lock, emit_bound_review_bundle
     from analyzer.ocr.ingestion import approved_data_root, read_work_artifact
@@ -129,9 +163,15 @@ def prepare_review(result, data_dir):
         content = read_work_artifact(root, result.work.artifact_path)
         emit_bound_review_bundle(root, directory, encode(record), content)
         _validate_bundle(root, directory, record)
+        required = (required_review_supersession(database.work, material["binding"]["raw_result_id"])
+                    if database is not None else None)
+        # Retractions get a new unapproved checklist, never overwrite an old
+        # draft and never reset sticky failures on the immutable candidate.
+        name = f"report-template-{required}.json" if required else "report-template.json"
         try:
-            with (directory / "report-template.json").open("x") as template:
-                json.dump(review_report_template(result, material), template, indent=2, sort_keys=True)
+            with (directory / name).open("x") as template:
+                json.dump(review_report_template(result, material,
+                          supersedes_admission_decision_id=required), template, indent=2, sort_keys=True)
         except FileExistsError:
             pass  # Never overwrite an operator's draft on repeated preparation.
         return str(Path(data_dir) / directory.relative_to(Path(root)))
@@ -142,6 +182,10 @@ def _validate_report(report, result, material, verdict):
         raise ValueError("review report must bind the exact frozen candidate")
     if report.get("policy_sha256") != digest(POLICY):
         raise ValueError("review policy identity missing or changed")
+    supersedes = report.get("supersedes_admission_decision_id")
+    if supersedes is not None and (not isinstance(supersedes, str) or len(supersedes) != 64
+                                   or any(char not in "0123456789abcdef" for char in supersedes)):
+        raise ValueError("supersedes_admission_decision_id must be a lowercase SHA-256 or null")
     if not isinstance(report.get("evidence"), str) or not report["evidence"].strip():
         raise ValueError("source-grounded evidence report required")
     if verdict != "pass":
@@ -178,7 +222,7 @@ def _validate_report(report, result, material, verdict):
         raise ValueError("empty claims require affirmative absence proof on every page")
 
 
-def record_review(result, data_dir, report, *, verdict, human_reviewed=False):
+def record_review(result, data_dir, report, *, verdict, human_reviewed=False, database=None):
     """Append a local verdict, never accepting positive silver/model assertions."""
     from scripts.audit_sample import audit_operation_lock
     from analyzer.ocr.ingestion import approved_data_root, read_work_artifact
@@ -193,6 +237,10 @@ def record_review(result, data_dir, report, *, verdict, human_reviewed=False):
         record = bundle_record(result, material)
         _validate_bundle(root, directory, record)
         _validate_report(report, result, material, verdict)
+        if verdict == "pass" and report.get("supersedes_admission_decision_id") is not None and database is None:
+            raise ValueError("recording a superseding review requires the current database; use ocr-review-record or pass database")
+        if verdict == "pass" and database is not None:
+            assert_review_supersession(database.work, material["binding"]["raw_result_id"], report)
         history_path = directory / "verdicts.json"
         history = json.loads(read_work_artifact(root, history_path)) if history_path.exists() else []
         entry = {"verdict": verdict, "binding": material["binding"], "report": report,
@@ -233,4 +281,5 @@ def review_decision_locked(result, data_dir):
         material["candidate"] = {**material["candidate"], "status": "verified_empty"}
     return {"allowed": True, "reason": "locally recorded all-pages source review passed",
             "review_binding": {**material["binding"], "verdict_sha256": digest(entry),
+                               "supersedes_admission_decision_id": entry["report"].get("supersedes_admission_decision_id"),
                                "bundle_seal_sha256": seal}, **material}

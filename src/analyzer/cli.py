@@ -737,17 +737,22 @@ def ocr_review_prepare(
     result_path: Path = typer.Argument(..., help="Immutable pipeline result JSON"),
     data_dir: str = typer.Option("data", help="Data root containing the sealed PDF"),
 ):
-    """Freeze all source pixels, raw evidence and final rows for local review (no API)."""
+    """Freeze source review (no API); retractions get report-template-DECISION_ID.json."""
     from analyzer.ocr.review import prepare_review
     from analyzer.ocr.workers import load_result
 
-    print(prepare_review(load_result(result_path), data_dir))
+    from analyzer.persistence.database import Database
+
+    # Review the working decision chain: a held published snapshot deliberately
+    # predates quarantine and cannot tell us which revocation must be acknowledged.
+    with Database(Path(data_dir) / "congress.duckdb", read_only=True) as db:
+        print(prepare_review(load_result(result_path), data_dir, database=db))
 
 
 @app.command()
 def ocr_review_record(
     result_path: Path = typer.Argument(..., help="The unchanged immutable result JSON"),
-    report: Path = typer.Argument(..., help="Source-grounded JSON report bound to the frozen bundle"),
+    report: Path = typer.Argument(..., help="Completed grounded checklist; retain its supersedes_admission_decision_id"),
     verdict: str = typer.Option(..., help="pass or fail; silver findings may only fail"),
     human_reviewed: bool = typer.Option(False, "--human-reviewed", help="Operator confirms actual all-pages, all-rows source review"),
     data_dir: str = typer.Option("data"),
@@ -757,8 +762,11 @@ def ocr_review_record(
     from analyzer.ocr.review import record_review
     from analyzer.ocr.workers import load_result
 
-    entry = record_review(load_result(result_path), data_dir, json.loads(report.read_text()),
-                          verdict=verdict, human_reviewed=human_reviewed)
+    from analyzer.persistence.database import Database
+
+    with Database(Path(data_dir) / "congress.duckdb", read_only=True) as db:
+        entry = record_review(load_result(result_path), data_dir, json.loads(report.read_text()),
+                              verdict=verdict, human_reviewed=human_reviewed, database=db)
     print(json.dumps(entry, sort_keys=True))
 
 

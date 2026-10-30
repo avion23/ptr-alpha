@@ -200,6 +200,17 @@ def _ingest(db: Database, result, path: Path, data_dir: Path, source) -> str:
     # lock itself. The guard rechecks the exact staged record and holds audit
     # authorization through normalization and the atomic canonical receipt.
     with admission_guard(result, data_dir) as gate:
+        if gate["allowed"] and work.lane != ExtractionLane.LOCAL:
+            from analyzer.ocr.review import assert_review_supersession
+
+            try:
+                # Read the actual current chain under the review lock, not an
+                # operator-supplied ID or the pre-lock inspection above.
+                assert_review_supersession(db.work, receipt["result_id"], gate["review_binding"])
+                if finished:
+                    predecessor = db.work.effective_admission_decision(receipt)
+            except ValueError as exc:
+                gate = {**gate, "allowed": False, "reason": str(exc)}
         local_uncertain = (work.lane == ExtractionLane.LOCAL
                            and result.evidence.get("artifact_verified") is True
                            and result.evidence.get("failure", {}).get("type") == "ParserCascadeError")

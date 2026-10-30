@@ -1414,6 +1414,35 @@ def test_typed_sale_conflicting_with_raw_purchase_checkbox_requires_review(tmp_p
     assert result.to_dict() == before
 
 
+@pytest.mark.parametrize("typed,cells,field,reason", [
+    ({"owner": "JT"}, {"Owner": ""}, "owner", "source_blank_typed_populated"),
+    ({"amount_raw": "$1,000-$15,000"},
+     {"$1,000-$15,000": "", "$15,001-$50,000": "X"}, "amount_raw", "typed_source_mismatch"),
+    ({"type": "Sale"}, {"Purchase": "X", "Sale": "X"}, "type", "multiple_source_selections"),
+])
+def test_raw_cell_claim_conflicts_are_findings_not_silent_corrections(tmp_path, typed, cells, field, reason):
+    from analyzer.ocr.contracts import ExtractionOutcome, ResultBundle
+    from analyzer.ocr.normalization import normalize_candidate
+
+    row = {**_tx(date="01/15/25"), "notif_date": "01/20/25", "amount_raw": "$1,000-$15,000",
+           **typed, "raw_cells": cells, "page_number": 1}
+    work = _bound_work(tmp_path)
+    result = ResultBundle(work, ExtractionOutcome.CANDIDATE, [row], evidence={
+        "output_schema_version": 4, "page_count": 1,
+        "page_outcomes": [{"page_number": 1, "outcome": "transactions"}],
+    })
+    before = result.to_dict()
+    normalized = normalize_candidate(work, result)
+    assert normalized["status"] == "needs_review"
+    conflicts = normalized["findings"]["raw_cell_consistency"]
+    assert all(item["occurrence"] == 1 and item["field"] == field and item["reason"] == reason
+               for item in conflicts)
+    assert conflicts
+    for key, value in typed.items():
+        assert normalized["rows"][0][key] == value
+    assert result.to_dict() == before
+
+
 @pytest.mark.parametrize("number", ["NaN", "Infinity", "1e999"])
 def test_schema4_rejects_nonfinite_numbers_nested_in_raw_source(number):
     row = {"asset": "Apple (AAPL)", "type": "Purchase", "date": "01/15/25",

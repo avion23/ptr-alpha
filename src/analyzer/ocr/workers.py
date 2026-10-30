@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import tempfile
+from contextlib import contextmanager
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
@@ -267,11 +268,53 @@ def extract_document(work: WorkEnvelope, spool_dir: str) -> str:
         detail = "bound extraction failed; see result evidence"
     if raw is None and evidence["provider_responses"]:
         raw = evidence["provider_responses"][-1]
-    return _publish(ResultBundle(work, outcome, rows, raw, evidence, detail, retry_after), spool_dir)
+    try:
+        result = ResultBundle(work, outcome, rows, raw, evidence, detail, retry_after)
+    except ValueError as exc:
+        # Backend data is not trusted JSON. Preserve the original source and
+        # an opaque diagnostic representation; never coerce bad row values
+        # into admissible numbers, or let one document abort sibling work.
+        rejected = repr({"rows": rows, "raw_response": raw, "evidence": evidence})
+        result = ResultBundle(
+            work, ExtractionOutcome.NEEDS_REVIEW, [],
+            raw if isinstance(raw, str) else None,
+            {"page_count": work.page_count,
+             "page_outcomes": _pages(work, "invalid_backend_result"),
+             "artifact_verified": evidence.get("artifact_verified") is True,
+             "contract_failure": {"type": type(exc).__name__, "message": str(exc)},
+             "rejected_candidate_repr": rejected},
+            "backend result violates the result contract; see retained source evidence",
+        )
+    return _publish(result, spool_dir)
 
 
 def admission_decision(result: ResultBundle, data_dir) -> dict:
-    """Connection-free policy decision; canonical writer must recheck binding."""
+    """Inspection only. Canonical publication requires ``admission_guard``."""
+    with admission_guard(result, data_dir) as decision:
+        return decision
+
+
+@contextmanager
+def admission_guard(result: ResultBundle, data_dir):
+    """Yield a decision while retaining GLM audit and document authorization.
+
+    The coordinator must keep this scope around normalization AND canonical
+    commit, including readmission. Do not call admission_decision or acquire
+    the audit-root lock again inside the scope: that lock is not reentrant.
+    """
+    if result.work.lane != ExtractionLane.GLM:
+        yield _admission_decision_locked(result, data_dir)
+        return
+    from scripts import glm_stage
+
+    with (
+        glm_stage.audit_operation_lock(data_dir),
+        glm_stage.document_publication_lock(data_dir, result.work.archive_year, result.work.doc_id),
+    ):
+        yield _admission_decision_locked(result, data_dir)
+
+
+def _admission_decision_locked(result: ResultBundle, data_dir) -> dict:
     refused = {"allowed": False, "reason": result.detail or result.outcome.value, "audit_binding": None}
     if result.outcome not in (ExtractionOutcome.CANDIDATE, ExtractionOutcome.VERIFIED_EMPTY):
         return refused
@@ -283,21 +326,20 @@ def admission_decision(result: ResultBundle, data_dir) -> dict:
         return {"allowed": True, "reason": "candidate; writer validation required", "audit_binding": None}
     from scripts import glm_stage
 
-    with glm_stage.audit_operation_lock(data_dir):
-        record = glm_stage.load_staging_record(data_dir, result.work.archive_year, result.work.doc_id)
-        expected = result.evidence.get("staging_record")
-        if record is None or expected is None or glm_stage.audit_staged_record_sha256(record) != glm_stage.audit_staged_record_sha256(expected):
-            return {**refused, "reason": "staging evidence missing or changed"}
-        state = glm_stage.audit_report_state(data_dir)
-        history = glm_stage.audit_history_sha256(glm_stage.load_audit_results(data_dir))
-        sample = glm_stage.sample_lot_file_sha256(data_dir, state.get("sample_file") if state else None)
-        if not glm_stage.audit_report_gate_open(state, history, sample):
-            return {**refused, "reason": glm_stage._audit_report_gate_issue(state, history, sample)}
-        bound, reason = glm_stage.verdict_binding(data_dir, result.work.doc_id, record)
-        if record.get("audit") != "pass" or not bound:
-            return {**refused, "reason": reason or "staging record lacks audit pass"}
-        return {
-            "allowed": True, "reason": "bound pixel audit passed; writer validation required",
-            "audit_binding": {"audit_history_sha256": history, "sample_file_sha256": sample,
-                              "staged_record_sha256": glm_stage.audit_staged_record_sha256(record)},
-        }
+    record = glm_stage.load_staging_record(data_dir, result.work.archive_year, result.work.doc_id)
+    expected = result.evidence.get("staging_record")
+    if record is None or expected is None or glm_stage.audit_staged_record_sha256(record) != glm_stage.audit_staged_record_sha256(expected):
+        return {**refused, "reason": "staging evidence missing or changed"}
+    state = glm_stage.audit_report_state(data_dir)
+    history = glm_stage.audit_history_sha256(glm_stage.load_audit_results(data_dir))
+    sample = glm_stage.sample_lot_file_sha256(data_dir, state.get("sample_file") if state else None)
+    if not glm_stage.audit_report_gate_open(state, history, sample):
+        return {**refused, "reason": glm_stage._audit_report_gate_issue(state, history, sample)}
+    bound, reason = glm_stage.verdict_binding(data_dir, result.work.doc_id, record)
+    if record.get("audit") != "pass" or not bound:
+        return {**refused, "reason": reason or "staging record lacks audit pass"}
+    return {
+        "allowed": True, "reason": "bound pixel audit passed; writer validation required",
+        "audit_binding": {"audit_history_sha256": history, "sample_file_sha256": sample,
+                          "staged_record_sha256": glm_stage.audit_staged_record_sha256(record)},
+    }

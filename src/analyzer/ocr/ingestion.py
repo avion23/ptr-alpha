@@ -36,7 +36,10 @@ from analyzer.ocr.common import (
 )
 
 from analyzer.ocr.paths import DATA_DIR, STAGING_ROOT
-from analyzer.ocr.normalization import normalize_rows, verified_empty_evidence
+from analyzer.ocr.normalization import (
+    CACHE_ROW_COLUMNS, canonical_row_projection, normalize_rows,
+    typed_instrument_fields, verified_empty_evidence,
+)
 
 DB_PATH = str(DATA_DIR / "congress.duckdb")
 PROGRESS_PATH = str(DATA_DIR / "ocr_progress_gemini_manual.json")
@@ -414,36 +417,16 @@ def get_ocr_work_items(
             doc_id, cached.parsed.member, cached.parsed.transactions,
             bound_metadata[0], " ".join(part for part in bound_metadata[1:] if part), cached.pdf_sha256,
         )
-        expected_rows = []
-        for source_row_number, transaction in enumerate(
-            normalized, start=1
-        ):
-            page_number = transaction.get("page_number")
-            source_row_id = (
-                f"{doc_id}:page:{page_number}:row:{source_row_number}"
-                if page_number is not None
-                else f"{doc_id}:row:{source_row_number}"
-            )
-            expected_rows.append(
-                (
-                    source_row_id,
-                    transaction["asset"][:500],
-                    transaction["type"],
-                    datetime.date.fromisoformat(transaction["date"]),
-                    datetime.date.fromisoformat(
-                        transaction["notif_date"]
-                    ) if transaction["notif_date"] is not None else None,
-                    transaction["amount_raw"],
-                    transaction.get("owner_code"),
-                    transaction.get("raw_owner"),
-                    transaction.get("instrument_type", "unknown"),
-                    transaction.get("strike_price"),
-                    transaction.get("expiry_date"),
-                )
-            )
+        expected_persistence, projection_errors = _normalize_ocr_rows(
+            doc_id, cached.parsed.member, normalized, bound_metadata[0],
+            artifact_sha256=cached.pdf_sha256, ingestion_generation=ingestion_generation,
+        )
+        expected_rows = [canonical_row_projection(row) for row in expected_persistence]
+        matching_rows = [canonical_row_projection(dict(zip(CACHE_ROW_COLUMNS, row))) for row in matching_rows]
         success_matches = (
             status == "success"
             and not findings
+            and not projection_errors
             and recorded_raw_count == cached.parsed.raw_row_count
             and recorded_count == parsed_count
             and current_ocr_row_count == parsed_count
@@ -471,6 +454,7 @@ def build_work_manifest(
     db_path: str = DB_PATH,
     data_dir: str | Path | None = None,
     year: int | None = None,
+    conn=None,
 ) -> dict:
     """The authoritative unresolved OCR queue as an artifact-bound manifest.
 
@@ -486,10 +470,17 @@ def build_work_manifest(
     groups use archive years; additive ``archive_year`` keeps artifact identity
     explicit while old manifests may retain filing-year staging groups.
     """
+    if conn is None:
+        from analyzer.persistence.ownership import resolve_read_path
+        owned = duckdb.connect(str(resolve_read_path(db_path)), read_only=True)
+        try:
+            return build_work_manifest(db_path=db_path, data_dir=data_dir, year=year, conn=owned)
+        finally:
+            owned.close()
     base = Path(data_dir) if data_dir is not None else Path(db_path).parent
     items = []
     for doc_id, doc_year, pdf_path in get_ocr_work_items(
-        db_path=db_path, data_dir=base, year=year
+        db_path=db_path, data_dir=base, year=year, conn=conn
     ):
         entry = {
             "doc_id": str(doc_id),
@@ -503,19 +494,15 @@ def build_work_manifest(
             entry["artifact_sha256"] = pdf_sha256(local_pdf)
         items.append(entry)
     if items:
-        conn = duckdb.connect(db_path, read_only=True)
-        try:
-            for entry in items:
-                if entry["artifact_sha256"] is None:
-                    continue
-                try:
-                    entry["ingestion_generation"] = _resolve_ingestion_generation(
-                        conn, entry["doc_id"], entry["year"], entry["artifact_sha256"]
-                    )
-                except RuntimeError:
-                    entry["ingestion_generation"] = None
-        finally:
-            conn.close()
+        for entry in items:
+            if entry["artifact_sha256"] is None:
+                continue
+            try:
+                entry["ingestion_generation"] = _resolve_ingestion_generation(
+                    conn, entry["doc_id"], entry["year"], entry["artifact_sha256"]
+                )
+            except RuntimeError:
+                entry["ingestion_generation"] = None
     return {
         "schema": WORK_MANIFEST_SCHEMA,
         "generated_at_utc": (
@@ -1378,9 +1365,12 @@ def _resolve_ingestion_generation(
 
 
 def resolve_ingestion_generation(
-    db_path: str, doc_id: str, year: int, artifact_sha256: str
+    db_path: str, doc_id: str, year: int, artifact_sha256: str, *, conn=None,
 ) -> str:
-    conn = duckdb.connect(db_path, read_only=True)
+    if conn is not None:
+        return _resolve_ingestion_generation(conn, doc_id, year, artifact_sha256)
+    from analyzer.persistence.ownership import resolve_read_path
+    conn = duckdb.connect(str(resolve_read_path(db_path)), read_only=True)
     try:
         return _resolve_ingestion_generation(conn, doc_id, year, artifact_sha256)
     finally:
@@ -2123,8 +2113,7 @@ def _normalize_ocr_rows(
                 "owner_code": tx.get("owner_code"),
                 "asset_description": tx["asset"][:500],
                 "source": "gemini_ocr",
-                "instrument_type": tx.get("instrument_type", "unknown"),
-                "strike_price": tx.get("strike_price"),
+                **typed_instrument_fields(tx),
                 "expiry_date": tx.get("expiry_date"),
             }
             page_number = tx.get("page_number")
@@ -2144,7 +2133,7 @@ def _normalize_ocr_rows(
                 "ticker_origin": ticker_origin,
                 "raw_ticker": raw_ticker,
                 "ticker_candidate": ticker_candidate,
-                "raw_asset_class": tx.get("raw_asset_class", tx.get("instrument_type", "Not separately reported")),
+                "raw_asset_class": tx.get("raw_asset_class", tx.get("raw_instrument_type", tx.get("instrument_type")) or "Not separately reported"),
                 "raw_owner": tx.get("raw_owner", tx.get("owner")),
                 "raw_asset_description": tx["asset"][:500],
                 "ingestion_generation": ingestion_generation,
@@ -2380,10 +2369,12 @@ def insert_transactions_outcome(
     The explicit force override retains an incomplete outcome and warning.
     Every branch shares this connection lifetime, including schema failures.
     """
-    owned = conn is None
-    if owned:
-        conn = duckdb.connect(db_path)
-    try:
+    with ExitStack() as resources:
+        if conn is None:
+            from analyzer.persistence.ownership import database_owner
+            resources.enter_context(database_owner(db_path, "standalone OCR insertion"))
+            conn = duckdb.connect(db_path)
+            resources.callback(lambda: cleanup_ocr_resource(conn.close))
         return _insert_transactions(
             conn, doc_id, year, member, transactions,
             parser_version=parser_version, raw_count=raw_count,
@@ -2392,9 +2383,6 @@ def insert_transactions_outcome(
             force_partial_canonical=force_partial_canonical,
             receipt=receipt, evidence=evidence,
         )
-    finally:
-        if owned:
-            cleanup_ocr_resource(conn.close)
 
 
 def insert_transactions(doc_id, year, member, transactions, *, report=None, **kwargs):

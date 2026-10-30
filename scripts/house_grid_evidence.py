@@ -157,16 +157,16 @@ def analyze_page(gray, directory, read_dates=False):
                             cv2.ROTATE_90_CLOCKWISE), 7) for i in range(2, 5)]
     page["header_ocr"] = {"major": major, "directions": labels}
     directions = [v["text"].upper() for v in labels]
-    if not ({"PURCHASE", "SALE", "EXCHANGE"} == set(directions)
-            and all(v["min_confidence"] >= 80 for v in labels)
-            and all(s in major["text"].upper() for s in ("ASSET", "NAME", "AMOUNT", "TRANSACTION"))):
+    headings_ok = ({"PURCHASE", "SALE", "EXCHANGE"} == set(directions)
+                   and all(v["min_confidence"] >= 80 for v in labels)
+                   and all(s in major["text"].upper() for s in ("ASSET", "NAME", "AMOUNT", "TRANSACTION")))
+    if not headings_ok:
         page["reason"] = "source_headings_not_independently_read"
-        return page
     headers = [save_crop(gray, [a, ys[1], b, ys[2]], directory, f"amount-header-{i+1}")
                for i, (a, b) in enumerate(pairwise(xs[7:]))]
     date_headers = [ocr(gray[ys[0]+8:ys[1]-8, xs[i]+8:xs[i+1]-8]) for i in (5, 6)]
     page["header_ocr"]["dates"] = date_headers
-    page.update(status="partial_evidence", amount_headers=headers)
+    page.update(status="partial_evidence" if headings_ok else "unknown", amount_headers=headers)
     for number, (top, bottom) in enumerate(pairwise(ys[2:]), 1):
         cells = [ink_observation(clean, [a, top, b, bottom]) for a, b in pairwise(xs)]
         row = {"band": number, "disposition": "unknown", "cells": cells,
@@ -177,6 +177,10 @@ def analyze_page(gray, directory, read_dates=False):
                                   ("amount", 7, len(xs)-1)):
             box = [xs[start], top, xs[end], bottom]
             fields[name] = {"state": "unknown", "evidence": save_crop(gray, box, directory, f"row-{number}-{name}")}
+        row["fields"] = fields
+        page["rows"].append(row)
+        if not headings_ok:
+            continue  # Retain detected bands even when text cannot establish semantics.
         fields["owner"]["state"] = "blank" if cells[0]["state"] == "blank" else "unknown"
         fields["owner"]["scope"] = "ruling-excluded interior only"
         fields["owner"]["value"] = None  # Blank is not JT, self, or another owner.
@@ -212,8 +216,6 @@ def analyze_page(gray, directory, read_dates=False):
                 value = date_candidate(reads)
                 if value is not None and header == expected:
                     fields[name].update(state="ocr_candidate_not_certified", value=value)
-        row["fields"] = fields
-        page["rows"].append(row)
     return page
 
 

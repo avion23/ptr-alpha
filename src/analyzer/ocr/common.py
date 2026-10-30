@@ -217,8 +217,10 @@ def parse_gemini_output(
         if line.startswith("ROW:"):
             if current_page is None:
                 raise GeminiOutputError(f"line {line_number}: transaction before PAGE")
+            from analyzer.ocr.contracts import _json_value
             try:
                 row = json.loads(line[4:].strip())
+                _json_value(row)
             except ValueError as exc:
                 raise GeminiOutputError(f"line {line_number}: invalid ROW JSON") from exc
             required = {"asset", "type", "date", "notif_date", "amount_raw", "owner", "account", "instrument_type", "raw_cells"}

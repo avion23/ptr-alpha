@@ -711,7 +711,7 @@ def test_house_parse_streams_text_results_before_ocr_tail_and_persists_tail_imme
     assert result["attempted"] == 4
 
 
-def test_cached_gemini_ingest_requires_exact_artifact_and_preserves_model_identity(
+def test_cached_gemini_ingest_requires_grounded_review_even_with_exact_artifact_and_model(
     monkeypatch, tmp_path
 ):
     from analyzer.persistence.database import Database
@@ -789,24 +789,26 @@ def test_cached_gemini_ingest_requires_exact_artifact_and_preserves_model_identi
         result = rebuild_staged._ingest_cached_gemini_year(
             staging, db, 2024, cache_dir
         )
-        assert [row["doc_id"] for row in result["accepted"]] == ["cache-doc"], result["rejected"]
-        assert result["rejected"] == []
+        assert result["accepted"] == []
+        assert result["rejected"] == [{"doc_id": "cache-doc", "status": "needs_review",
+                                       "error": "grounded API source review required"}]
         assert db.conn.execute(
             """
             SELECT source, ticker, transaction_type, ingestion_generation
             FROM transactions WHERE doc_id = 'cache-doc'
             """
-        ).fetchall() == [
-            ("gemini_ocr", "AAPL", "Purchase", "cache-generation")
-        ]
+        ).fetchall() == []
         assert db.conn.execute(
             """
             SELECT parser_version, engines_attempted, status, transaction_count
             FROM pdf_parse_runs WHERE doc_id = 'cache-doc'
             """
-        ).fetchall() == [
-            ("v-test-gemini", "gemini/test-model", "success", 1)
-        ]
+        ).fetchall() == []
+        assert json.loads((cache_dir / 'cache-doc.json').read_text()) == envelope
+        pdf_path.write_bytes(b'changed source')
+        refused = rebuild_staged._ingest_cached_gemini_year(staging, db, 2024, cache_dir)
+        assert refused['accepted'] == []
+        assert 'hash does not match' in refused['rejected'][0]['error']
     finally:
         db.close()
 

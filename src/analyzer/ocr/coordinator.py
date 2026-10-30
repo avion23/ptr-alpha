@@ -300,6 +300,8 @@ def run_pipeline(
             # A document-only signature cannot establish whole-database freshness.
             publication = db.publish_snapshot()
             scoped = {(s["archive_year"], s["generation_id"], s["doc_id"]): s for s in scope}
+            unresolved = {(y, g): set(db.get_unresolved_house_doc_ids(y, g))
+                          for y, g in {(s["archive_year"], s["generation_id"]) for s in scope}}
             missing_years = []
 
             eligible = set()
@@ -334,6 +336,42 @@ def run_pipeline(
                 prior = db.conn.execute("SELECT state FROM extraction_results WHERE result_id = ?",
                                         [result_id]).fetchone()[0]
                 state = _ingest(db, result, Path(path), base, source)
+                generation = (result.work.archive_year, result.work.generation_id)
+                if state in {"accepted", "verified_empty"} and (
+                        prior not in {"accepted", "verified_empty"}
+                        or result.work.doc_id in unresolved[generation]):
+                    unresolved[generation] = set(db.get_unresolved_house_doc_ids(*generation))
+                    if result.work.doc_id in unresolved[generation]:
+                        # Keep the extraction and its historical verdict intact;
+                        # record a separate admission refusal, not another parse
+                        # or a silently accepted-but-unresolved terminal task.
+                        current = db.conn.execute(
+                            "SELECT attempt_id, status FROM extraction_work WHERE task_id = ?",
+                            [result.work.task_id],
+                        ).fetchone()
+                        if current == (result.work.attempt_id, state):
+                            from analyzer.ocr.workers import _publish
+
+                            detail = "admitted extraction did not resolve its official binding"
+                            review = replace(result, outcome=ExtractionOutcome.NEEDS_REVIEW,
+                                             evidence={**result.evidence, "admission_contract_error": detail},
+                                             detail=detail)
+                            # Admission evidence is not a fresh worker delivery.
+                            # An orphan from a crash before receipt commit must
+                            # not be imported as an inactive extraction attempt.
+                            review_path = _publish(review, str(spool / "admission-reviews"))
+                            db.conn.execute("BEGIN TRANSACTION")
+                            try:
+                                db.conn.execute("UPDATE extraction_work SET status = 'running' WHERE task_id = ?",
+                                                [result.work.task_id])
+                                review_receipt = dict(task_id=result.work.task_id, attempt_id=result.work.attempt_id,
+                                                      result_id=db.work.register_result(review, review_path))
+                                db.work.finish(review_receipt, "needs_review", detail, in_transaction=True)
+                                db.conn.execute("COMMIT")
+                            except Exception:
+                                db.conn.execute("ROLLBACK")
+                                raise
+                        state = "needs_review"
                 if state in {"accepted", "verified_empty"} and prior not in {"accepted", "verified_empty"}:
                     satisfied.add(binding(result.work))
                     eligible.discard(binding(result.work))
@@ -351,8 +389,6 @@ def run_pipeline(
             for receipt in db.work.pending_results(limit=2147483647):
                 receive(receipt["path"])
             db.work.recover_expired()
-            unresolved = { (y, g): set(db.get_unresolved_house_doc_ids(y, g))
-                           for y, g in {(s["archive_year"], s["generation_id"]) for s in scope} }
             # Resolve canonical scope once, not through the global canonical
             # view for every dispatch. Ledger timestamps distinguish a resumed
             # refresh from an older success on the same immutable binding.

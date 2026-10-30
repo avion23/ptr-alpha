@@ -64,6 +64,10 @@ def _invalid_consolidated_house_docs(df: pd.DataFrame) -> dict[str, list[str]]:
     disclosure = pd.to_datetime(df["disclosure_date"], errors="coerce")
     add(tx_date.isna() | disclosure.isna(), "missing chronology date")
     add(tx_date.notna() & disclosure.notna() & (tx_date > disclosure), "transaction after disclosure")
+    if "notification_date" in df.columns:
+        notification = pd.to_datetime(df["notification_date"], errors="coerce")
+        add(notification.notna() & tx_date.notna() & (notification < tx_date),
+            "notification before transaction")
     source_row = df["source_row_id"]
     add(
         source_row.isna() | source_row.map(lambda value: not str(value).strip() if pd.notna(value) else True),

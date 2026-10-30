@@ -52,6 +52,8 @@ EXEMPT = {
     "src/analyzer/ocr/ingestion.py:get_ocr_work_items": 3,  # Current OCR work queue.
     "src/analyzer/ocr/ingestion.py:_insert_transactions": 1,  # Ingestion no-txs row retirement.
     "src/analyzer/ocr/ingestion.py:_replace_accepted_ocr_rows": 5,  # Persistence/deduplication/history repair.
+    "src/analyzer/ocr/ingestion.py:_verified_final_admission": 1,  # Owner-held exact current SQL rowset verification inside admission transaction.
+    "scripts/quarantine_model_admissions.py:quarantine": 2,  # Owner-held scoped withdrawal compares current receipts and pinned baseline; never a decision reader.
     "src/analyzer/ocr/ingestion.py:record_parse_run": 1,  # Ingestion provenance.
     "scripts/purge_phantom_rows.py:<module>": 1,  # Duplicate-detection SQL constant.
     "scripts/purge_phantom_rows.py:purge_phantom_rows": 3,  # Current duplicate repair.

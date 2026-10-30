@@ -298,7 +298,7 @@ def test_zero_document_jobs_publish_metadata_and_price_changes(tmp_path):
                 assert reader.conn.execute("SELECT close FROM prices").fetchall() == [(125.0,)]
 
 
-def test_same_binding_has_one_provider_call_and_no_duplicate_on_replay(scope, monkeypatch):
+def test_unreviewed_provider_results_stay_unresolved_without_duplicate_on_replay(scope, monkeypatch):
     root, digest = scope
     with Database(root / "congress.duckdb") as owner:
         owner.conn.execute("DELETE FROM house_generation_metadata WHERE doc_id != 'a'")
@@ -314,7 +314,6 @@ def test_same_binding_has_one_provider_call_and_no_duplicate_on_replay(scope, mo
 
     def extract(work, spool):
         calls.append(work.lane)
-        assert work.lane != ExtractionLane.GLM, "a second provider spent quota on an already admitted binding"
         local = work.lane == ExtractionLane.LOCAL
         evidence = {"artifact_verified": True, "page_count": 1, "output_schema_version": 4,
                     "page_outcomes": [{"page_number": 1, "outcome": "unknown" if local else "transactions"}]}
@@ -325,13 +324,13 @@ def test_same_binding_has_one_provider_call_and_no_duplicate_on_replay(scope, mo
     monkeypatch.setattr(workers, "extract_document", extract)
     first = coordinator.run_pipeline(root, [2025], local_workers=1, gemini_workers=1, glm_workers=1)
     second = coordinator.run_pipeline(root, [2025], local_workers=1, gemini_workers=1, glm_workers=1)
-    assert calls == [ExtractionLane.LOCAL, ExtractionLane.GEMINI]
-    assert first["completed_attempts"] == 2
+    assert calls == [ExtractionLane.LOCAL, ExtractionLane.GEMINI, ExtractionLane.GLM]
+    assert first["completed_attempts"] == 3
     assert second["completed_attempts"] == 0
-    assert second["unresolved"] == 0
-    assert second["work"]["by_state"] == {"accepted": 1, "needs_review": 1, "superseded": 1}
+    assert second["unresolved"] == 1
+    assert second["work"]["by_state"] == {"needs_review": 3}
     with Database(root / "congress.duckdb", read_only=True) as reader:
-        assert reader.conn.execute("SELECT COUNT(*) FROM transactions").fetchone() == (1,)
+        assert reader.conn.execute("SELECT COUNT(*) FROM transactions").fetchone() == (0,)
 
 
 @pytest.mark.parametrize("counts", [(2, 2), (None, None), (0, None), (-1, 0), (0, -1)])
@@ -433,7 +432,7 @@ def test_nonfinite_raw_source_is_durable_refusal_without_stopping_other_document
     summary = coordinator.run_pipeline(root, [2025], local_workers=0, gemini_workers=1)
     assert sorted(calls) == ["a", "b"]
     assert summary["completed_attempts"] == 2
-    assert summary["work"]["by_state"] == {"accepted": 1, "needs_review": 1}
+    assert summary["work"]["by_state"] == {"needs_review": 2}
     bundles = {bundle.work.doc_id: bundle for bundle in (
         workers.load_result(path) for path in (root / "pipeline" / "results").glob("*.json"))}
     assert bundles["a"].raw_response == invalid
@@ -441,4 +440,4 @@ def test_nonfinite_raw_source_is_durable_refusal_without_stopping_other_document
     assert "invalid_response" in bundles["a"].evidence["provider_error"]
     assert len(bundles["b"].rows) == 1
     with Database(root / "congress.duckdb", read_only=True) as reader:
-        assert reader.conn.execute("SELECT doc_id FROM transactions").fetchall() == [("b",)]
+        assert reader.conn.execute("SELECT doc_id FROM transactions").fetchall() == []

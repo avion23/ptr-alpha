@@ -1657,8 +1657,9 @@ def load_input_list(manifest_path: str | Path, data_dir: str | Path) -> list[tup
 def load_metadata(db_path: str | Path) -> dict[str, dict]:
     """Read-only member/filing metadata for the staged generation."""
     import duckdb  # noqa: PLC0415
+    from analyzer.persistence.ownership import resolve_read_path
 
-    conn = duckdb.connect(str(db_path), read_only=True)
+    conn = duckdb.connect(str(resolve_read_path(db_path)), read_only=True)
     try:
         rows = conn.execute(
             """

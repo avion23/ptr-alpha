@@ -19,6 +19,29 @@ def test_pdftotext_preserves_owner_code(monkeypatch):
     assert transactions[0]["notification_date"] == "01/03/2024"
 
 
+def test_pdftotext_house_id_before_owner_keeps_owner_and_asset(monkeypatch):
+    text = (
+        "2000134514 SP              Pfizer, Inc. Common Stock (PFE) S "
+        "03/10/2025 04/11/2025 $15,001 - $50,000\n"
+    )
+    monkeypatch.setattr(
+        "analyzer.parsing.pdftotext_parser._run_pdftotext", lambda _path: text
+    )
+
+    transactions = parse_pdf_table(
+        extract_tables_with_pdftotext(Path("disclosure.pdf"))[0]
+    )
+
+    assert len(transactions) == 1
+    assert transactions[0]["owner_code"] == "SP"
+    assert transactions[0]["ticker"] == "PFE"
+    assert transactions[0]["asset_description"] == "Pfizer, Inc. Common Stock (PFE)"
+    assert transactions[0]["transaction_type"] == "Sale"
+    assert transactions[0]["transaction_date"] == "03/10/2025"
+    assert transactions[0]["notification_date"] == "04/11/2025"
+    assert transactions[0]["amount_raw"] == "$15,001 - $50,000"
+
+
 def test_pdftotext_no_owner_keeps_column_alignment(monkeypatch):
     text = "Apple Inc. (AAPL) P 01/02/2024 01/03/2024 $1,001 - $15,000\n"
     monkeypatch.setattr(
@@ -79,6 +102,23 @@ def test_indented_uppercase_asset_is_not_misclassified_as_owner(monkeypatch):
 
     assert transactions[0]["ticker"] == "IBM"
     assert transactions[0]["owner_code"] is None
+
+
+def test_numeric_company_name_without_owner_stays_asset(monkeypatch):
+    text = (
+        "    3M Company Common Stock (MMM) P 01/02/2024 01/03/2024 $1,001 - $15,000\n"
+    )
+    monkeypatch.setattr(
+        "analyzer.parsing.pdftotext_parser._run_pdftotext", lambda _path: text
+    )
+
+    transaction = parse_pdf_table(
+        extract_tables_with_pdftotext(Path("disclosure.pdf"))[0]
+    )[0]
+
+    assert transaction["owner_code"] is None
+    assert transaction["ticker"] == "MMM"
+    assert transaction["asset_description"] == "3M Company Common Stock (MMM)"
 
 
 def test_wrapped_amount_and_source_accounts_are_preserved(monkeypatch):

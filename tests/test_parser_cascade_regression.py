@@ -105,6 +105,23 @@ class TestTickerMetadataContamination(unittest.TestCase):
         self.assertEqual(extract_ticker("Pay to ACME: settled"), "ACME")
         self.assertEqual(extract_ticker("Holdings $BRK.B"), "BRK.B")
 
+    def test_account_acronyms_do_not_override_reported_asset_tickers(self):
+        self.assertIsNone(
+            extract_ticker(
+                "Prudential RILA [Account: Registered Index Linked Annuity (RILA)]"
+            )
+        )
+        self.assertEqual(
+            extract_ticker(
+                "Apple (AAPL) [Account: Registered Index Linked Annuity (RILA)]"
+            ),
+            "AAPL",
+        )
+        # Parenthetical acronyms remain eligible when they are in the asset span.
+        self.assertEqual(extract_ticker("Unlisted issuer (RILA)"), "RILA")
+        self.assertIsNone(extract_ticker("Series 2025 (2025)"))
+        self.assertIsNone(extract_ticker("Asset [Account: Owner: SP]"))
+
 
 class TestPdftotextLayoutRepair(unittest.TestCase):
     """Single-digit dates and FILING STATUS lines reached the asset folder."""

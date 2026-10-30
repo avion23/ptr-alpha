@@ -51,7 +51,7 @@ _AMOUNT = (
 )
 
 _TX_WITH_OWNER = re.compile(
-    r"^\s{2,}"
+    r"^(?:\s{2,}(?:\d{10}\s+)?|\d{10}\s+)"  # ID can start at column zero
     r"(SP|DC|JT|J|S)\s+"  # House owner code
     r"(.+?)\s+"  # asset name
     rf"({_TX_TYPE})\s+"  # type

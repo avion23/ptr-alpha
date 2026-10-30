@@ -73,9 +73,14 @@ def clean_text(text: str | None) -> str:
 def extract_ticker(asset_cell: str | None) -> str | None:
     if not asset_cell:
         return None
+    # pdftotext preserves source-account identity in a trailing annotation;
+    # parenthetical acronyms there describe the account, not the traded asset.
+    identity = re.split(
+        r"\s+\[Account\s*:", asset_cell, maxsplit=1, flags=re.IGNORECASE
+    )[0]
     # Search on a copy with metadata labels removed so a label's trailing
     # word ("STATUS:", "OF:") can never satisfy the ticker patterns below.
-    searchable = _FILING_METADATA_LABEL.sub(" ", asset_cell)
+    searchable = _FILING_METADATA_LABEL.sub(" ", identity)
     ticker_match = re.search(_PARENTHETICAL_TICKER, searchable)
     if ticker_match:
         candidate = ticker_match.group(1).upper()
@@ -92,7 +97,7 @@ def extract_ticker(asset_cell: str | None) -> str | None:
         candidate = colon_match.group(1).upper()
         if candidate not in _TICKER_BLACKLIST:
             return candidate
-    return _resolve_company_name_ticker(asset_cell)
+    return _resolve_company_name_ticker(identity)
 
 
 # Company-name-to-ticker mapping used as fallback when regex patterns fail.

@@ -457,27 +457,39 @@ def test_quota_stops_year_batch(stored, monkeypatch):
     assert len(calls) == 1
 
 
-@pytest.mark.parametrize("reported_pages", [1, 2])
-def test_runner_admission_requires_bound_physical_page_coverage(stored, monkeypatch, reported_pages):
+@pytest.mark.parametrize("reported_pages,metadata_pages", [(1, 1), (2, 1), (1, 2)])
+def test_runner_admission_requires_bound_physical_page_coverage(stored, monkeypatch, reported_pages, metadata_pages):
     path, pdf, digest = stored
     output = f'MEMBER: Jane Doe\nPAGES: {reported_pages}\nPAGE: 1\nApple (AAPL) | Purchase | 01/15/24 | N/A | A'
-    common.parse_gemini_output(output, expected_page_count=1)
-    monkeypatch.setattr(common, 'call_gemini', lambda *args, **kwargs: (output, '', None))
+    parsed = common.parse_gemini_output(output, expected_page_count=1)
+    assert parsed.page_count == 1  # Existing policy clamps unreported blank trailing pages.
+    assert parsed.covered_pages == frozenset({1})
+    metadata = common.ArtifactMetadata(digest, metadata_pages, len(pdf.read_bytes()), str(pdf), parsed)
+    monkeypatch.setattr(common, 'call_gemini', lambda *args, **kwargs: (output, '', metadata))
     summary = runner.run_gemini_ocr_for_year(2024, str(path.parent))
-    assert summary['unresolved'] == (0 if reported_pages == 1 else 1)
-    assert summary['work']['by_state'] == {'accepted' if reported_pages == 1 else 'needs_review': 1}
+    assert summary['unresolved'] == (0 if metadata_pages == 1 else 1)
+    assert summary['work']['by_state'] == {'accepted' if metadata_pages == 1 else 'blocked': 1}
     from analyzer.ocr.workers import load_result
     bundle = load_result(next((path.parent / 'pipeline' / 'results').glob('*.json')))
     assert bundle.evidence['page_count'] == 1
+    if metadata_pages != 1:
+        assert bundle.evidence['failure']['message'] == 'provider success lacks bound validated response metadata'
 
 
-def test_year_runner_validation_failure_preserves_accepted_rows(stored, monkeypatch):
+@pytest.mark.parametrize("failure", ["member", "page_binding", "artifact_binding"])
+def test_year_runner_validation_failure_preserves_accepted_rows(stored, monkeypatch, failure):
     cache_and_insert(stored)
     path, pdf, digest = stored
-    output = 'MEMBER: Other Person\nPAGES: 1\nPAGE: 1\nApple (AAPL) | Purchase | 01/15/24 | N/A | A'
-    monkeypatch.setattr(common, 'call_gemini', lambda *args, **kwargs: (output, '', None))
+    member = 'Other Person' if failure == 'member' else 'Jane Doe'
+    output = f'MEMBER: {member}\nPAGES: 1\nPAGE: 1\nApple (AAPL) | Purchase | 01/15/24 | N/A | A'
+    metadata = common.ArtifactMetadata(
+        'b' * 64 if failure == 'artifact_binding' else digest,
+        2 if failure == 'page_binding' else 1, len(pdf.read_bytes()), str(pdf),
+        common.parse_gemini_output(output, expected_page_count=1),
+    )
+    monkeypatch.setattr(common, 'call_gemini', lambda *args, **kwargs: (output, '', metadata))
     summary = runner.run_gemini_ocr_for_year(2024, str(path.parent), refresh=True)
-    assert summary['work']['by_state'] == {'needs_review': 1}
+    assert summary['work']['by_state'] == {'needs_review' if failure == 'member' else 'blocked': 1}
     db = Database(path)
     try:
         assert db.conn.execute('SELECT COUNT(*) FROM transactions').fetchone()[0] == 1

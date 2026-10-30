@@ -2,9 +2,12 @@
 
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import json
 from pathlib import Path
 import socket
 import threading
+import time
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -42,8 +45,7 @@ def scope(tmp_path, monkeypatch):
     return tmp_path, digest
 
 
-def bound_work(root, digest, doc_id="a"):
-    lane = ExtractionLane.LOCAL
+def bound_work(root, digest, doc_id="a", lane=ExtractionLane.LOCAL):
     recipe = workers.extraction_recipe(lane)
     return WorkEnvelope(
         task_key(doc_id, 2025, "g", digest, recipe, lane), str(uuid4()), doc_id,
@@ -154,3 +156,108 @@ def test_pipeline_reuses_existing_owner_and_refuses_competing_writer(scope):
         status = coordinator.pipeline_status(root, years=[2025])
         assert status["scope"] == status["unresolved"] == 4
         assert coordinator.pipeline_status(root, years=[2025], database=owner)["scope"] == 4
+
+
+def test_local_watchdog_publishes_db_free_uncertainty_and_escalates(scope, monkeypatch):
+    import duckdb
+    import signal
+    from analyzer import download
+    from analyzer.parsing import cascade
+
+    root, digest = scope
+    with Database(root / "congress.duckdb") as owner:
+        owner.conn.execute("DELETE FROM house_generation_metadata WHERE doc_id != 'a'")
+        work = bound_work(root, digest)
+        owner.work.register(work)
+        claimed = owner.work.claim(work.task_id)
+    prior_handler = signal.getsignal(signal.SIGALRM)
+
+    def stalled_backend(path):
+        time.sleep(5)
+        raise AssertionError("watchdog did not interrupt the backend")
+
+    def no_database(*args, **kwargs):
+        raise AssertionError("extraction worker attempted database access")
+
+    with monkeypatch.context() as worker_patch:
+        worker_patch.setattr(download, "_PARSE_DOC_BUDGET_SECONDS", 0.02)
+        worker_patch.setattr(cascade, "parse_pdf_worker", stalled_backend)
+        worker_patch.setattr(duckdb, "connect", no_database)
+        worker_patch.setattr(workers.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(stdout="", stderr="", returncode=0))
+        bundle_path = workers.extract_document(claimed, str(root / "pipeline"))
+    result = workers.load_result(bundle_path)
+    assert result.outcome == ExtractionOutcome.BLOCKED
+    assert result.rows == []
+    assert result.evidence["artifact_verified"] is True
+    assert result.evidence["failure"]["type"] == "ParserCascadeError"
+    assert "parse budget 0.02s exceeded" in result.evidence["failure"]["message"]
+    assert signal.getsignal(signal.SIGALRM) == prior_handler
+    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+    calls = []
+
+    def quota(work, spool):
+        calls.append(work.lane)
+        return workers._publish(ResultBundle(work, ExtractionOutcome.RETRY_WAIT, [], retry_after=3600), spool)
+
+    monkeypatch.setattr(workers, "extract_document", quota)
+    summary = coordinator.run_pipeline(root, [2025], local_workers=1, gemini_workers=1)
+    assert calls == [ExtractionLane.GEMINI]
+    assert summary["completed_attempts"] == 1
+    assert summary["work"]["by_state"] == {"needs_review": 1, "retry_wait": 1}
+
+
+def test_zero_document_jobs_publish_metadata_and_price_changes(tmp_path):
+    path = tmp_path / "congress.duckdb"
+    with Database(path) as owner:
+        owner.conn.execute("INSERT INTO house_archive_generations (archive_year, generation_id, metadata_count, ptr_count) VALUES (2025, 'empty', 0, 0)")
+        owner.conn.execute("INSERT INTO metadata (doc_id, first_name, filing_type) VALUES ('non-ptr', 'Before', 'A')")
+        owner.conn.execute("INSERT INTO prices (ticker, date, close) VALUES ('AAPL', '2025-01-02', 100)")
+        before = owner.publish_snapshot()
+        with Database(path, read_only=True) as pinned:
+            owner.conn.execute("UPDATE metadata SET first_name = 'After' WHERE doc_id='non-ptr'")
+            owner.conn.execute("UPDATE prices SET close = 125 WHERE ticker='AAPL'")
+            result = coordinator.run_pipeline(tmp_path, [2025], database=owner)
+            assert result["completed_attempts"] == 0
+            assert result["scope"] == 0
+            assert result["snapshot"]["version"] != before["version"]
+            assert pinned.conn.execute("SELECT first_name FROM metadata").fetchall() == [("Before",)]
+            assert pinned.conn.execute("SELECT close FROM prices").fetchall() == [(100.0,)]
+            with Database(path, read_only=True) as reader:
+                assert reader.conn.execute("SELECT first_name FROM metadata").fetchall() == [("After",)]
+                assert reader.conn.execute("SELECT close FROM prices").fetchall() == [(125.0,)]
+
+
+def test_same_binding_has_one_provider_call_and_no_duplicate_on_replay(scope, monkeypatch):
+    root, digest = scope
+    with Database(root / "congress.duckdb") as owner:
+        owner.conn.execute("DELETE FROM house_generation_metadata WHERE doc_id != 'a'")
+        owner.conn.execute("DELETE FROM house_pdf_artifacts WHERE doc_id != 'a'")
+        owner.conn.execute("UPDATE house_archive_generations SET metadata_count=1, ptr_count=1")
+        for lane in ExtractionLane:
+            owner.work.register(bound_work(root, digest, lane=lane))
+    monkeypatch.setattr(coordinator, "ProcessPoolExecutor", lambda slots, **kwargs: ThreadPoolExecutor(slots))
+    calls = []
+    row = {"asset": "Apple (AAPL)", "type": "Purchase", "date": "01/15/25",
+           "notif_date": None, "amount_raw": "$1,234.56", "owner": "SP", "account": None,
+           "instrument_type": "unknown", "raw_cells": {"Amount": "$1,234.56"}, "page_number": 1}
+
+    def extract(work, spool):
+        calls.append(work.lane)
+        assert work.lane != ExtractionLane.GLM, "a second provider spent quota on an already admitted binding"
+        local = work.lane == ExtractionLane.LOCAL
+        evidence = {"artifact_verified": True, "page_count": 1, "output_schema_version": 4,
+                    "page_outcomes": [{"page_number": 1, "outcome": "unknown" if local else "transactions"}]}
+        result = ResultBundle(work, ExtractionOutcome.NEEDS_REVIEW if local else ExtractionOutcome.CANDIDATE,
+                              [] if local else [row], raw_response=None if local else json.dumps(row), evidence=evidence)
+        return workers._publish(result, spool)
+
+    monkeypatch.setattr(workers, "extract_document", extract)
+    first = coordinator.run_pipeline(root, [2025], local_workers=1, gemini_workers=1, glm_workers=1)
+    second = coordinator.run_pipeline(root, [2025], local_workers=1, gemini_workers=1, glm_workers=1)
+    assert calls == [ExtractionLane.LOCAL, ExtractionLane.GEMINI]
+    assert first["completed_attempts"] == 2
+    assert second["completed_attempts"] == 0
+    assert second["unresolved"] == 0
+    assert second["work"]["by_state"] == {"accepted": 1, "needs_review": 1, "superseded": 1}
+    with Database(root / "congress.duckdb", read_only=True) as reader:
+        assert reader.conn.execute("SELECT COUNT(*) FROM transactions").fetchone() == (1,)

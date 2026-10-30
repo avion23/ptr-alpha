@@ -7,10 +7,10 @@ import json
 import math
 import re
 
-from analyzer.ocr.contracts import WorkEnvelope, ResultBundle
+from analyzer.ocr.contracts import ExtractionLane, WorkEnvelope, ResultBundle
 from analyzer.parsing.cells import extract_owner_code
 
-NORMALIZATION_RECIPE = "house-ocr-normalization-v2"
+NORMALIZATION_RECIPE = "house-ocr-normalization-v3"
 
 
 def typed_instrument_fields(row):
@@ -151,6 +151,8 @@ def normalize_candidate(work: WorkEnvelope, result: ResultBundle) -> dict:
     schema = result.evidence.get("output_schema_version")
     legacy = type(schema) is not int or schema != 4 or any("raw_cells" not in row for row in result.rows)
     status = result.outcome.value
+    if work.lane != ExtractionLane.LOCAL and legacy and status in {"candidate", "verified_empty"}:
+        findings["obsolete_output_schema"] = len(result.rows) or 1
     if status not in {"candidate", "verified_empty", "needs_review", "blocked"}:
         status = "blocked"
     if findings or (result.rows and len(rows) != len(result.rows)):

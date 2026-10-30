@@ -12,7 +12,6 @@ import zipfile
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from io import BytesIO
-from multiprocessing import Pool
 from pathlib import Path
 
 import aiohttp
@@ -704,113 +703,11 @@ class HouseTransactionSource(TransactionSource):
         )
 
     def parse_cached_pdfs(self, year: int, *, force: bool = False) -> None:
-        legacy_year = os.environ.get("PTR_REUSE_LEGACY_V5_CACHE_YEAR")
-        if not force and legacy_year is not None and (
-            len(legacy_year) != 4
-            or not legacy_year.isascii()
-            or not legacy_year.isdecimal()
-            or int(legacy_year) == 0
-        ):
-            raise ValueError("PTR_REUSE_LEGACY_V5_CACHE_YEAR must be a four-digit year")
-        reuse_legacy = not force and legacy_year == str(year)
-        logger.info(
-            "House parser cache policy: year=%d producer=%s force=%s "
-            "PTR_REUSE_LEGACY_V5_CACHE_YEAR=%s legacy_reuse=%s",
-            year, PARSE_VERSION, force, legacy_year, reuse_legacy,
-        )
-        ingestion_generation = self.db.get_latest_house_generation(year)
-        if ingestion_generation is None:
-            raise DataSourceError(
-                f"No acquired House generation exists for archive {year}"
-            )
-        metadata = self.fetch_metadata(year)
-        ptrs = metadata[metadata["FilingType"] == FilingType.PTR.value]
-        pdf_dir = self.data_dir / str(year) / "pdfs"
+        """Local-only route into the shared durable owner, never a second pool."""
+        from analyzer.ocr.coordinator import run_pipeline
 
-        if not pdf_dir.exists():
-            raise DataSourceError(f"PDF directory not found: {pdf_dir}")
-
-        pdf_paths, existing_docs = filter_existing_pdfs(ptrs, pdf_dir)
-        if not pdf_paths:
-            raise DataSourceError(f"No PDF files found in {pdf_dir}")
-
-        if not force:
-            artifact_hashes = {
-                path.stem: sha256
-                for path in pdf_paths
-                if (sha256 := validated_pdf_sha256(path))
-            }
-            cached = self.db.parse_runs.get_cached_doc_ids(
-                year=year,
-                parser_version=PARSE_VERSION,
-                artifact_hashes=artifact_hashes,
-                ingestion_generation=ingestion_generation,
-            )
-            if reuse_legacy:
-                legacy_cached = self.db.parse_runs.get_cached_doc_ids(
-                    year=year,
-                    parser_version="v5-deterministic",
-                    artifact_hashes=artifact_hashes,
-                    ingestion_generation=ingestion_generation,
-                )
-                logger.warning(
-                    "Explicit legacy cache reuse: year=%d generation=%s count=%d "
-                    "original_producer=v5-deterministic current_producer=%s; "
-                    "original versions and payloads retained, not corrected or "
-                    "reproduced under the current recipe",
-                    year, ingestion_generation, len(legacy_cached - cached), PARSE_VERSION,
-                )
-                cached |= legacy_cached
-            if cached:
-                keep_mask = (
-                    existing_docs["DocID"]
-                    .astype(str)
-                    .map(lambda d: d not in cached)
-                    .to_numpy()
-                )
-                skipped = int((~keep_mask).sum()) if len(keep_mask) else 0
-                pdf_paths = [p for p, keep in zip(pdf_paths, keep_mask) if keep]
-                existing_docs = (
-                    existing_docs[keep_mask]
-                    if len(keep_mask)
-                    else existing_docs.iloc[0:0]
-                )
-                logger.info(
-                    "Skipping %d already-parsed PDFs for %d (%d remain)",
-                    skipped,
-                    year,
-                    len(pdf_paths),
-                )
-
-        if not pdf_paths:
-            logger.info("All PDFs for %d already parsed; nothing to do", year)
-            return
-
-        member_lookup = build_member_lookup(existing_docs)
-        logger.info(f"Parsing {len(pdf_paths)} PDFs for {year}")
-
-        # Submit bounded batches and checkpoint completions without waiting for
-        # slow siblings, so an interrupted archive can resume from terminal runs.
-        batch_size = max(16, self.parallel_workers * 4)
-        with Pool(self.parallel_workers) as pool:
-            for offset in range(0, len(pdf_paths), batch_size):
-                batch_paths = pdf_paths[offset : offset + batch_size]
-                parsed = pool.imap_unordered(tolerant_parse_pdf_worker, batch_paths)
-                for pdf_path, transactions, engines_attempted in parsed:
-                    result = (pdf_path, transactions, engines_attempted)
-                    error_detail = engine_error_detail(engines_attempted)
-                    if error_detail is not None:
-                        logger.warning(
-                            "Excluding unparseable PDF %s: %s", pdf_path.stem, error_detail
-                        )
-                        self._save_failed_parse_runs(
-                            year, [result], ingestion_generation
-                        )
-                        continue
-                    # A one-document checkpoint cannot wait behind a slow sibling.
-                    self._save_parse_results(
-                        year, [result], member_lookup, ingestion_generation
-                    )
+        run_pipeline(self.data_dir, [year], local_workers=self.parallel_workers,
+                     refresh_recipe=force, database=self.db)
 
     def _save_failed_parse_runs(
         self,
@@ -912,6 +809,23 @@ class HouseTransactionSource(TransactionSource):
         if not df.empty:
             df = preserve_existing_fields(df, self.db)
 
+        if receipt is not None:
+            import inspect
+            import json
+
+            normalization_code = "\n".join(inspect.getsource(fn) for fn in (
+                prepare_house_parse_batch, _invalid_consolidated_house_docs,
+                consolidate_transactions, preserve_existing_fields,
+            ))
+            # The immutable bundle keeps raw rows. The atomic receipt records
+            # the actual consolidation projection and its separate recipe.
+            receipt = dict(receipt, detail=json.dumps({
+                "normalization_recipe": "house-local-consolidation-v1:" + hashlib.sha256(normalization_code.encode()).hexdigest(),
+                "raw_row_counts": raw_transaction_counts,
+                "normalized_rows": json.loads(df.to_json(orient="records", date_format="iso")),
+                "findings": invalid_docs,
+            }, sort_keys=True))
+
         attempted_doc_ids = [doc_id for doc_id, _ in parse_attempts]
         persisted = self.db.replace_transactions_for_docs(
             df,
@@ -924,7 +838,7 @@ class HouseTransactionSource(TransactionSource):
                 else []
             ),
             parse_runs=parse_runs,
-            receipt=(dict(receipt, state="needs_review", detail=str(invalid_docs))
+            receipt=(dict(receipt, state="needs_review")
                      if receipt is not None and invalid_docs else receipt),
             include_global_counts=receipt is None,
         )

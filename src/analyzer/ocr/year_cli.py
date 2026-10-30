@@ -1,4 +1,4 @@
-"""Isolated, machine-readable year OCR boundary used by the analyzer CLI."""
+"""Machine-readable year entrypoint into the durable OCR coordinator."""
 import argparse
 from contextlib import redirect_stdout
 import json
@@ -13,9 +13,10 @@ def main():
     parser.add_argument("--data-dir", required=True)
     args = parser.parse_args()
     with redirect_stdout(sys.stderr):
-        inserted = run_gemini_ocr_for_year(args.year, data_dir=args.data_dir)
-    print(json.dumps({"schema": "ocr-year-summary-v1", "inserted": inserted}))
+        summary = run_gemini_ocr_for_year(args.year, data_dir=args.data_dir)
+    print(json.dumps({"schema": "document-pipeline-summary-v1", **summary}, default=str))
+    return int(summary["unresolved"] > 0 or bool(summary["missing_years"]))
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

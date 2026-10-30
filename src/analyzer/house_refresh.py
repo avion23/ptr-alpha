@@ -9,7 +9,6 @@ from pathlib import Path
 from analyzer.persistence.database import Database, open_database as _open_database
 from analyzer.download import HouseFetchSummary, HouseTransactionSource
 from analyzer.exceptions import DataResult
-from analyzer.pipeline import run_parse_pipeline
 
 logger = logging.getLogger(__name__)
 

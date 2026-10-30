@@ -2,11 +2,7 @@
 
 import logging
 import os
-import signal
-import subprocess
 import sys
-import threading
-import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -24,6 +20,7 @@ from analyzer.member_ranking.buyer_scoring import (
     get_consensus_price_tickers,
 )
 from analyzer.persistence.database import Database, open_database as _open_database
+from analyzer.persistence.ownership import resolve_read_path
 from analyzer.download import HouseTransactionSource
 from analyzer.exceptions import AnalyzerError, DataSourceError
 from analyzer.freshness import FreshnessCheck, monitoring_checks
@@ -41,7 +38,6 @@ from analyzer.pipeline import (
     TickerScoringParams,
     run_analysis_pipeline,
     run_backtest_pipeline,
-    run_parse_pipeline,
     run_recent_ticker_scoring,
     run_ticker_analysis,
     source_freshness_metrics,
@@ -109,7 +105,6 @@ def get_context(ctx, data_dir=None, read_only=False):
         # Share a single DuckDB connection across both data sources to avoid
         # two independent Database instances pointing at the same file.
         if read_only:
-            from analyzer.persistence.ownership import resolve_read_path
             shared_db = Database(resolve_read_path(Path(settings.data.data_dir) / "congress.duckdb"), read_only=True)
         else:
             shared_db = _open_database(settings.data.data_dir, False)
@@ -707,184 +702,6 @@ def _activate_house_generation(transaction_source, year: int) -> None:
     transaction_source.db.mark_house_generation_parse_complete(year, generation_id)
 
 
-def _release_parent_db_for_ocr(app_ctx: AppContext) -> Path | None:
-    """Checkpoint and close parent DuckDB handles so OCR can open the file.
-
-    Returns the database path when a real parent handle was released, else
-    None (test doubles hold no file lock). Both sources share one handle via
-    get_context; close each distinct real handle once.
-    """
-    owners = (
-        getattr(app_ctx, "transaction_source", None),
-        getattr(app_ctx, "price_source", None),
-    )
-    seen: list = []
-    for owner in owners:
-        db = getattr(owner, "db", None)
-        if isinstance(db, Database) and not any(db is prior for prior in seen):
-            seen.append(db)
-    if not seen:
-        return None
-    db_path = Path(seen[0].db_path)
-    close_error = None
-    for db in seen:
-        try:
-            db.conn.execute("CHECKPOINT")
-        except Exception:
-            logger.debug("Pre-OCR checkpoint failed", exc_info=True)
-        try:
-            db.close()
-        except Exception as exc:  # noqa: BLE001
-            if close_error is None:
-                close_error = exc
-    if close_error is not None:
-        raise close_error
-    return db_path
-
-
-def _reacquire_parent_db_after_ocr(
-    app_ctx: AppContext, db_path: Path | None
-) -> None:
-    """Reopen the parent handle after isolated OCR finishes."""
-    if db_path is None:
-        return
-    fresh: Database | None = None
-    for owner in (
-        getattr(app_ctx, "transaction_source", None),
-        getattr(app_ctx, "price_source", None),
-    ):
-        if owner is None:
-            continue
-        if not isinstance(getattr(owner, "db", None), Database):
-            continue
-        if fresh is None:
-            fresh = Database(db_path, read_only=False)
-        owner.db = fresh
-
-
-def _run_gemini_ocr_year_subprocess(
-    data_dir: str | Path, year: int, *, timeout: int = 7200
-) -> tuple[int, str | None]:
-    """Run one year's OCR in a child interpreter without the parent lock.
-
-    Returns (inserted, failure_reason|None). The child emits a JSON summary
-    on stdout and diagnostics on stderr; the parent releases its DB lock.
-    On POSIX, the child owns a new process group. Main-thread SIGTERM is
-    converted to an exit after cleanup. Python cannot install that handler
-    from non-main callers, where SIGTERM cannot be guaranteed to clean up.
-    """
-    command = [
-        sys.executable,
-        "-m",
-        "analyzer.ocr.year_cli",
-        "--year",
-        str(int(year)),
-        "--data-dir",
-        str(Path(data_dir).resolve()),
-    ]
-    original_sigterm = None
-    if threading.current_thread() is threading.main_thread():
-        original_sigterm = signal.getsignal(signal.SIGTERM)
-
-        def terminate_parent(signum, _frame):
-            # A second SIGTERM must not interrupt cleanup.
-            signal.signal(signal.SIGTERM, signal.SIG_IGN)
-            raise SystemExit(128 + signum)
-
-        signal.signal(signal.SIGTERM, terminate_parent)
-
-    proc = None
-    try:
-        proc = subprocess.Popen(
-            command,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=(os.name == "posix"),
-        )
-        try:
-            stdout, stderr = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            _terminate_ocr_process_tree(proc)
-            return 0, "timeout"
-        except BaseException:
-            try:
-                _terminate_ocr_process_tree(proc)
-            except Exception:
-                logger.exception("Failed to clean up Gemini OCR subprocess")
-            raise
-        if proc.returncode != 0:
-            detail = (stderr or stdout)[-500:]
-            return 0, f"exit {proc.returncode}: {detail}"
-        try:
-            import json
-
-            summary = json.loads(stdout)
-            inserted = summary["inserted"]
-            if (
-                summary["schema"] != "ocr-year-summary-v1"
-                or type(inserted) is not int
-                or inserted < 0
-            ):
-                raise ValueError("invalid OCR summary")
-        except (ValueError, TypeError, KeyError):
-            return 0, f"invalid OCR JSON summary: {(stdout or '')[-500:]}"
-        return inserted, None
-    finally:
-        if original_sigterm is not None:
-            signal.signal(signal.SIGTERM, original_sigterm)
-
-
-def _terminate_ocr_process_tree(proc: subprocess.Popen) -> None:
-    """Stop the owned process group, then force-stop and reap its leader."""
-    process_group = os.name == "posix"
-
-    def signal_tree(signum: int) -> None:
-        if process_group:
-            # Keep the direct child unreaped through the group kill, so its
-            # PID/PGID cannot be recycled and mistaken for another group.
-            if proc.returncode is not None:
-                return
-            try:
-                os.killpg(proc.pid, signum)
-            except ProcessLookupError:
-                pass
-        elif proc.poll() is None:
-            if signum == signal.SIGTERM:
-                proc.terminate()
-            else:
-                proc.kill()
-
-    cleanup_error = None
-    try:
-        signal_tree(signal.SIGTERM)
-        time.sleep(1)
-    except BaseException as exc:
-        cleanup_error = exc
-    finally:
-        try:
-            if process_group:
-                signal_tree(signal.SIGKILL)
-            elif proc.poll() is None:
-                proc.kill()
-        except BaseException as exc:
-            cleanup_error = cleanup_error or exc
-        try:
-            proc.communicate(timeout=5)
-        except subprocess.TimeoutExpired as exc:
-            if cleanup_error is None:
-                cleanup_error = RuntimeError(
-                    "Gemini OCR subprocess was not reaped after SIGKILL"
-                )
-                cleanup_error.__cause__ = exc
-            else:
-                logger.error("Gemini OCR subprocess was not reaped after SIGKILL")
-        except BaseException as exc:
-            cleanup_error = cleanup_error or exc
-    if cleanup_error is not None:
-        raise cleanup_error
-
-
 @app.command()
 def parse(
     ctx: typer.Context,
@@ -937,6 +754,8 @@ def pipeline(
                               gemini_workers=gemini_workers, glm_workers=glm_workers,
                               refresh_recipe=refresh_recipe, publish_every=publish_every)
     print(json.dumps(result, default=str))
+    if not status:
+        _cli_exit(int(result["unresolved"] > 0 or bool(result["missing_years"])))
 
 
 @app.command()
@@ -1613,7 +1432,7 @@ def follow_member(
     if not member:
         _cli_exit(1, "Error: provide at least one --member")
 
-    db = _open_database(data_dir, read_only=True)
+    db = Database(resolve_read_path(Path(data_dir) / "congress.duckdb"), read_only=True)
     try:
         try:
             with db.canonical_as_of(as_of_date):
@@ -1738,7 +1557,7 @@ def setups(
 
     decision_13f = is_13f_corroboration_enabled(None)
     try:
-        db = _open_database(data_dir, read_only=True)
+        db = Database(resolve_read_path(Path(data_dir) / "congress.duckdb"), read_only=True)
     except Exception as exc:
         _cli_exit(1, f"Error: could not open read-only database: {exc}")
 

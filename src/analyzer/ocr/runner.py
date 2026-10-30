@@ -23,7 +23,7 @@ def main(*, staging_runner=None) -> int:
     """Keep the executable, not its old competing database-writing loop."""
     from analyzer.ocr.coordinator import run_pipeline
     from analyzer.ocr.ingestion import WORK_MANIFEST_DEFAULT_PATH, export_work_manifest
-    from analyzer.persistence.database import Database
+    from analyzer.persistence.ownership import resolve_read_path
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", default=str(DATA_DIR))
@@ -32,10 +32,9 @@ def main(*, staging_runner=None) -> int:
     parser.add_argument("--export-work-manifest", nargs="?", const=WORK_MANIFEST_DEFAULT_PATH)
     args = parser.parse_args()
     if args.export_work_manifest:
-        with Database(Path(args.data_dir) / "congress.duckdb") as db:
-            result = export_work_manifest(args.export_work_manifest, data_dir=args.data_dir,
-                                          db_path=str(db.db_path), conn=db.conn)
-            print(json.dumps(result, default=str))
+        result = export_work_manifest(args.export_work_manifest, data_dir=args.data_dir,
+                                      db_path=str(resolve_read_path(Path(args.data_dir) / "congress.duckdb")))
+        print(json.dumps(result, default=str))
         return 0
     mode = _ocr_engine_mode()
     if mode == "dual":
@@ -58,7 +57,7 @@ def run_gemini_ocr_for_year(year: int, data_dir: str = str(DATA_DIR),
         raise ValueError("dual-read drain retired; coordinator Gemini lane is single-engine only")
     result = run_pipeline(data_dir, [year], local_workers=0, gemini_workers=1,
                           refresh_recipe=refresh)
-    return result["completed_attempts"]
+    return result
 
 
 if __name__ == "__main__":

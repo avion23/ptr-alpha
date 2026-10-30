@@ -240,3 +240,40 @@ def test_withdrawn_raw_result_cannot_reuse_its_old_review_to_readmit(quarantinab
     assert ingest(db, result, root) == "needs_review"
     assert db.work.effective_admission_decision(scope[0]) == withdrawn
     assert db.conn.execute("SELECT * FROM canonical_transactions WHERE doc_id='review'").fetchall() == restored
+
+
+def test_sql_projection_failure_rolls_back_canonical_rows_before_receipt_acceptance(candidate, monkeypatch):
+    from analyzer.ocr import ingestion
+
+    db, result, root = candidate
+    review.prepare_review(result, root)
+    review.record_review(result, root, source_report(result), verdict="pass", human_reviewed=True)
+    verify = ingestion._verified_final_admission
+
+    def corrupt_before_verification(conn, doc_id, admission):
+        conn.execute("UPDATE transactions SET transaction_type='Sale' WHERE doc_id=?", [doc_id])
+        return verify(conn, doc_id, admission)
+
+    monkeypatch.setattr(ingestion, "_verified_final_admission", corrupt_before_verification)
+    with pytest.raises(ValueError, match="final SQL rows differ"):
+        ingest(db, result, root)
+    assert db.conn.execute("SELECT COUNT(*) FROM transactions").fetchone() == (0,)
+    assert db.conn.execute("SELECT COUNT(*) FROM pdf_parse_runs WHERE status='success'").fetchone() == (0,)
+    assert db.work.effective_admission_decision(raw_receipt(db, result))["state"] == "needs_review"
+
+
+def test_review_authority_expires_at_guard_exit(candidate):
+    from analyzer.ocr.ingestion import insert_transactions_outcome
+
+    db, result, root = candidate
+    review.prepare_review(result, root)
+    review.record_review(result, root, source_report(result), verdict="pass", human_reviewed=True)
+    with workers.admission_guard(result, root) as authority:
+        assert review.has_review_authority(authority)
+    assert not review.has_review_authority(authority)
+    outcome = insert_transactions_outcome(
+        result.work.doc_id, 2025, result.work.member, authority["candidate"]["rows"],
+        conn=db.conn, admission=authority, artifact_sha256=result.work.artifact_sha256,
+        ingestion_generation="g", parser_version=result.work.extraction_recipe, checkpoint=False)
+    assert outcome.status == "needs_review"
+    assert db.conn.execute("SELECT COUNT(*) FROM transactions").fetchone() == (0,)

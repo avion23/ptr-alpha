@@ -389,9 +389,18 @@ def test_initials(name, expected):
 
 
 def test_year_runner_parses_fresh_response_once(stored, monkeypatch):
+    from types import SimpleNamespace
+
     path, pdf, _ = stored
     output = 'MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\nNO_TRANSACTIONS'
-    monkeypatch.setattr(common, 'call_gemini', lambda *a, **kw: (output, '', None))
+    run = common.subprocess.run
+
+    def provider(command, *args, **kwargs):
+        if command[0] == 'llm':
+            return SimpleNamespace(returncode=0, stdout=output, stderr='')
+        return run(command, *args, **kwargs)  # Keep actual COW publication, not a fake cp.
+
+    monkeypatch.setattr(common.subprocess, 'run', provider)
     original = common.parse_gemini_output
     calls = []
     def parse(*args, **kwargs):

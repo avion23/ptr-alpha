@@ -37,6 +37,7 @@ from analyzer.freshness import (
     monitoring_checks,
     ocr_backlog_freshness,
 )
+from analyzer.persistence.ownership import publication_pointer
 from analyzer.persistence.price_repository import previous_nyse_session
 from scripts import doctor as doctor_mod
 
@@ -332,6 +333,7 @@ class OcrStagingCheckTest(TestCase):
         passing = FreshnessCheck("fixture.monitoring", "still checked", True)
 
         with (
+            patch.object(doctor_mod, "CANONICAL", root / "canonical.duckdb"),
             patch.object(doctor_mod, "monitoring_checks", return_value=[passing]),
             patch.object(
                 doctor_mod,
@@ -393,6 +395,39 @@ class OcrStagingCheckTest(TestCase):
         self.assertIn("[PASS] fixture.monitoring", output.getvalue())
         self.assertIn("[PASS] cron.ocr.engagement", output.getvalue())
         self.assertIn("doctor: 1 CHECK(S) FAILED", output.getvalue())
+
+
+@pytest.mark.parametrize("held", [False, True])
+def test_publication_quality_hold_uses_canonical_not_repo_root(tmp_path, held):
+    canonical = tmp_path / "fixture.duckdb"
+    repo = tmp_path / "other-repo"
+    other_canonical = repo / "data" / "congress.duckdb"
+    other_canonical.parent.mkdir(parents=True)
+    pointers = []
+    for path, has_hold in ((canonical, held), (other_canonical, not held)):
+        snapshot = path.with_suffix(".snapshot.duckdb")
+        snapshot.touch()
+        state = {"path": str(snapshot)}
+        if has_hold:
+            state["quality_hold"] = {"reason": "fixture review required"}
+        pointer = publication_pointer(path)
+        pointer.write_text(json.dumps(state), encoding="utf-8")
+        pointers.append((pointer, pointer.read_bytes()))
+
+    with (
+        patch.object(doctor_mod, "CANONICAL", canonical),
+        patch.object(doctor_mod, "REPO", repo),
+    ):
+        result = doctor_mod._publication_quality_hold()
+
+    if held:
+        assert result.name == "publication.quality_hold"
+        assert result.mark == "FAIL"
+        assert "fixture review required" in result.detail
+    else:
+        assert result is None
+    for pointer, before in pointers:
+        assert pointer.read_bytes() == before
 
 
 def test_staging_audit_severity_split_uses_sticky_worst_and_legacy_default(tmp_path):

@@ -135,8 +135,8 @@ def _run_case(directory: Path, effort: str, *, timeout: float = REQUEST_DEADLINE
             check=False,
         )
     except subprocess.TimeoutExpired:
-        # subprocess.run kills and waits for its child on timeout; no request
-        # survives to overlap the next case (unlike requests' idle timeout).
+        # subprocess.run kills and waits for the client child on timeout.
+        # Provider-side cancellation is unknown; later cases may be affected.
         return {**_summary(directory, effort), "failure_type": "deadline",
                 "censored": True, "deadline_seconds": timeout,
                 "total_elapsed_seconds": round(time.monotonic() - start, 3)}

@@ -302,12 +302,15 @@ def read_document_with_vision_b(
     Non-200 bodies travel (bounded to
     ``SNIPPET_LIMIT`` chars) inside the exception so classification survives.
     Optional ``reasoning_effort`` is restricted to GLM-5.3-Flash's documented
-    max/high/low values; omission leaves all existing provider defaults intact.
+    max/high/low values. Bulk GLM drafts use low effort unless explicitly set;
+    they still require source review. Other models keep their provider defaults.
     """
     if not page_data_urls:
         raise VisionBUnavailable("visionb requires at least one page image")
-    # GLM-5.3-Flash always thinks; this controls reasoning depth, not the
-    # output ceiling. Omission preserves the provider's existing MAX default.
+    # Spend the subscription on fast drafts, not deep reasoning. This changes
+    # extraction only: low-effort output is never source-review approval.
+    if reasoning_effort is None and config.model.lower() == "glm-5.3-flash":
+        reasoning_effort = "low"
     if reasoning_effort is not None and (
         config.model.lower() != "glm-5.3-flash"
         or reasoning_effort not in ("max", "high", "low")

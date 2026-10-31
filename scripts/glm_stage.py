@@ -17,7 +17,7 @@ Subcommands:
     vision endpoint through the existing ``analyzer.vision_engines`` client
     (shared PROMPT, never forked), parse with ``parse_gemini_output``, and
     write staging records. Transient endpoint failures (5xx, timeout,
-    transport, truncation, Google rate-shaped 429s) are retried in-process
+    transport, Google rate-shaped 429s) are retried in-process
     with cached page renders; Google 429s wait 60–90s between attempts.
     Five consecutive rate-limited Google docs with no success degrade to a
     clean batch stop so a dead daily quota cannot fill the manifest with
@@ -118,6 +118,7 @@ from analyzer.vision_engines import (  # noqa: E402
     GoogleVisionBRateLimitError,
     GoogleVisionBServiceUnavailableError,
     TransientVisionBError,
+    TruncatedCompletion,
     VisionBConfig,
     classify_visionb_error,
     is_google_api_host,
@@ -573,13 +574,15 @@ def read_document(
 
     Uses the shared PROMPT via ``read_document_with_vision_b`` (never
     forked). Transient engine failures (``TransientVisionBError``: 5xx,
-    timeout/transport, malformed envelope, truncated completion) are
+    timeout/transport, malformed envelope) are
     retried up to ``max_retries`` times with jittered exponential backoff,
     reusing the SAME rendered page images. Google's rate-shaped 429s use a
     60–90s jittered delay for Google-host 429/503 responses; other transient
     failures keep the shorter backoff.
     Quota errors stop immediately; auth/config/permanent failures are raised
     untouched (no retry — the same request would fail again).
+    Truncated completions also stop: repeating the same document and output
+    budget spends more inference without addressing the exhausted budget.
 
     ``read_fn(pdf_path, page_count)`` replaces the render+read pair (tests,
     alternate engines); it gets the same bounded retries.
@@ -604,6 +607,8 @@ def read_document(
     for attempt in range(max_retries + 1):
         try:
             return _attempt()
+        except TruncatedCompletion:
+            raise
         except TransientVisionBError as exc:
             if attempt >= max_retries:
                 raise

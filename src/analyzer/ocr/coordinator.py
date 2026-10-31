@@ -161,11 +161,8 @@ def _current_binding(db: Database, work: WorkEnvelope) -> bool:
     return row is not None and row[0] == work.artifact_sha256
 
 
-def _ingest(db: Database, result, path: Path, data_dir: Path, source) -> str:
-    from analyzer.ocr.ingestion import insert_transactions_outcome
-    from analyzer.ocr.normalization import normalize_candidate
-    from analyzer.ocr.workers import admission_guard
-
+def _register_receipt(db: Database, result, path: Path) -> tuple[dict, dict | None]:
+    """Register the hash-bound delivery once and inspect its current decision."""
     work = result.work
     receipt = dict(task_id=work.task_id, attempt_id=work.attempt_id,
                    result_id=db.work.register_result(result, str(path)), path=str(path))
@@ -173,6 +170,23 @@ def _ingest(db: Database, result, path: Path, data_dir: Path, source) -> str:
                                       [receipt["result_id"]]).fetchone()[0]
     finished = db.work.is_finished(receipt)
     predecessor = db.work.effective_admission_decision(receipt) if finished else None
+    return receipt, predecessor
+
+
+def _ingest(db: Database, result, path: Path, data_dir: Path, source) -> str:
+    receipt, predecessor = _register_receipt(db, result, path)
+    return _ingest_registered(db, result, receipt, predecessor, data_dir, source)
+
+
+def _ingest_registered(db: Database, result, receipt: dict, predecessor: dict | None,
+                       data_dir: Path, source) -> str:
+    """Ingest the registered delivery; review authorization is rechecked under lock."""
+    from analyzer.ocr.ingestion import insert_transactions_outcome
+    from analyzer.ocr.normalization import normalize_candidate
+    from analyzer.ocr.workers import admission_guard
+
+    work = result.work
+    finished = predecessor is not None
     if finished:
         current = db.conn.execute("SELECT attempt_id, result_id, status FROM extraction_work WHERE task_id = ?",
                                   [work.task_id]).fetchone()
@@ -334,14 +348,9 @@ def run_pipeline(
                 key = (result.work.archive_year, result.work.generation_id, result.work.doc_id)
                 if key not in scoped:
                     return
-                result_id = db.work.register_result(result, str(path))
-                raw_receipt = dict(task_id=result.work.task_id, attempt_id=result.work.attempt_id,
-                                   result_id=result_id, path=str(path))
-                raw_receipt["path"] = db.conn.execute("SELECT path FROM extraction_results WHERE result_id = ?",
-                                                      [result_id]).fetchone()[0]
-                prior = (db.work.effective_admission_decision(raw_receipt)["state"]
-                         if db.work.is_finished(raw_receipt) else "extracted")
-                state = _ingest(db, result, Path(path), base, source)
+                raw_receipt, predecessor = _register_receipt(db, result, Path(path))
+                prior = predecessor["state"] if predecessor is not None else "extracted"
+                state = _ingest_registered(db, result, raw_receipt, predecessor, base, source)
                 generation = (result.work.archive_year, result.work.generation_id)
                 if state in {"accepted", "verified_empty"} and (
                         prior not in {"accepted", "verified_empty"}
@@ -422,15 +431,20 @@ def run_pipeline(
                 elif (root[1] == "needs_review" and root[2] is not None
                       and (key not in accepted_at or accepted_at[key] < root[2])):
                     eligible.add(key)
+            obsolete = []
+            obsolete_paid = {}
             for work, state, _ in known.values():
                 key = (work.archive_year, work.generation_id, work.doc_id)
                 if key in scoped and binding(work) not in eligible and state in {"pending", "retry_wait"}:
-                    db.work.supersede_pending(work, "binding already resolved; no outstanding recipe refresh")
+                    obsolete.append(work)
                 elif (key in scoped and work.lane != ExtractionLane.LOCAL
                       and work.doc_id not in unresolved[work.archive_year, work.generation_id]
                       and state in {"pending", "retry_wait"}):
-                    db.work.supersede_pending(work, "resolved recipe refresh does not require paid extraction",
-                                              lane=work.lane.value)
+                    obsolete_paid.setdefault(work.lane, []).append(work)
+            db.work.supersede_pending_many(obsolete, "binding already resolved; no outstanding recipe refresh")
+            for lane, works in obsolete_paid.items():
+                db.work.supersede_pending_many(works, "resolved recipe refresh does not require paid extraction",
+                                               lane=lane.value)
             replaying = False
             for result in replayed_reviews:
                 escalate(result, "needs_review")

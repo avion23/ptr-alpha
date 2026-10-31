@@ -51,18 +51,29 @@ class WorkRepository:
 
     def supersede_pending(self, work: WorkEnvelope, detail: str, *, lane: str | None = None) -> int:
         """Cancel queued producers for a binding; retain all attempts/results."""
+        return self.supersede_pending_many([work], detail, lane=lane)
+
+    def supersede_pending_many(self, works: list[WorkEnvelope], detail: str,
+                               *, lane: str | None = None) -> int:
+        """Cancel a known set of bindings in one scan of the pending queue."""
         if not isinstance(detail, str) or not detail.strip():
             raise ValueError("Superseding work requires a reason")
+        bindings = sorted({(work.doc_id, str(work.archive_year), work.generation_id,
+                            work.artifact_sha256) for work in works})
+        if not bindings:
+            return 0
         rows = self.conn.execute("""UPDATE extraction_work SET status = 'superseded',
             detail = ?, lease_until = NULL, retry_at = NULL, updated_at = CURRENT_TIMESTAMP
             WHERE status IN ('pending', 'retry_wait')
               AND (? IS NULL OR lane = ?)
-              AND json_extract_string(envelope, '$.doc_id') = ?
-              AND json_extract_string(envelope, '$.archive_year') = ?
-              AND json_extract_string(envelope, '$.generation_id') = ?
-              AND json_extract_string(envelope, '$.artifact_sha256') = ?
-            RETURNING task_id""", [detail, lane, lane, work.doc_id, str(work.archive_year),
-                                    work.generation_id, work.artifact_sha256]).fetchall()
+              AND EXISTS (
+                  SELECT 1 FROM (SELECT UNNEST(?) AS doc_id, UNNEST(?) AS archive_year,
+                      UNNEST(?) AS generation_id, UNNEST(?) AS artifact_sha256) b
+                  WHERE json_extract_string(extraction_work.envelope, '$.doc_id') = b.doc_id
+                    AND json_extract_string(extraction_work.envelope, '$.archive_year') = b.archive_year
+                    AND json_extract_string(extraction_work.envelope, '$.generation_id') = b.generation_id
+                    AND json_extract_string(extraction_work.envelope, '$.artifact_sha256') = b.artifact_sha256)
+            RETURNING task_id""", [detail, lane, lane, *map(list, zip(*bindings))]).fetchall()
         return len(rows)
 
     def pending(self, lane, limit=100):
@@ -115,10 +126,17 @@ class WorkRepository:
         return [dict(zip(("task_id", "attempt_id", "result_id", "path"), row)) for row in rows]
 
     def register_result(self, result: ResultBundle, path: str) -> str:
-        row = self.conn.execute("SELECT envelope FROM extraction_attempts WHERE attempt_id = ? AND task_id = ?", [result.work.attempt_id, result.work.task_id]).fetchone()
+        identity = hashlib.sha256(_json(result.to_dict()).encode()).hexdigest()
+        row = self.conn.execute("""SELECT a.envelope, r.task_id, r.attempt_id, r.finished_at
+            FROM extraction_attempts a LEFT JOIN extraction_results r ON r.result_id = ?
+            WHERE a.attempt_id = ? AND a.task_id = ?""",
+            [identity, result.work.attempt_id, result.work.task_id]).fetchone()
         if row is None or json.loads(row[0]) != result.work.to_dict():
             raise ValueError("Result does not match a registered attempt")
-        identity = hashlib.sha256(_json(result.to_dict()).encode()).hexdigest()
+        if row[3] is not None:
+            if row[1:3] != (result.work.task_id, result.work.attempt_id):
+                raise ValueError("Result does not match its immutable receipt")
+            return identity
         current = self.conn.execute("SELECT attempt_id, status FROM extraction_work WHERE task_id = ?",
                                     [result.work.task_id]).fetchone()
         superseded = current is None or current != (result.work.attempt_id, "running")

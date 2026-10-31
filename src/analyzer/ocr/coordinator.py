@@ -316,7 +316,9 @@ def run_pipeline(
                 if state != "needs_review" or result.work.lane not in lanes:
                     return
                 old = result.work
-                if binding(old) not in eligible:
+                if (binding(old) not in eligible
+                        or old.extraction_recipe != recipes[old.lane]
+                        or old.doc_id not in unresolved[old.archive_year, old.generation_id]):
                     return
                 priority = db.conn.execute("SELECT priority FROM extraction_work WHERE task_id = ?",
                                            [old.task_id]).fetchone()[0]
@@ -424,6 +426,11 @@ def run_pipeline(
                 key = (work.archive_year, work.generation_id, work.doc_id)
                 if key in scoped and binding(work) not in eligible and state in {"pending", "retry_wait"}:
                     db.work.supersede_pending(work, "binding already resolved; no outstanding recipe refresh")
+                elif (key in scoped and work.lane != ExtractionLane.LOCAL
+                      and work.doc_id not in unresolved[work.archive_year, work.generation_id]
+                      and state in {"pending", "retry_wait"}):
+                    db.work.supersede_pending(work, "resolved recipe refresh does not require paid extraction",
+                                              lane=work.lane.value)
             replaying = False
             for result in replayed_reviews:
                 escalate(result, "needs_review")

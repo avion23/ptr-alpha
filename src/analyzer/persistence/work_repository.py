@@ -49,18 +49,19 @@ class WorkRepository:
             (task_id, envelope, status, priority, detail) VALUES (?, ?, 'blocked', ?, ?)
             ON CONFLICT DO NOTHING""", [task_id, _json(scope), priority, detail])
 
-    def supersede_pending(self, work: WorkEnvelope, detail: str) -> int:
-        """Cancel queued producers for an accepted binding; retain all attempts/results."""
+    def supersede_pending(self, work: WorkEnvelope, detail: str, *, lane: str | None = None) -> int:
+        """Cancel queued producers for a binding; retain all attempts/results."""
         if not isinstance(detail, str) or not detail.strip():
             raise ValueError("Superseding work requires a reason")
         rows = self.conn.execute("""UPDATE extraction_work SET status = 'superseded',
             detail = ?, lease_until = NULL, retry_at = NULL, updated_at = CURRENT_TIMESTAMP
             WHERE status IN ('pending', 'retry_wait')
+              AND (? IS NULL OR lane = ?)
               AND json_extract_string(envelope, '$.doc_id') = ?
               AND json_extract_string(envelope, '$.archive_year') = ?
               AND json_extract_string(envelope, '$.generation_id') = ?
               AND json_extract_string(envelope, '$.artifact_sha256') = ?
-            RETURNING task_id""", [detail, work.doc_id, str(work.archive_year),
+            RETURNING task_id""", [detail, lane, lane, work.doc_id, str(work.archive_year),
                                     work.generation_id, work.artifact_sha256]).fetchall()
         return len(rows)
 

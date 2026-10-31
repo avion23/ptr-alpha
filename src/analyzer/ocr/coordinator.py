@@ -10,6 +10,7 @@ from contextlib import ExitStack, nullcontext
 from dataclasses import replace
 from datetime import datetime, timedelta
 import hashlib
+import json
 import multiprocessing
 from pathlib import Path
 import time
@@ -19,6 +20,20 @@ from analyzer.exceptions import DataSourceError
 from analyzer.ocr.contracts import ExtractionLane, ExtractionOutcome, WorkEnvelope, task_key
 from analyzer.persistence.database import Database
 from analyzer.persistence.ownership import assert_publication_allowed
+
+
+def provider_code(result) -> str | None:
+    """Read only the last durable provider HTTP body, never model/error prose."""
+    responses = result.evidence.get("provider_responses") or []
+    if not responses:
+        return None
+    try:
+        body = json.loads(responses[-1])
+    except (TypeError, ValueError):
+        return None
+    error = body.get("error") if isinstance(body, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    return str(code) if isinstance(code, (str, int)) and not isinstance(code, bool) else None
 
 
 def _scope(db: Database, years: list[int] | None) -> list[dict]:
@@ -280,7 +295,7 @@ def run_pipeline(
     refresh_recipe: bool = False, publish_every: int = 100,
     lease_seconds: int = 3600, database: Database | None = None,
 ) -> dict:
-    """Drain ready work. API use is explicit; deferred retries survive for next run.
+    """Drain ready work, including scoped GLM rate retries, with explicit API use.
 
     A provider retry never consumes another provider's slots. Unresolved local
     results may escalate to configured API lanes; a retry is not an escalation.
@@ -399,8 +414,6 @@ def run_pipeline(
             # Resolve canonical scope once, not through the global canonical
             # view for every dispatch. Ledger timestamps distinguish a resumed
             # refresh from an older success on the same immutable binding.
-            import json
-
             known = {}
             accepted_at = {}
             for envelope, state, claimed_at, finished_at in db.conn.execute("""
@@ -519,16 +532,45 @@ def run_pipeline(
                 pools[lane] = stack.enter_context(pool)
             running = {}
             lane_backoff = dict.fromkeys(lanes, 0)
-            for envelope, delay in db.conn.execute("""SELECT envelope,
-                    epoch(retry_at - CURRENT_TIMESTAMP) FROM extraction_work
-                    WHERE status = 'retry_wait' AND retry_at > CURRENT_TIMESTAMP""").fetchall():
+            glm_limit = glm_workers
+            glm_successes = 0
+            glm_rate_wave_until = 0
+            glm_rate_retries = set()
+            # Exhaustion stops this run, not a later explicit run after renewal.
+            quota_exhausted = set()
+            for envelope, delay, result_path in db.conn.execute("""SELECT w.envelope,
+                    epoch(w.retry_at - CURRENT_TIMESTAMP), r.path FROM extraction_work w
+                    LEFT JOIN extraction_results r ON r.result_id = w.result_id
+                    WHERE w.status = 'retry_wait'""").fetchall():
                 work = WorkEnvelope.from_dict(json.loads(envelope))
                 item = scoped.get((work.archive_year, work.generation_id, work.doc_id))
                 if (work.lane not in lanes or work.extraction_recipe != recipes[work.lane]
                         or binding(work) not in eligible or item is None
                         or item["artifact_sha256"] != work.artifact_sha256):
                     continue
-                lane_backoff[work.lane] = max(lane_backoff[work.lane], time.monotonic() + delay)
+                code = provider_code(load_result(result_path)) if result_path and work.lane == ExtractionLane.GLM else None
+                if code == "1302":
+                    glm_rate_retries.add(work.task_id)
+                elif delay is not None and delay > 0:
+                    lane_backoff[work.lane] = max(lane_backoff[work.lane], time.monotonic() + delay)
+
+            def rate_retry_wakeup():
+                # Only this run's current eligible rate-limited bindings can
+                # keep a bulk GLM drain alive. claim() still owns retry_at.
+                if ExtractionLane.GLM in quota_exhausted or not glm_rate_retries:
+                    return None
+                delays = []
+                for envelope, delay in db.conn.execute("""SELECT envelope,
+                        epoch(retry_at - CURRENT_TIMESTAMP) FROM extraction_work
+                        WHERE status = 'retry_wait' AND task_id IN (SELECT UNNEST(?))""",
+                        [sorted(glm_rate_retries)]).fetchall():
+                    work = WorkEnvelope.from_dict(json.loads(envelope))
+                    if (delay is not None and delay > 0 and binding(work) in eligible
+                            and work.extraction_recipe == recipes[ExtractionLane.GLM]
+                            and _current_binding(db, work)):
+                        delays.append(delay)
+                return time.monotonic() + min(delays) if delays else None
+
             completed = 0
             while True:
                 if not seeds_done:
@@ -542,8 +584,11 @@ def run_pipeline(
                         seed(item)
                 wakeups = []
                 for lane in lanes:
-                    free = capacities[lane] - sum(w.lane == lane for w in running.values())
-                    if not free:
+                    if lane in quota_exhausted:
+                        continue
+                    limit = glm_limit if lane == ExtractionLane.GLM else capacities[lane]
+                    free = limit - sum(w.lane == lane for w in running.values())
+                    if free <= 0:
                         continue
                     delay = lane_backoff[lane] - time.monotonic()
                     if delay > 0:
@@ -557,10 +602,24 @@ def run_pipeline(
                     for (task_id,) in ready(lane, free):
                         work = db.work.claim(task_id, lease_seconds=lease_seconds)
                         running[pools[lane].submit(extract_document, work, str(spool))] = work
+                    if (lane == ExtractionLane.GLM
+                            and sum(w.lane == lane for w in running.values()) < glm_limit):
+                        retry_wakeup = rate_retry_wakeup()
+                        if retry_wakeup is not None:
+                            wakeups.append(retry_wakeup)
                 if not running:
-                    if time.monotonic() < lane_backoff[lanes[0]]:
-                        break
                     if not seeds_done:
+                        if (lanes[0] in quota_exhausted
+                                or time.monotonic() < lane_backoff[lanes[0]]):
+                            break
+                        continue
+                    retry_wakeup = rate_retry_wakeup()
+                    if retry_wakeup is not None:
+                        # Unknown quota errors retain their whole-lane backoff.
+                        deadline = max(retry_wakeup, lane_backoff[ExtractionLane.GLM])
+                        delay = deadline - time.monotonic()
+                        if delay > 0:
+                            time.sleep(delay)
                         continue
                     break
                 timeout = max(0, min(wakeups) - time.monotonic()) if wakeups else None
@@ -574,8 +633,26 @@ def run_pipeline(
                     if result.work != work:
                         raise ValueError("worker returned a different work identity")
                     receive(path)
-                    if result.outcome == ExtractionOutcome.RETRY_WAIT:
+                    code = provider_code(result) if work.lane == ExtractionLane.GLM else None
+                    if work.lane == ExtractionLane.GLM and code == "1308":
+                        quota_exhausted.add(work.lane)
+                    elif result.outcome == ExtractionOutcome.RETRY_WAIT and code == "1302":
+                        glm_rate_retries.add(work.task_id)
+                        now = time.monotonic()
+                        if now >= glm_rate_wave_until:
+                            glm_limit = max(1, glm_limit // 2)
+                            glm_successes = 0
+                            # One reduction per returned retry window, not per
+                            # sibling response from the same saturated wave.
+                            glm_rate_wave_until = now + (result.retry_after or 60)
+                    elif result.outcome == ExtractionOutcome.RETRY_WAIT:
                         lane_backoff[work.lane] = time.monotonic() + (result.retry_after or 60)
+                    elif work.lane == ExtractionLane.GLM and result.outcome == ExtractionOutcome.CANDIDATE:
+                        glm_rate_retries.discard(work.task_id)
+                        glm_successes += 1
+                        if glm_successes >= glm_limit:
+                            glm_limit = min(glm_workers, glm_limit + 1)
+                            glm_successes = 0
                     completed += 1
                     if completed % publish_every == 0:
                         publication = db.publish_snapshot()
@@ -585,4 +662,7 @@ def run_pipeline(
             publication = db.publish_snapshot()
             return {**pipeline_status(base, years=years, database=db),
                     "completed_attempts": completed, "missing_years": missing_years,
-                    "snapshot": publication}
+                    "snapshot": publication,
+                    **({"APIquota_exhausted": True,
+                        "exhausted_lanes": sorted(lane.value for lane in quota_exhausted)}
+                       if quota_exhausted else {})}

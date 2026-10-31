@@ -282,6 +282,7 @@ def read_document_with_vision_b(
     *,
     prompt: str | None = None,
     response_sink: Callable[[str], None] | None = None,
+    reasoning_effort: str | None = None,
 ) -> str:
     """Read all page images with engine B and return the raw completion.
 
@@ -300,9 +301,20 @@ def read_document_with_vision_b(
     ``model_context_window_exceeded`` as permanent, others transient).
     Non-200 bodies travel (bounded to
     ``SNIPPET_LIMIT`` chars) inside the exception so classification survives.
+    Optional ``reasoning_effort`` is restricted to GLM-5.3-Flash's documented
+    max/high/low values; omission leaves all existing provider defaults intact.
     """
     if not page_data_urls:
         raise VisionBUnavailable("visionb requires at least one page image")
+    # GLM-5.3-Flash always thinks; this controls reasoning depth, not the
+    # output ceiling. Omission preserves the provider's existing MAX default.
+    if reasoning_effort is not None and (
+        config.model.lower() != "glm-5.3-flash"
+        or reasoning_effort not in ("max", "high", "low")
+    ):
+        raise VisionBConfigError(
+            "reasoning_effort requires glm-5.3-flash and max, high, or low"
+        )
     extraction_prompt = (
         prompt if prompt is not None else gemini.PROMPT
     )
@@ -327,6 +339,8 @@ def read_document_with_vision_b(
             }
         ],
     }
+    if reasoning_effort is not None:
+        payload["reasoning_effort"] = reasoning_effort
     headers = {"Content-Type": "application/json"}
     if config.api_key:
         headers["Authorization"] = f"Bearer {config.api_key}"

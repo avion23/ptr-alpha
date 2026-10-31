@@ -456,7 +456,7 @@ def run_pipeline(
                 s["doc_id"] not in unresolved[s["archive_year"], s["generation_id"]]))
             seeds_done = False
 
-            def ready(lane, limit):
+            def ready(lane, limit, retry_delay=0):
                 # Scope and recipe filters prevent an older/year-excluded queue
                 # head from hiding ready work. Resolved queued bindings were
                 # superseded above (and on each admission), without repeatedly
@@ -475,7 +475,8 @@ def run_pipeline(
                      AND m.doc_id = json_extract_string(w.envelope, '$.doc_id')
                     WHERE w.lane = ? AND json_extract_string(w.envelope, '$.extraction_recipe') = ?
                       AND m.filing_type = 'P' AND g.archive_year IN (SELECT UNNEST(?))
-                      AND (w.status = 'pending' OR (w.status = 'retry_wait' AND w.retry_at <= CURRENT_TIMESTAMP))
+                       AND (w.status = 'pending' OR (w.status = 'retry_wait'
+                            AND w.retry_at <= CURRENT_TIMESTAMP + (? * INTERVAL '1 SECOND')))
                       AND NOT EXISTS (
                           SELECT 1 FROM extraction_work active
                           WHERE active.status = 'running'
@@ -485,7 +486,8 @@ def run_pipeline(
                             AND json_extract_string(active.envelope, '$.artifact_sha256') = json_extract_string(w.envelope, '$.artifact_sha256')
                       )
                     ORDER BY w.priority DESC, w.task_id LIMIT ?
-                """, [lane.value, recipes[lane], sorted({s["archive_year"] for s in scope}), limit]).fetchall()
+                """, [lane.value, recipes[lane], sorted({s["archive_year"] for s in scope}),
+                       retry_delay, limit]).fetchall()
 
             pools = {}
             for lane in lanes:
@@ -495,12 +497,17 @@ def run_pipeline(
                     pool = ThreadPoolExecutor(capacities[lane], thread_name_prefix=lane.value)
                 pools[lane] = stack.enter_context(pool)
             running = {}
-            lane_backoff = {}
-            for lane in lanes:
-                delay = db.conn.execute("""SELECT epoch(MAX(retry_at) - CURRENT_TIMESTAMP)
-                    FROM extraction_work WHERE lane = ? AND status = 'retry_wait'""",
-                    [lane.value]).fetchone()[0]
-                lane_backoff[lane] = time.monotonic() + max(0, delay or 0)
+            lane_backoff = dict.fromkeys(lanes, 0)
+            for envelope, delay in db.conn.execute("""SELECT envelope,
+                    epoch(retry_at - CURRENT_TIMESTAMP) FROM extraction_work
+                    WHERE status = 'retry_wait' AND retry_at > CURRENT_TIMESTAMP""").fetchall():
+                work = WorkEnvelope.from_dict(json.loads(envelope))
+                item = scoped.get((work.archive_year, work.generation_id, work.doc_id))
+                if (work.lane not in lanes or work.extraction_recipe != recipes[work.lane]
+                        or binding(work) not in eligible or item is None
+                        or item["artifact_sha256"] != work.artifact_sha256):
+                    continue
+                lane_backoff[work.lane] = max(lane_backoff[work.lane], time.monotonic() + delay)
             completed = 0
             while True:
                 if not seeds_done:
@@ -512,9 +519,17 @@ def run_pipeline(
                             seeds_done = True
                             break
                         seed(item)
+                wakeups = []
                 for lane in lanes:
                     free = capacities[lane] - sum(w.lane == lane for w in running.values())
-                    if not free or time.monotonic() < lane_backoff[lane]:
+                    if not free:
+                        continue
+                    delay = lane_backoff[lane] - time.monotonic()
+                    if delay > 0:
+                        # Wake only for a free lane with work ready at its
+                        # deadline. claim() still enforces the durable retry_at.
+                        if ready(lane, 1, retry_delay=delay):
+                            wakeups.append(lane_backoff[lane])
                         continue
                     # One bounded rolling window across all years, replenished
                     # after every completion rather than after a batch barrier.
@@ -527,7 +542,8 @@ def run_pipeline(
                     if not seeds_done:
                         continue
                     break
-                done, _ = wait(running, return_when=FIRST_COMPLETED)
+                timeout = max(0, min(wakeups) - time.monotonic()) if wakeups else None
+                done, _ = wait(running, timeout=timeout, return_when=FIRST_COMPLETED)
                 for future in done:
                     work = running.pop(future)
                     # Unexpected worker failures remain leased for explicit

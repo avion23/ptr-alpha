@@ -377,14 +377,14 @@ def read_document_with_vision_b(
         raise TransientVisionBError(
             f"visionb malformed response envelope: {exc}"
         ) from exc
-    if not isinstance(text, str) or not text.strip():
-        raise TransientVisionBError("visionb empty completion")
     finish_reason = (
         choice.get("finish_reason") if isinstance(choice, dict) else None
     )
     rejection = _finish_reason_rejection(finish_reason, text)
     if rejection is not None:
         raise rejection
+    if not isinstance(text, str) or not text.strip():
+        raise TransientVisionBError("visionb empty completion")
     return text
 
 

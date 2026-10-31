@@ -1,9 +1,10 @@
-"""Bounded, sequential MAX/LOW experiment; never publishes pipeline results.
+"""Bounded, sequential reasoning experiment; never publishes pipeline results.
 
 Run only after the operator has authorized live calls and drained other users
 of the endpoint. Each invocation accepts 1–3 frozen ResultBundle JSON paths.
 The new output directory is private; raw responses and parsed fields stay there.
 Only the safe summary is printed. There are no retries or admission receipts.
+Compare two efforts (MAX/LOW by default), or run one follow-up effort.
 """
 
 from __future__ import annotations
@@ -155,10 +156,11 @@ def _run_case(directory: Path, effort: str, *, timeout: float = REQUEST_DEADLINE
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--result", action="append", type=Path, default=[])
+    parser.add_argument("--effort", action="append", choices=("max", "high", "low"))
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--output", type=Path, help="new directory under data/pipeline/benchmarks/zai-effort")
     parser.add_argument("--_case", type=Path, help=argparse.SUPPRESS)
-    parser.add_argument("--_effort", choices=("max", "low"), help=argparse.SUPPRESS)
+    parser.add_argument("--_effort", choices=("max", "high", "low"), help=argparse.SUPPRESS)
     args = parser.parse_args()
     os.umask(0o077)
     if args._case is not None:
@@ -167,6 +169,9 @@ def main() -> int:
         return _case(args._case, args._effort)
     if not 1 <= len(args.result) <= 3 or args.output is None:
         parser.error("require 1–3 --result paths and a new --output directory")
+    efforts = args.effort or ["max", "low"]
+    if len(efforts) > 2 or len(set(efforts)) != len(efforts):
+        parser.error("require one or two distinct efforts; at most six requests")
     _config()  # Validate before rendering; no network call.
     root = args.data_dir.resolve()
     base = root / "pipeline/benchmarks/zai-effort"
@@ -206,8 +211,8 @@ def main() -> int:
             "page_count": work.page_count,
             "render_elapsed_seconds": round(time.monotonic() - render_start, 3),
         })
-        efforts = ("max", "low") if index % 2 == 0 else ("low", "max")
-        cases.extend((directory, effort) for effort in efforts)
+        order = efforts if index % 2 == 0 else list(reversed(efforts))
+        cases.extend((directory, effort) for effort in order)
     summaries = []
     for directory, effort in cases:  # At most six requests, strictly sequential.
         summary = _run_case(directory, effort)

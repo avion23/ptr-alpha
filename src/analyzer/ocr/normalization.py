@@ -147,7 +147,7 @@ def raw_cell_consistency_findings(row, occurrence):
         else:
             target_claim = parsers[field](target)
             if field == "amount_raw" and target_claim is not None and (
-                source_claim[0] == "band" or target_claim[0] == "band"
+                (source_claim[0] == "band") != (target_claim[0] == "band")
             ) and source_claim != target_claim:
                 report(field, source_key, "amount_letters_without_source_legend")
             elif target_claim != source_claim:

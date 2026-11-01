@@ -335,6 +335,19 @@ def read_document_with_vision_b(
             "Use image positions, not printed page numbers; copied sheets still have distinct physical positions. "
             "Every ROW must be one complete valid JSON object on one line. Escape quotes and newlines "
             "inside strings; no trailing commas, Markdown, or prose outside the required format."
+            "\nCompact raw_cells transport override only: keep SCHEMA: 4 and all named ROW fields "
+            "and literal source values unchanged. After each PAGE, before its first ROW, output "
+            "COLUMNS: followed by a JSON ordered list of verbatim printed source column headings. "
+            "For nested raw_cells maps, a heading may instead be a JSON array of exact literal "
+            "header strings forming its path; never join path components with separators. "
+            "Paths must be nonempty, unique, and have no prefix collisions. Emit each ROW.raw_cells "
+            "as a JSON ordered list of cell values in exactly that COLUMNS order, with matching width. "
+            "Preserve every cell including empty strings, nulls, marks, cents, and unreadable values; "
+            "do not fill values from headings, metadata, or amount legends. Declare COLUMNS once per "
+            "physical page, repeating even identical headings on the next page; replace COLUMNS before "
+            "later ROWs only if another table on that page has different headings. All other ROW fields "
+            "remain named, not positional, including additional source fields. This overrides only the "
+            "raw_cells object transport instruction: decoding restores the same object without inference."
         )
     payload = {
         "model": config.model,

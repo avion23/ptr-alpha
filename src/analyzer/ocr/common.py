@@ -145,6 +145,31 @@ def _is_example(asset: str) -> bool:
     return normalized == "example: mega corp. common stock"
 
 
+def _raw_cell_columns(text: str) -> list[list[str]]:
+    """Validate literal header paths; never normalize or infer source headings."""
+    columns = json.loads(text)
+    if not isinstance(columns, list) or not columns:
+        raise ValueError("expected nonempty header list")
+    paths = []
+    tree = {}
+    for column in columns:
+        path = [column] if isinstance(column, str) else column
+        if not isinstance(path, list) or not path or any(
+            not isinstance(part, str) or not part.strip() for part in path
+        ):
+            raise ValueError("expected nonempty literal header path")
+        node = tree
+        for part in path:
+            if None in node:
+                raise ValueError("header prefix collision")
+            node = node.setdefault(part, {})
+        if node:
+            raise ValueError("duplicate header or header prefix collision")
+        node[None] = True
+        paths.append(path)
+    return paths
+
+
 def parse_gemini_output(
     output: str, *, expected_page_count: int | None = None
 ) -> ParsedGeminiOutput:
@@ -168,6 +193,7 @@ def parse_gemini_output(
     member: str | None = None
     declared_page_count: int | None = None
     current_page: int | None = None
+    raw_cell_columns: list[list[str]] | None = None
     transactions: list[dict] = []
     raw_row_count = 0
     declared_pages: set[int] = set()
@@ -214,6 +240,15 @@ def parse_gemini_output(
             if current_page in declared_pages:
                 raise GeminiOutputError(f"line {line_number}: duplicate page")
             declared_pages.add(current_page)
+            raw_cell_columns = None
+            continue
+        if line.startswith("COLUMNS:"):
+            if schema_version != 4 or current_page is None:
+                raise GeminiOutputError(f"line {line_number}: COLUMNS requires schema 4 PAGE")
+            try:
+                raw_cell_columns = _raw_cell_columns(line.split(":", 1)[1].strip())
+            except ValueError as exc:
+                raise GeminiOutputError(f"line {line_number}: invalid COLUMNS JSON: {exc}") from exc
             continue
         if line == "NO_TRANSACTIONS":
             if current_page is None:
@@ -235,7 +270,22 @@ def parse_gemini_output(
             except ValueError as exc:
                 raise GeminiOutputError(f"line {line_number}: invalid ROW JSON") from exc
             required = {"asset", "type", "date", "notif_date", "amount_raw", "owner", "account", "instrument_type", "raw_cells"}
-            if not isinstance(row, dict) or not required <= row.keys() or not isinstance(row["raw_cells"], dict):
+            if not isinstance(row, dict) or not required <= row.keys():
+                raise GeminiOutputError(f"line {line_number}: incomplete ROW")
+            cells = row["raw_cells"]
+            if isinstance(cells, list):
+                if schema_version != 4 or raw_cell_columns is None:
+                    raise GeminiOutputError(f"line {line_number}: raw_cells array requires COLUMNS")
+                if len(cells) != len(raw_cell_columns):
+                    raise GeminiOutputError(f"line {line_number}: raw_cells width mismatch")
+                expanded = {}
+                for path, value in zip(raw_cell_columns, cells):
+                    node = expanded
+                    for part in path[:-1]:
+                        node = node.setdefault(part, {})
+                    node[path[-1]] = value
+                row["raw_cells"] = expanded
+            elif not isinstance(cells, dict):
                 raise GeminiOutputError(f"line {line_number}: incomplete ROW")
             if _is_example(str(row["asset"])):
                 continue

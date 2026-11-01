@@ -321,8 +321,6 @@ def review_decision_locked(result, data_dir):
     record = bundle_record(result, material)
     try:
         _validate_bundle(data_dir, directory, record)
-        if _has_failed_projection(data_dir, material, result):
-            raise ValueError("failed candidate requires re-extraction, not a later pass")
         history = json.loads(read_work_artifact(data_dir, directory / "verdicts.json"))
         if not history or any(item["verdict"] == "fail" for item in history):
             raise ValueError("missing or failed source review")
@@ -333,6 +331,8 @@ def review_decision_locked(result, data_dir):
         if entry["bundle_seal_sha256"] != seal or entry["verdict"] != "pass":
             raise ValueError("review seal changed or verdict is not pass")
         _validate_report(entry["report"], result, material, "pass")
+        if _has_failed_projection(data_dir, material, result):
+            raise ValueError("failed candidate requires re-extraction, not a later pass")
     except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
         return {"allowed": False, "reason": f"grounded API review required: {exc}", **material}
     if not result.rows:

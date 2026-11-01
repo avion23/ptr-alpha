@@ -85,6 +85,24 @@ def _original_observation(ledger, document_pointer, observation):
     return original
 
 
+def _complete_source_amount(literal):
+    """A selected monetary observation must contain one complete numeric claim."""
+    import re
+    from analyzer.ocr.normalization import normalize_amount
+
+    number = r"\$?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?"
+    pattern = (r"(?<![\w\d.,])(?:" + r"(?:over|greater than|>)\s*" + number
+               + "|" + number + r"\s*(?:-|–|—|to)\s*" + number
+               + "|" + number + r")(?![\w\d.,])")
+    claims = list(re.finditer(pattern, literal, re.I))
+    if len(claims) != 1:
+        raise ValueError("source amount observation must preserve one complete numeric claim")
+    amount = normalize_amount(claims[0].group())
+    if amount["amount_kind"] not in {"range", "exact", "open"}:
+        raise ValueError("source amount numeric bounds are unknown")
+    return amount
+
+
 def review_material(result, *, source_proposal=None):
     """One normalization and one typed final persistence projection; no I/O."""
     from analyzer.ocr.normalization import normalize_candidate
@@ -414,7 +432,7 @@ def _validate_ai_report(report, result, material, directory, data_dir):
 
     def same_numeric_amount(left, right):
         left, right = normalize_amount(left), normalize_amount(right)
-        if left["amount_kind"] not in {"range", "exact"} or left["amount_kind"] != right["amount_kind"]:
+        if left["amount_kind"] not in {"range", "exact", "open"} or left["amount_kind"] != right["amount_kind"]:
             return False
         return all((Decimal(left[key]) if left[key] is not None else None) ==
                    (Decimal(right[key]) if right[key] is not None else None)
@@ -524,7 +542,7 @@ def _validate_ai_report(report, result, material, directory, data_dir):
                     amount = fields["amount_raw"]
                     parsed = normalize_amount(amount.get("literal"))
                     if (field != "amount_midpoint" or literal != amount.get("literal")
-                            or amount.get("status") != "observed" or parsed["amount_kind"] not in {"range", "exact"}
+                            or amount.get("status") != "observed" or parsed["amount_kind"] not in {"range", "exact", "open"}
                             or parsed["amount_midpoint"] != value):
                         raise ValueError("midpoint must be computed from literal source numeric bounds")
                 elif status == "observed":
@@ -543,6 +561,9 @@ def _validate_ai_report(report, result, material, directory, data_dir):
                         observed = extract_owner_code(literal)
                     elif field == "amount_raw":
                         observed = value if same_numeric_amount(literal, value) else None
+                        complete = _complete_source_amount(original["literal"])
+                        if not same_numeric_amount(complete["amount_raw"], literal):
+                            raise ValueError("source amount observation truncates or changes original numeric bounds")
                     elif field == "transaction_type":
                         observed = _normalize_tx_type(literal)
                     elif field == "member":

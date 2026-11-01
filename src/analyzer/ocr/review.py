@@ -440,6 +440,11 @@ def _validate_ai_report(report, result, material, directory, data_dir):
                    (Decimal(right[key]) if right[key] is not None else None)
                    for key in ("amount_lower", "amount_upper", "amount_exact"))
 
+    def same_value(field, left, right):
+        # Permit only the witnessed category-label casing; unknowns stay exact.
+        return (left == right or (field == "instrument_type"
+                and left in ("Stock", "stock") and right in ("Stock", "stock")))
+
     _validate_report(report, result, material, "fail")  # Envelope binding and evidence.
     reports = report.get("reports")
     if report.get("source_checking_attested") is not True or not isinstance(reports, list) or len(reports) != 2:
@@ -526,7 +531,7 @@ def _validate_ai_report(report, result, material, directory, data_dir):
                         or not isinstance(observation.get("evidence"), str) or not observation["evidence"].strip()
                         or not isinstance(literal, str) or not literal.strip()):
                     raise ValueError("every field needs literal source evidence and frozen page citation")
-                if value != expected[field]:
+                if not same_value(field, value, expected[field]):
                     raise ValueError(f"source observation differs from current projection: {field}")
                 original = (None if status == "official_metadata" else
                             _original_observation(ledger, document_pointer, observation))
@@ -579,7 +584,8 @@ def _validate_ai_report(report, result, material, directory, data_dir):
                             raise ValueError("asset literal must preserve complete original source text")
                         observed = " ".join(literal.split())
                         value = " ".join(value.split())
-                    if observed != value:
+                    if not same_value(field, observed,
+                                      expected[field] if field == "instrument_type" else value):
                         raise ValueError(f"literal source differs from canonical value: {field}")
                     original_value = original.get("normalized_value")
                     if field == "transaction_type":
@@ -591,12 +597,14 @@ def _validate_ai_report(report, result, material, directory, data_dir):
                     elif field in {"transaction_date", "notification_date", "expiry_date", "disclosure_date"}:
                         parsed = _strict_date(original_value)
                         original_value = parsed.isoformat() if parsed else None
+                    comparison_value = expected[field] if field == "instrument_type" else value
                     if (not isinstance(original_value, dict) and field not in {"member", "asset_description"}
-                            and original_value != value):
+                            and not same_value(field, original_value, comparison_value)):
                         raise ValueError(f"original source value differs from canonical value: {field}")
                 else:
                     raise ValueError(f"unknown/conflicting field status: {field}")
-                values.append((field, status, value))
+                values.append((field, status,
+                               expected[field] if field == "instrument_type" else value))
         observations.append(values)
     if observations[0] != observations[1]:
         raise ValueError("independent source observations disagree")

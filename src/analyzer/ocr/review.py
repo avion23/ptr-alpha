@@ -25,6 +25,7 @@ POLICY = {
     "ai_authority": "independent-ai-source-review-v1",
     "render_dpi": 180,
     "ai_requirements": "two independent sessions; pixel citations; all field observations; original UTF-8 ledgers with SHA-256; local source-checking and faithful comparison attestations; blind ledger binding is post-review",
+    "source_proposals": "AI-only schema-4 source observations; original raw result retained; both original ledger hashes bound; all current normalization gates; corrections publish as separate derived decisions",
 }
 
 
@@ -50,7 +51,41 @@ def digest(value):
     return hashlib.sha256(encode(value)).hexdigest()
 
 
-def review_material(result):
+def _ledger_at(ledger, pointer, *, within=None):
+    """Resolve a local JSON pointer; no evaluation, guessing or cross-document lookup."""
+    if (not isinstance(pointer, str) or not pointer.startswith("/")
+            or (within is not None and not pointer.startswith(within + "/"))):
+        raise ValueError("exact original-ledger JSON pointer required")
+    try:
+        for part in pointer[1:].split("/"):
+            key = part.replace("~1", "/").replace("~0", "~")
+            ledger = ledger[int(key)] if isinstance(ledger, list) else ledger[key]
+        return ledger
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise ValueError("original-ledger JSON pointer does not resolve") from exc
+
+
+def _original_observation(ledger, document_pointer, observation):
+    import re
+
+    original = _ledger_at(ledger, observation.get("ledger_pointer"), within=document_pointer)
+    if (not isinstance(original, dict) or original.get("source_page") != observation.get("page_number")
+            or not isinstance(original.get("evidence_location"), str) or not original["evidence_location"].strip()):
+        raise ValueError("field must reference an actual page-located original source observation")
+    if observation.get("status") == "not_reported":
+        if original.get("status") != "not_reported" or original.get("normalized_value") not in (None, "unknown"):
+            raise ValueError("unreported status contradicts original source ledger")
+        return original
+    literal = original.get("literal")
+    if (original.get("status") != "observed" or not isinstance(literal, str) or not literal.strip()
+            or not isinstance(observation.get("literal"), str)
+            or not re.search(r"(?<![\d.,])" + re.escape("".join(observation["literal"].split())) + r"(?![\d.,])",
+                             "".join(literal.split()))):
+        raise ValueError("observed literal is absent from original source ledger")
+    return original
+
+
+def review_material(result, *, source_proposal=None):
     """One normalization and one typed final persistence projection; no I/O."""
     from analyzer.ocr.normalization import normalize_candidate
     from analyzer.ocr.ingestion import final_ocr_projection
@@ -59,7 +94,34 @@ def review_material(result):
         raise ValueError("source review is for API candidates")
     if result.outcome not in (ExtractionOutcome.CANDIDATE, ExtractionOutcome.VERIFIED_EMPTY):
         raise ValueError("only an unchanged candidate or empty claim can be reviewed")
-    if not result.rows:
+    subject = result
+    if source_proposal is not None:
+        from dataclasses import replace
+        from copy import deepcopy
+
+        if (not isinstance(source_proposal, dict)
+                or source_proposal.get("schema") != "independent-ai-source-proposal-v1"
+                or result.evidence.get("output_schema_version") != 4
+                or any(not isinstance(row.get("raw_cells"), dict) for row in result.rows)):
+            raise ValueError("source proposals require an explicit source schema and original schema-4 result")
+        rows = source_proposal.get("rows")
+        required = {"asset", "type", "date", "notif_date", "amount_raw", "owner", "account", "instrument_type", "raw_cells", "page_number"}
+        ledgers = source_proposal.get("source_ledger_sha256s")
+        if (not isinstance(rows, list) or any(not isinstance(row, dict) or not required <= row.keys()
+                or not isinstance(row["raw_cells"], dict) for row in rows)
+                or not isinstance(source_proposal.get("member"), str)
+                or not isinstance(ledgers, list) or len(ledgers) != 2):
+            raise ValueError("complete source rows, observed member and two original ledger hashes required")
+        for ledger in ledgers:
+            _validate_supersession_id(ledger)
+            if ledger is None:
+                raise ValueError("source ledger hash cannot be null")
+        subject = replace(result, rows=deepcopy(rows), evidence={
+            "member": source_proposal["member"], "output_schema_version": 4,
+            "page_count": result.work.page_count,
+            "page_outcomes": deepcopy(source_proposal.get("page_outcomes")),
+        })
+    if source_proposal is None and not result.rows:
         from analyzer.ocr.common import parse_gemini_output
 
         if (not isinstance(result.raw_response, str) or not result.raw_response.strip()
@@ -69,8 +131,8 @@ def review_material(result):
         if (parsed.transactions or parsed.raw_row_count or not parsed.no_transactions
                 or parsed.covered_pages != frozenset(range(1, result.work.page_count + 1))):
             raise ValueError("empty review requires an explicit parsed claim covering every source page")
-    candidate = normalize_candidate(result.work, result)
-    if candidate["findings"] or (result.rows and candidate["status"] != "candidate"):
+    candidate = normalize_candidate(result.work, subject)
+    if candidate["findings"] or (subject.rows and candidate["status"] != "candidate"):
         raise ValueError("candidate fails deterministic validation; re-extract before review")
     projection = final_ocr_projection(result.work, candidate["rows"])
     binding = {
@@ -82,11 +144,23 @@ def review_material(result):
         "policy_identity": POLICY["identity"],
         "policy_sha256": digest(POLICY),
     }
-    return {"candidate": candidate, "projection": projection, "binding": binding}
+    material = {"candidate": candidate, "projection": projection, "binding": binding}
+    if source_proposal is not None:
+        binding["source_proposal_sha256"] = digest(source_proposal)
+        material["source_proposal"] = deepcopy(source_proposal)
+        material["source_review_lineage"] = {
+            "source_origin": "independent-ai-source-proposal-v1",
+            "original_raw_result_id": binding["raw_result_id"],
+            "extracted_raw_count": len(result.rows), "verified_source_count": len(subject.rows),
+            "source_proposal_sha256": digest(source_proposal),
+            "source_ledger_sha256s": ledgers,
+            "derived_outcome": "candidate" if subject.rows else "verified_empty",
+        }
+    return material
 
 
 def bundle_record(result, material):
-    return {
+    record = {
         "schema": "house-api-review-bundle-v1", "doc_id": result.work.doc_id,
         "year": result.work.archive_year, "pages": result.work.page_count,
         "pdf_sha256": result.work.artifact_sha256,
@@ -94,6 +168,10 @@ def bundle_record(result, material):
         "raw_result": result.to_dict(), "candidate": material["candidate"],
         "final_projection": material["projection"],
     }
+    if "source_proposal" in material:
+        record["source_proposal"] = material["source_proposal"]
+        record["source_review_lineage"] = material["source_review_lineage"]
+    return record
 
 
 def required_review_supersession(repository, raw_result_id):
@@ -179,6 +257,9 @@ def _has_failed_projection(data_dir, material, result):
                 or old["final_projection_sha256"] != digest(record["final_projection"])
                 or old["final_projection_count"] != len(record["final_projection"])):
             raise ValueError("invalid sibling source-review binding")
+        if (("source_proposal_sha256" in old) != ("source_proposal" in record)
+                or ("source_proposal" in record and old["source_proposal_sha256"] != digest(record["source_proposal"]))):
+            raise ValueError("invalid sibling source proposal binding")
         _validate_bundle(data_dir, directory, record)
         history_path = directory / "verdicts.json"
         # Prepared but unreviewed bundles have no history yet.
@@ -203,14 +284,14 @@ def _has_failed_projection(data_dir, material, result):
     return failed
 
 
-def prepare_review(result, data_dir, *, database=None, supersedes_admission_decision_id=None):
+def prepare_review(result, data_dir, *, database=None, supersedes_admission_decision_id=None, source_proposal=None):
     """Local command: freeze actual PDF, rendered pixels, raw and final rows."""
     from scripts.audit_sample import audit_operation_lock, emit_bound_review_bundle
     from analyzer.ocr.ingestion import approved_data_root, read_work_artifact
 
     _validate_supersession_id(supersedes_admission_decision_id)
     with approved_data_root(data_dir) as root, audit_operation_lock(root):
-        material = review_material(result)
+        material = review_material(result, source_proposal=source_proposal)
         directory = bundle_directory(root, material)
         record = bundle_record(result, material)
         content = read_work_artifact(root, result.work.artifact_path)
@@ -235,7 +316,7 @@ def prepare_review(result, data_dir, *, database=None, supersedes_admission_deci
         try:
             with (directory / ai_name).open("x") as template:
                 json.dump(ai_review_report_template(result, root,
-                          supersedes_admission_decision_id=required), template, indent=2, sort_keys=True)
+                          supersedes_admission_decision_id=required, source_proposal=source_proposal), template, indent=2, sort_keys=True)
         except FileExistsError:
             pass
         return str(Path(data_dir) / directory.relative_to(Path(root)))
@@ -289,12 +370,12 @@ def _validate_report(report, result, material, verdict):
         raise ValueError("empty claims require affirmative absence proof on every page")
 
 
-def ai_review_report_template(result, data_dir, *, supersedes_admission_decision_id=None):
+def ai_review_report_template(result, data_dir, *, supersedes_admission_decision_id=None, source_proposal=None):
     """Unapproved two-session checklist. Call after prepare_review; never copies proposed values."""
     from copy import deepcopy
     from analyzer.ocr.ingestion import read_work_artifact
 
-    material = review_material(result)
+    material = review_material(result, source_proposal=source_proposal)
     directory = bundle_directory(data_dir, material)
     _validate_bundle(data_dir, directory, bundle_record(result, material))
     seal = json.loads(read_work_artifact(data_dir, directory / "bundle-seal.json"))
@@ -302,16 +383,25 @@ def ai_review_report_template(result, data_dir, *, supersedes_admission_decision
                                    supersedes_admission_decision_id=supersedes_admission_decision_id)
     report.update(reviewer_id="", session_id="", review_mode="",
                   original_source_ledger="", original_source_ledger_sha256="",
-                  ledger_comparison_attested=False)
+                  ledger_comparison_attested=False, ledger_document_pointer="",
+                  ledger_pdf_sha256_pointer="", ledger_row_count_pointer="", ledger_absence_pointer="")
+    if source_proposal is not None and not material["projection"]:
+        report["source_header"] = {"member": {
+            "status": "unknown", "value": None, "literal": "", "page_number": None,
+            "image_sha256": "", "evidence": "", "ledger_pointer": ""}}
     for page, image in zip(report["pages"], seal["pages"]):
         page["image_sha256"] = image["sha256"]
+        page["ledger_image_sha256_pointer"] = ""
     for row in report["rows"]:
         row["fields"] = {field: {"status": "unknown", "value": None, "literal": "",
-                                 "page_number": row["page_number"], "image_sha256": "", "evidence": ""}
+                                 "page_number": row["page_number"], "image_sha256": "", "evidence": "", "ledger_pointer": ""}
                          for field in POLICY["critical_fields"]}
-    return {"binding": material["binding"], "policy_sha256": digest(POLICY), "evidence": "",
+    envelope = {"binding": material["binding"], "policy_sha256": digest(POLICY), "evidence": "",
             "supersedes_admission_decision_id": supersedes_admission_decision_id,
             "source_checking_attested": False, "reports": [deepcopy(report), deepcopy(report)]}
+    if source_proposal is not None:
+        envelope["source_proposal"] = material["source_proposal"]
+    return envelope
 
 
 def _validate_ai_report(report, result, material, directory, data_dir):
@@ -338,6 +428,14 @@ def _validate_ai_report(report, result, material, directory, data_dir):
                 or hashlib.sha256(ledger.encode("utf-8")).hexdigest() != source.get("original_source_ledger_sha256")
                 or not isinstance(json.loads(ledger), dict)):
             raise ValueError("original immutable source ledger and local comparison attestation required")
+        ledger = json.loads(ledger)
+        document_pointer = source.get("ledger_document_pointer")
+        document = _ledger_at(ledger, document_pointer)
+        if (not isinstance(document, dict) or str(document.get("doc_id")) != result.work.doc_id
+                or _ledger_at(ledger, source.get("ledger_pdf_sha256_pointer"), within=document_pointer) != result.work.artifact_sha256
+                or type(_ledger_at(ledger, source.get("ledger_row_count_pointer"), within=document_pointer)) is not int
+                or _ledger_at(ledger, source["ledger_row_count_pointer"], within=document_pointer) != len(material["projection"])):
+            raise ValueError("original source document, artifact or actual occurrence count differs")
         if source.get("supersedes_admission_decision_id") != report.get("supersedes_admission_decision_id"):
             raise ValueError("source report supersession differs")
         for index, key in enumerate(("reviewer_id", "session_id")):
@@ -346,8 +444,36 @@ def _validate_ai_report(report, result, material, directory, data_dir):
                 raise ValueError("distinct reviewer and session IDs required")
             identities[index].add(identity)
         for page, image in zip(source["pages"], seal["pages"]):
-            if page.get("image_sha256") != image["sha256"]:
+            if (page.get("image_sha256") != image["sha256"]
+                    or _ledger_at(ledger, page.get("ledger_image_sha256_pointer"), within=document_pointer) != image["sha256"]):
                 raise ValueError("source page image citation missing or changed")
+        if "source_proposal" in material:
+            if [{"page_number": page["page_number"], "outcome": page["outcome"]}
+                    for page in source["pages"]] != material["candidate"]["page_outcomes"]:
+                raise ValueError("source proposal and observed page outcomes differ")
+            if not material["projection"]:
+                header = source.get("source_header", {}).get("member")
+                if not isinstance(header, dict):
+                    raise ValueError("empty source proposal requires observed filer header")
+                page, literal = header.get("page_number"), header.get("literal")
+                if (header.get("status") != "observed" or header.get("value") != result.work.member
+                        or not isinstance(literal, str) or not literal.strip()
+                        or type(page) is not int or not 1 <= page <= len(seal["pages"])
+                        or header.get("image_sha256") != seal["pages"][page - 1]["sha256"]
+                        or not isinstance(header.get("evidence"), str) or not header["evidence"].strip()):
+                    raise ValueError("empty source proposal requires pixel-cited filer identity")
+                _, rejected = validate_transactions(result.work.doc_id, literal, [],
+                                                    result.work.filing_date, result.work.member)
+                if rejected:
+                    raise ValueError("empty source filer differs from official identity")
+                _original_observation(ledger, document_pointer, header)
+                absence = _ledger_at(ledger, source.get("ledger_absence_pointer"), within=document_pointer)
+                if (not isinstance(absence, dict) or absence.get("status") != "observed"
+                        or not isinstance(absence.get("literal"), str) or not absence["literal"].strip()
+                        or type(absence.get("source_page")) is not int
+                        or not 1 <= absence["source_page"] <= len(seal["pages"])
+                        or not isinstance(absence.get("evidence_location"), str) or not absence["evidence_location"].strip()):
+                    raise ValueError("empty source proposal requires original page-grounded absence observation")
         values = []
         for row, expected in zip(source["rows"], material["projection"]):
             fields = row.get("fields")
@@ -366,6 +492,8 @@ def _validate_ai_report(report, result, material, directory, data_dir):
                     raise ValueError("every field needs literal source evidence and frozen page citation")
                 if value != expected[field]:
                     raise ValueError(f"source observation differs from current projection: {field}")
+                original = (None if status == "official_metadata" else
+                            _original_observation(ledger, document_pointer, observation))
                 if status == "not_reported":
                     if literal != "NotReported" or value not in (None, "unknown"):
                         raise ValueError("not-reported field must remain null/unknown")
@@ -397,20 +525,33 @@ def _validate_ai_report(report, result, material, directory, data_dir):
                     elif field == "transaction_type":
                         observed = _normalize_tx_type(literal)
                     elif field == "member":
+                        if " ".join(original["literal"].split()) != " ".join(literal.split()):
+                            raise ValueError("member literal must preserve original source observation")
                         _, rejected = validate_transactions(result.work.doc_id, literal, [],
                                                             result.work.filing_date, result.work.member)
                         observed = None if rejected else value
                     elif field == "asset_description":
+                        if " ".join(original["literal"].split()) != " ".join(literal.split()):
+                            raise ValueError("asset literal must preserve complete original source text")
                         observed = " ".join(literal.split())
                         value = " ".join(value.split())
                     if observed != value:
                         raise ValueError(f"literal source differs from canonical value: {field}")
+                    original_value = original.get("normalized_value")
+                    if (not isinstance(original_value, dict) and field not in {"member", "asset_description"}
+                            and original_value != value):
+                        raise ValueError(f"original source value differs from canonical value: {field}")
                 else:
                     raise ValueError(f"unknown/conflicting field status: {field}")
                 values.append((field, status, value))
         observations.append(values)
     if observations[0] != observations[1]:
         raise ValueError("independent source observations disagree")
+    if "source_proposal" in material:
+        if (report.get("source_proposal") != material["source_proposal"]
+                or sorted(material["source_proposal"]["source_ledger_sha256s"]) != sorted(
+                    source["original_source_ledger_sha256"] for source in reports)):
+            raise ValueError("source proposal must bind both exact original source ledgers")
 
 
 def record_review(result, data_dir, report, *, verdict, human_reviewed=False, ai_source_reviewed=False, database=None):
@@ -425,7 +566,9 @@ def record_review(result, data_dir, report, *, verdict, human_reviewed=False, ai
     if verdict == "pass" and not (human_reviewed or ai_source_reviewed):
         raise ValueError("positive authorization requires explicit local human review")
     with approved_data_root(data_dir) as root, audit_operation_lock(root):
-        material = review_material(result)
+        if report.get("source_proposal") is not None and not ai_source_reviewed:
+            raise ValueError("source proposals require explicit independent AI source review mode")
+        material = review_material(result, source_proposal=report.get("source_proposal"))
         directory = bundle_directory(root, material)
         record = bundle_record(result, material)
         _validate_bundle(root, directory, record)
@@ -448,6 +591,9 @@ def record_review(result, data_dir, report, *, verdict, human_reviewed=False, ai
             raise ValueError("failed candidate requires re-extraction, not a later pass")
         from scripts.glm_stage import atomic_write_json
         atomic_write_json(history_path, [*history, entry])
+        if verdict == "pass":
+            atomic_write_json(directory.parent.with_suffix(".json"), {
+                "binding": material["binding"], "verdict_sha256": digest(entry)})
         return entry
 
 
@@ -455,7 +601,18 @@ def review_decision_locked(result, data_dir):
     """Caller owns the audit root through final SQL comparison and commit."""
     from analyzer.ocr.ingestion import read_work_artifact
 
-    material = review_material(result)
+    raw_directory = Path(data_dir) / "pipeline" / "reviews" / digest(result.to_dict())
+    selection_path = raw_directory.with_suffix(".json")
+    selection = None
+    if selection_path.exists() or selection_path.is_symlink():
+        selection = json.loads(read_work_artifact(data_dir, selection_path))
+        selected = raw_directory / digest(selection["binding"])
+        frozen = json.loads(read_work_artifact(data_dir, selected / "record.json"))
+        material = review_material(result, source_proposal=frozen.get("source_proposal"))
+        if selection["binding"] != material["binding"]:
+            raise ValueError("selected source review no longer matches current normalization, policy or proposal")
+    else:
+        material = review_material(result)
     directory = bundle_directory(data_dir, material)
     record = bundle_record(result, material)
     try:
@@ -464,6 +621,8 @@ def review_decision_locked(result, data_dir):
         if not history or any(item["verdict"] == "fail" for item in history):
             raise ValueError("missing or failed source review")
         entry = history[-1]
+        if selection is not None and selection["verdict_sha256"] != digest(entry):
+            raise ValueError("selected source review verdict changed")
         if entry["authority"] not in {POLICY["authority"], POLICY["ai_authority"]} or entry["binding"] != material["binding"]:
             raise ValueError("review is not locally authorized for this exact candidate")
         seal = hashlib.sha256(read_work_artifact(data_dir, directory / "bundle-seal.json")).hexdigest()
@@ -477,7 +636,7 @@ def review_decision_locked(result, data_dir):
             raise ValueError("failed candidate requires re-extraction, not a later pass")
     except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
         return {"allowed": False, "reason": f"grounded API review required: {exc}", **material}
-    if not result.rows:
+    if not material["candidate"]["rows"]:
         # Authorization derives from the operator's affirmative page report,
         # not from a provider's empty claim. The raw bundle remains unchanged.
         material["candidate"] = {**material["candidate"], "status": "verified_empty"}

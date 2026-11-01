@@ -738,13 +738,16 @@ def ocr_review_prepare(
     data_dir: str = typer.Option("data", help="Data root containing the sealed PDF"),
     supersedes_admission_decision: str | None = typer.Option(
         None, "--supersedes-admission-decision", help="Retraction result ID supplied by the operator; owner validates currentness at admission"),
+    source_proposal: Path | None = typer.Option(None, "--source-proposal", help="Explicit AI source-ledger proposal JSON; original result stays unchanged"),
 ):
     """Freeze source review (no API); retractions get report-template-DECISION_ID.json."""
     from analyzer.ocr.review import prepare_review
     from analyzer.ocr.workers import load_result
+    import json
 
     print(prepare_review(load_result(result_path), data_dir,
-                         supersedes_admission_decision_id=supersedes_admission_decision))
+                         supersedes_admission_decision_id=supersedes_admission_decision,
+                         source_proposal=json.loads(source_proposal.read_text()) if source_proposal else None))
 
 
 @app.command()

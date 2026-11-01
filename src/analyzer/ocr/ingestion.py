@@ -1741,11 +1741,26 @@ def _finish_receipt(conn, receipt, state, detail=None):
 
             decision = receipt["admission_decision"]
             detail = detail if isinstance(detail, dict) else {"reason": detail}
+            source_proposal = detail.get("source_proposal")
+            source_lineage = detail.get("source_review_lineage")
+            if source_proposal is not None:
+                from analyzer.ocr.review import digest, POLICY
+                if (detail.get("review_binding", {}).get("authority") != POLICY["ai_authority"]
+                        or source_lineage["original_raw_result_id"] != receipt["result_id"]
+                        or digest(decision["result"].to_dict()) != receipt["result_id"]
+                        or source_lineage["source_proposal_sha256"] != digest(source_proposal)
+                        or source_lineage["verified_source_count"] != len(source_proposal["rows"])
+                        or source_lineage["derived_outcome"] != ("verified_empty" if state == "verified_empty" else "candidate")):
+                    raise ValueError("source-reviewed decision lineage does not bind original receipt and derived rows")
             bundle = replace(
                 decision["result"],
+                rows=source_proposal["rows"] if source_proposal is not None else decision["result"].rows,
                 outcome=ExtractionOutcome({"accepted": "candidate", "verified_empty": "verified_empty",
                                            "needs_review": "needs_review", "blocked": "blocked"}[state]),
-                evidence={**decision["result"].evidence, "admission_decision": {
+                evidence={**decision["result"].evidence,
+                          **({"source_review_lineage": source_lineage,
+                              "source_proposal": source_proposal} if source_proposal is not None else {}),
+                          "admission_decision": {
                     "predecessor_result_id": decision["predecessor"]["result_id"],
                     "raw_result_id": receipt["result_id"], "state": state,
                     "detail_sha256": hashlib.sha256(json.dumps(detail, sort_keys=True).encode()).hexdigest(),
@@ -2128,14 +2143,18 @@ def _verified_final_admission(conn, doc_id, admission):
     actual = [indexed[row["source_row_id"]] for row in expected]
     if len(indexed) != len(expected) or digest(actual) != admission["binding"]["final_projection_sha256"]:
         raise ValueError("final SQL row count or digest differs from review")
-    return {"schema": "house-api-final-admission-v1",
+    detail = {"schema": "house-api-final-admission-v1",
             "normalization_recipe": admission["binding"]["normalization_recipe"],
             "policy_identity": admission["binding"]["policy_identity"],
             "policy_sha256": admission["binding"]["policy_sha256"],
             "raw_result_id": admission["binding"]["raw_result_id"],
             "final_projection": actual, "final_projection_sha256": digest(actual),
             "final_projection_count": len(actual), "review_binding": admission["review_binding"],
-            "audit_binding": admission.get("audit_binding")}
+             "audit_binding": admission.get("audit_binding")}
+    if admission.get("source_proposal") is not None:
+        detail["source_proposal"] = admission["source_proposal"]
+        detail["source_review_lineage"] = admission["source_review_lineage"]
+    return detail
 
 
 def _replace_accepted_ocr_rows(

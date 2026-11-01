@@ -288,6 +288,11 @@ def _ingest_registered(db: Database, result, receipt: dict, predecessor: dict | 
             if not finished:
                 db.work.finish(receipt, disposition, result.detail or gate["reason"] or str(candidate["findings"] if candidate else []))
             return "needs_review" if finished else disposition
+        if gate.get("source_proposal") is not None and not finished:
+            # Source correction is a new decision, never a rewrite/retag of the
+            # original extraction result. Register that immutable refusal first.
+            db.work.finish(receipt, "needs_review", "source proposal requires a separate source-reviewed admission decision")
+            return "needs_review"
         if finished:
             receipt["admission_decision"] = {
                 "predecessor": predecessor, "result": result,
@@ -310,7 +315,8 @@ def _ingest_registered(db: Database, result, receipt: dict, predecessor: dict | 
                 work.doc_id, work.archive_year, work.member, candidate["rows"],
                 conn=db.conn, receipt=receipt, evidence=result.evidence,
                 admission=gate,
-                raw_count=len(result.rows), parser_version=work.extraction_recipe,
+                raw_count=len(candidate["rows"]) if gate.get("source_proposal") is not None else len(result.rows),
+                parser_version=work.extraction_recipe,
                 artifact_sha256=work.artifact_sha256, ingestion_generation=work.generation_id,
                 engine_model=model, checkpoint=False,
             )

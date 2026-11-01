@@ -318,7 +318,7 @@ def admission_guard(result: ResultBundle, data_dir):
     ):
         try:
             source_review = review_decision_locked(result, root)
-        except ValueError as exc:
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
             source_review = {"allowed": False, "reason": str(exc)}
         ai_authorized = (source_review["allowed"] and
                          source_review["review_binding"]["authority"] == POLICY["ai_authority"])

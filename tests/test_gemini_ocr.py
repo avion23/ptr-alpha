@@ -228,6 +228,9 @@ def test_validation_nulls_future_notification_without_filing_bound(monkeypatch):
 
 
 def test_verified_8220049_corrections_survive_raw_and_validated_projection(tmp_path):
+    from analyzer.ocr.normalization import normalize_rows
+    from analyzer.ocr.ingestion import _normalize_ocr_rows
+
     output = (Path(__file__).parent / "fixtures/8220049-ocr.txt").read_text()
     parsed = gemini_ocr_common.parse_gemini_output(output, expected_page_count=3)
     original = json.dumps(parsed.transactions, sort_keys=True)
@@ -256,7 +259,21 @@ def test_verified_8220049_corrections_survive_raw_and_validated_projection(tmp_p
                 FROM transactions ORDER BY source_row_id
             """).fetchall()
         assert rows == []
-        projected = _projection('8220049', txs, member=parsed.member, filing='2023-11-17', sha=sha)
+        typed, findings = normalize_rows('8220049', parsed.member, txs,
+                                         '2023-11-17', parsed.member, sha)
+        expected_policy = [
+            dict(occurrence=number, source_occurrence=number,
+                 field='notification_date', notification_date='2030-11-01',
+                 filing_date='2023-11-17')
+            for number in (6, 12)
+        ] if txs is parsed.transactions else []
+        assert findings == ({'notification_after_filing': expected_policy}
+                            if expected_policy else {})
+        projected, errors = _normalize_ocr_rows(
+            '8220049', parsed.member, typed, date(2023, 11, 17),
+            artifact_sha256=sha, ingestion_generation='test-house-generation',
+        )
+        assert not errors
         rows = [(row['source_row_id'], row['transaction_type'], row['notification_date']) for row in projected]
         assert len(rows) == 13
         by_row = {row[0]: row[1:] for row in rows}

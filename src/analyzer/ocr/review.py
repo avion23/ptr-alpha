@@ -385,7 +385,7 @@ def ai_review_report_template(result, data_dir, *, supersedes_admission_decision
     report.update(reviewer_id="", session_id="", review_mode="",
                   original_source_ledger="", original_source_ledger_sha256="",
                   ledger_comparison_attested=False, ledger_document_pointer="",
-                  ledger_pdf_sha256_pointer="", ledger_row_count_pointer="", ledger_absence_pointer="")
+                  ledger_pdf_sha256_pointer="", ledger_row_count_pointer="", ledger_rows_pointer="", ledger_absence_pointer="")
     if not material["projection"]:
         report["source_header"] = {"member": {
             "status": "unknown", "value": None, "literal": "", "page_number": None,
@@ -448,6 +448,9 @@ def _validate_ai_report(report, result, material, directory, data_dir):
                 or type(_ledger_at(ledger, source.get("ledger_row_count_pointer"), within=document_pointer)) is not int
                 or _ledger_at(ledger, source["ledger_row_count_pointer"], within=document_pointer) != len(material["projection"])):
             raise ValueError("original source document, artifact or actual occurrence count differs")
+        original_rows = _ledger_at(ledger, source.get("ledger_rows_pointer"), within=document_pointer)
+        if not isinstance(original_rows, list) or len(original_rows) != len(material["projection"]):
+            raise ValueError("original source ledger must cover every actual row occurrence")
         if source.get("supersedes_admission_decision_id") != report.get("supersedes_admission_decision_id"):
             raise ValueError("source report supersession differs")
         for index, key in enumerate(("reviewer_id", "session_id")):
@@ -487,7 +490,8 @@ def _validate_ai_report(report, result, material, directory, data_dir):
                     or not isinstance(absence.get("evidence_location"), str) or not absence["evidence_location"].strip()):
                 raise ValueError("empty source review requires original page-grounded absence observation")
         values = []
-        for row, expected in zip(source["rows"], material["projection"]):
+        for index, (row, expected) in enumerate(zip(source["rows"], material["projection"])):
+            original_row_pointer = source["ledger_rows_pointer"] + f"/{index}"
             fields = row.get("fields")
             if not isinstance(fields, dict) or set(fields) != set(POLICY["critical_fields"]):
                 raise ValueError("every critical field needs an observation")
@@ -506,6 +510,10 @@ def _validate_ai_report(report, result, material, directory, data_dir):
                     raise ValueError(f"source observation differs from current projection: {field}")
                 original = (None if status == "official_metadata" else
                             _original_observation(ledger, document_pointer, observation))
+                if field not in {"member", "disclosure_date"} and (
+                        not observation.get("ledger_pointer", "").startswith(original_row_pointer + "/")
+                        or page != row["page_number"]):
+                    raise ValueError("row field must reference its own original source occurrence and page")
                 if status == "not_reported":
                     if literal != "NotReported" or value not in (None, "unknown"):
                         raise ValueError("not-reported field must remain null/unknown")

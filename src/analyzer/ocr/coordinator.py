@@ -330,7 +330,7 @@ def run_pipeline(
     local_workers: int = 3, gemini_workers: int = 0, glm_workers: int = 0,
     refresh_recipe: bool = False, publish_every: int = 100,
     lease_seconds: int = 3600, database: Database | None = None,
-    doc_ids: list[str] | None = None,
+    doc_ids: list[str] | None = None, extract_doc_ids: list[str] | None = None,
 ) -> dict:
     """Drain ready work, including scoped GLM rate retries, with explicit API use.
 
@@ -360,6 +360,17 @@ def run_pipeline(
             # Unproven metadata scope must not replace an earlier publication
             # or start extraction work, including when the row query is empty.
             scope = _scope(db, years, doc_ids)
+            extraction_scope = scope
+            if extract_doc_ids is not None:
+                if not extract_doc_ids:
+                    raise DataSourceError("Extraction scope unknown: no document IDs requested")
+                requested = set(extract_doc_ids)
+                unknown = requested - {item["doc_id"] for item in scope}
+                if unknown:
+                    raise DataSourceError(
+                        f"Extraction document IDs outside official scope: {sorted(unknown)}"
+                    )
+                extraction_scope = [item for item in scope if item["doc_id"] in requested]
             source = HouseTransactionSource(settings, db=db)
             stack.callback(source.close)
             # Ownership may follow price, metadata, or other maintenance writes.
@@ -367,6 +378,10 @@ def run_pipeline(
             publication = db.publish_snapshot()
             scoped = {(s["archive_year"], s["generation_id"], s["doc_id"]): s for s in scope}
             scoped_doc_ids = sorted({s["doc_id"] for s in scope})
+            extraction_doc_ids = sorted({s["doc_id"] for s in extraction_scope})
+            extraction_bindings = {(*key, item["artifact_sha256"])
+                                   for key, item in scoped.items()
+                                   if item["doc_id"] in extraction_doc_ids}
             scoped_bindings = {(*key, item["artifact_sha256"]) for key, item in scoped.items()}
             unresolved = {(y, g): set(db.get_unresolved_house_doc_ids(y, g))
                           for y, g in {(s["archive_year"], s["generation_id"]) for s in scope}}
@@ -398,6 +413,7 @@ def run_pipeline(
                     db.work.register(work, priority=priority)
 
             def receive(path):
+                nonlocal publication
                 result = load_result(path)
                 key = (result.work.archive_year, result.work.generation_id, result.work.doc_id)
                 if key not in scoped:
@@ -439,6 +455,10 @@ def run_pipeline(
                     satisfied.add(binding(result.work))
                     eligible.discard(binding(result.work))
                     db.work.supersede_pending(result.work, "binding satisfied by an admitted extraction")
+                if (state in {"accepted", "verified_empty"}
+                        and prior not in {"accepted", "verified_empty"}
+                        and result.work.lane != ExtractionLane.LOCAL):
+                    publication = db.publish_snapshot()
                 if replaying and state == "needs_review":
                     replayed_reviews.append(result)
                 else:
@@ -451,15 +471,17 @@ def run_pipeline(
             # Receipts can reference a durable bundle outside the default spool.
             for receipt in db.work.pending_results(limit=2147483647):
                 receive(receipt["path"])
-            if doc_ids is None:
+            if doc_ids is None and extract_doc_ids is None:
                 db.work.recover_expired()
             else:
+                recovery_doc_ids = extraction_doc_ids if extract_doc_ids is not None else scoped_doc_ids
+                recovery_bindings = extraction_bindings if extract_doc_ids is not None else scoped_bindings
                 recovery_tasks = [task_id for task_id, envelope in db.conn.execute("""
                     SELECT task_id, envelope FROM extraction_work
                     WHERE status = 'running' AND lease_until <= CURRENT_TIMESTAMP
                       AND json_extract_string(envelope, '$.doc_id') IN (SELECT UNNEST(?))
-                """, [scoped_doc_ids]).fetchall()
-                    if binding(WorkEnvelope.from_dict(json.loads(envelope))) in scoped_bindings]
+                """, [recovery_doc_ids]).fetchall()
+                    if binding(WorkEnvelope.from_dict(json.loads(envelope))) in recovery_bindings]
                 db.conn.execute("""UPDATE extraction_work SET status = 'pending',
                     lease_until = NULL, updated_at = CURRENT_TIMESTAMP
                     WHERE task_id IN (SELECT UNNEST(?))
@@ -486,7 +508,7 @@ def run_pipeline(
                 if finished_at is not None:
                     key = binding(work)
                     accepted_at[key] = max(accepted_at.get(key, finished_at), finished_at)
-            for item in scope:
+            for item in extraction_scope:
                 key = (item["archive_year"], item["generation_id"], item["doc_id"], item["artifact_sha256"])
                 needed = item["doc_id"] in unresolved[item["archive_year"], item["generation_id"]]
                 if needed:
@@ -506,7 +528,13 @@ def run_pipeline(
             obsolete_paid = {}
             for work, state, _ in known.values():
                 key = (work.archive_year, work.generation_id, work.doc_id)
-                if key in scoped and binding(work) not in eligible and state in {"pending", "retry_wait"}:
+                is_selected_for_extraction = binding(work) in extraction_bindings
+                is_resolved = (work.doc_id not in unresolved.get(
+                    (work.archive_year, work.generation_id), set()
+                ))
+                if (key in scoped and state in {"pending", "retry_wait"}
+                        and ((is_selected_for_extraction and binding(work) not in eligible)
+                             or (not is_selected_for_extraction and is_resolved))):
                     obsolete.append(work)
                 elif (key in scoped and work.lane != ExtractionLane.LOCAL
                       and work.doc_id not in unresolved[work.archive_year, work.generation_id]
@@ -544,7 +572,7 @@ def run_pipeline(
             # Freeze source bytes only within a small rolling seed window.
             # The official generation remains the durable inventory for items
             # not yet materialized into extraction envelopes.
-            seeds = iter(sorted(scope, key=lambda s:
+            seeds = iter(sorted(extraction_scope, key=lambda s:
                 s["doc_id"] not in unresolved[s["archive_year"], s["generation_id"]]))
             seeds_done = False
 
@@ -586,7 +614,7 @@ def run_pipeline(
                         CAST(json_extract_string(w.envelope, '$.page_count') AS INTEGER),
                         w.task_id LIMIT ?
                 """, [lane.value, recipes[lane], sorted({s["archive_year"] for s in scope}),
-                       scoped_doc_ids, doc_ids is None, retry_delay, limit]).fetchall()
+                       extraction_doc_ids, doc_ids is None, retry_delay, limit]).fetchall()
 
             pools = {}
             for lane in lanes:
@@ -636,8 +664,72 @@ def run_pipeline(
                         delays.append(delay)
                 return time.monotonic() + min(delays) if delays else None
 
+            review_seen = {}
+            review_poll_seconds = 30
+            next_review_poll = 0.0
+
+            def poll_review_inbox():
+                """Apply changed native review selectors to their registered raw result only."""
+                from analyzer.ocr.ingestion import read_work_artifact
+
+                review_dir = spool / "reviews"
+                try:
+                    paths = sorted(review_dir.glob("*.json"))
+                except OSError:
+                    return
+                present = {path.name for path in paths}
+                for missing in review_seen.keys() - present:
+                    del review_seen[missing]
+                for selector_path in paths:
+                    raw_id = selector_path.stem
+                    if (len(raw_id) != 64
+                            or any(char not in "0123456789abcdef" for char in raw_id)):
+                        continue
+                    try:
+                        stat = selector_path.stat()
+                        content = read_work_artifact(base, selector_path)
+                    except (OSError, RuntimeError):
+                        continue
+                    content_sha = hashlib.sha256(content).hexdigest()
+                    stat_signature = (stat.st_mtime_ns, stat.st_size, content_sha)
+                    previous = review_seen.get(selector_path.name)
+                    if previous is not None and previous[:3] == stat_signature:
+                        continue
+                    try:
+                        selection = json.loads(content)
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        signature = (*stat_signature, raw_id, None)
+                        review_seen[selector_path.name] = signature
+                        continue
+                    binding_data = selection.get("binding") if isinstance(selection, dict) else None
+                    verdict_sha = selection.get("verdict_sha256") if isinstance(selection, dict) else None
+                    signature = (*stat_signature, raw_id, verdict_sha)
+                    if (not isinstance(binding_data, dict)
+                            or binding_data.get("raw_result_id") != raw_id
+                            or not isinstance(verdict_sha, str) or len(verdict_sha) != 64
+                            or any(char not in "0123456789abcdef" for char in verdict_sha)):
+                        review_seen[selector_path.name] = signature
+                        continue
+                    row = db.conn.execute("""SELECT path, state, finished_at FROM extraction_results
+                        WHERE result_id = ?""", [raw_id]).fetchone()
+                    if row is None:
+                        # A selector may arrive just before its worker result is registered.
+                        continue
+                    review_seen[selector_path.name] = signature
+                    path, state, finished_at = row
+                    if finished_at is not None and state != "needs_review":
+                        continue
+                    receive(path)
+
+            def review_poll_deadline():
+                return next_review_poll
+
             completed = 0
             while True:
+                now = time.monotonic()
+                if now >= next_review_poll:
+                    poll_review_inbox()
+                    next_review_poll = time.monotonic() + review_poll_seconds
                 if not seeds_done:
                     window = max(1, sum(capacities.values()) * 2)
                     budget = window - len(ready(lanes[0], window))
@@ -682,12 +774,13 @@ def run_pipeline(
                     if retry_wakeup is not None:
                         # Unknown quota errors retain their whole-lane backoff.
                         deadline = max(retry_wakeup, lane_backoff[ExtractionLane.GLM])
-                        delay = deadline - time.monotonic()
+                        delay = min(deadline, review_poll_deadline()) - time.monotonic()
                         if delay > 0:
                             time.sleep(delay)
                         continue
                     break
-                timeout = max(0, min(wakeups) - time.monotonic()) if wakeups else None
+                wakeups.append(review_poll_deadline())
+                timeout = max(0, min(wakeups) - time.monotonic())
                 done, _ = wait(running, timeout=timeout, return_when=FIRST_COMPLETED)
                 for future in done:
                     work = running.pop(future)

@@ -774,6 +774,9 @@ def pipeline(
     data_dir: str = typer.Option("data", help="Data directory"),
     year: list[int] | None = typer.Option(None, "--year", help="Official archive year; repeatable"),
     doc_id: list[str] | None = typer.Option(None, "--doc-id", help="Official PTR document ID; repeatable"),
+    extract_doc_id: list[str] | None = typer.Option(
+        None, "--extract-doc-id", help="Restrict extraction and paid work; repeatable"
+    ),
     status: bool = typer.Option(False, "--status", help="Read published work/status without starting workers"),
     local_workers: int = typer.Option(3, min=0),
     gemini_workers: int = typer.Option(0, min=0, help="Explicit billable Gemini slots; zero disables Gemini"),
@@ -787,8 +790,12 @@ def pipeline(
 
     routed_scope = {"doc_ids": doc_id} if doc_id is not None else {}
     if status:
+        if extract_doc_id is not None:
+            _cli_exit(1, "--extract-doc-id applies only when running the pipeline")
         result = pipeline_status(data_dir, years=year, **routed_scope)
     else:
+        if extract_doc_id is not None:
+            routed_scope["extract_doc_ids"] = extract_doc_id
         result = run_pipeline(data_dir, year, local_workers=local_workers,
                               gemini_workers=gemini_workers, glm_workers=glm_workers,
                               refresh_recipe=refresh_recipe, publish_every=publish_every, **routed_scope)

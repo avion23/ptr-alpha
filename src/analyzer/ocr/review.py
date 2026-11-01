@@ -53,6 +53,8 @@ def digest(value):
 
 def _ledger_at(ledger, pointer, *, within=None):
     """Resolve a local JSON pointer; no evaluation, guessing or cross-document lookup."""
+    if pointer == "" and within is None:
+        return ledger
     if (not isinstance(pointer, str) or not pointer.startswith("/")
             or (within is not None and not pointer.startswith(within + "/"))):
         raise ValueError("exact original-ledger JSON pointer required")

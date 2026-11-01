@@ -774,7 +774,7 @@ def pipeline(
     data_dir: str = typer.Option("data", help="Data directory"),
     year: list[int] | None = typer.Option(None, "--year", help="Official archive year; repeatable"),
     doc_id: list[str] | None = typer.Option(None, "--doc-id", help="Official PTR document ID; repeatable"),
-    extract_doc_id: list[str] | None = typer.Option(
+    extract_doc_id: list[str] | None = typer.Option(  # noqa: B008
         None, "--extract-doc-id", help="Restrict extraction and paid work; repeatable"
     ),
     status: bool = typer.Option(False, "--status", help="Read published work/status without starting workers"),

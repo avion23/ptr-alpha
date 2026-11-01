@@ -23,6 +23,7 @@ POLICY = {
     ],
     "coverage": "all source pages, all row occurrences, every critical field; omissions included",
     "ai_authority": "independent-ai-source-review-v1",
+    "render_dpi": 180,
     "ai_requirements": "two independent sessions; pixel citations; all field observations; original UTF-8 ledgers with SHA-256; local source-checking and faithful comparison attestations; blind ledger binding is post-review",
 }
 
@@ -213,7 +214,7 @@ def prepare_review(result, data_dir, *, database=None, supersedes_admission_deci
         directory = bundle_directory(root, material)
         record = bundle_record(result, material)
         content = read_work_artifact(root, result.work.artifact_path)
-        emit_bound_review_bundle(root, directory, encode(record), content)
+        emit_bound_review_bundle(root, directory, encode(record), content, render_dpi=POLICY["render_dpi"])
         _validate_bundle(root, directory, record)
         required = supersedes_admission_decision_id
         if database is not None:

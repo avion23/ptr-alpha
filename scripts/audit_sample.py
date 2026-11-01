@@ -801,7 +801,7 @@ def _emit_attempt_bundle(data_dir, year, doc_id, record_bytes, *, render):
         emit_bound_review_bundle(data_dir, doc_dir, record_bytes, pdf_bytes)
 
 
-def emit_bound_review_bundle(data_dir, doc_dir: Path, record_bytes: bytes, pdf_bytes: bytes):
+def emit_bound_review_bundle(data_dir, doc_dir: Path, record_bytes: bytes, pdf_bytes: bytes, *, render_dpi=RENDER_DPI):
     """Freeze actual source pixels and a bound candidate using the shared seal."""
     from analyzer.ocr.common import pdf_page_count
     from analyzer.ocr.ingestion import approved_data_root
@@ -828,7 +828,7 @@ def emit_bound_review_bundle(data_dir, doc_dir: Path, record_bytes: bytes, pdf_b
             snapshot.write_bytes(pdf_bytes)
             if pdf_page_count(snapshot) != record.get("pages"):
                 raise ValueError("staged page count does not match PDF")
-            render_pdf_pages(snapshot, temporary / "pages")
+            render_pdf_pages(snapshot, temporary / "pages", dpi=render_dpi)
             (temporary / "record.json").write_bytes(record_bytes)
             # Validate through the approved root before publishing the completed directory.
             rooted_temporary = doc_dir.parent / temporary.name

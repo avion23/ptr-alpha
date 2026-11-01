@@ -348,10 +348,21 @@ def _admission_decision_locked(result: ResultBundle, data_dir, *, ai_source_revi
         return {"allowed": True, "reason": "candidate; writer validation required", "audit_binding": None}
     from scripts import glm_stage
 
-    record = glm_stage.load_staging_record(data_dir, result.work.archive_year, result.work.doc_id)
     expected = result.evidence.get("staging_record")
-    if record is None or expected is None or glm_stage.audit_staged_record_sha256(record) != glm_stage.audit_staged_record_sha256(expected):
-        return {**refused, "reason": "staging evidence missing or changed"}
+    if ai_source_review:
+        if expected is None:
+            return {**refused, "reason": "staging evidence missing or changed"}
+        try:
+            # AI source review is bound to this immutable result; a later GLM
+            # attempt may legitimately have replaced the mutable staging pointer.
+            record = glm_stage.decode_staging_record(_encode(expected))
+        except (TypeError, ValueError, KeyError):
+            return {**refused, "reason": "staging evidence missing or changed"}
+    else:
+        record = glm_stage.load_staging_record(data_dir, result.work.archive_year, result.work.doc_id)
+        if (record is None or expected is None
+                or glm_stage.audit_staged_record_sha256(record) != glm_stage.audit_staged_record_sha256(expected)):
+            return {**refused, "reason": "staging evidence missing or changed"}
     if ai_source_review:
         expected_identity = {"doc_id": result.work.doc_id, "year": result.work.archive_year,
                              "archive_year": result.work.archive_year,

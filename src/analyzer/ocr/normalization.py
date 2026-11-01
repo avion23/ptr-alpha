@@ -278,7 +278,7 @@ def raw_cell_consistency_findings(row, occurrence):
                     checkbox_columns.append((child_source_key, child_value, claim))
                     handled = True
                 elif (exact_field == "amount_raw" and isinstance(child_key, str)
-                      and child_key.strip().upper() in set("ABCDEFGHIJ")):
+                      and re.fullmatch(r"[a-z]", child_normalized)):
                     if isinstance(child_value, dict):
                         amount_letter_columns(child_source_key, child_value, checkbox_columns)
                         handled = True

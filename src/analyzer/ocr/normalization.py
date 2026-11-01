@@ -11,7 +11,7 @@ from analyzer.ocr.contracts import ExtractionLane, WorkEnvelope, ResultBundle
 from analyzer.parsing.cells import extract_owner_code
 from analyzer.parsing.columns import _normalize_header
 
-NORMALIZATION_RECIPE = "house-ocr-normalization-v4"
+NORMALIZATION_RECIPE = "house-ocr-normalization-v5"
 
 
 def typed_instrument_fields(row):
@@ -144,38 +144,38 @@ def raw_cell_consistency_findings(row, occurrence):
             report(field, source_key, "source_unreadable_or_ambiguous")
         elif blank(target):
             report(field, source_key, "typed_omission")
-        elif parsers[field](target) != source_claim:
-            report(field, source_key, "typed_source_mismatch")
+        else:
+            target_claim = parsers[field](target)
+            if field == "amount_raw" and target_claim is not None and (
+                source_claim[0] == "band" or target_claim[0] == "band"
+            ) and source_claim != target_claim:
+                report(field, source_key, "amount_letters_without_source_legend")
+            elif target_claim != source_claim:
+                report(field, source_key, "typed_source_mismatch")
 
     # Checkbox claims are grouped: an empty Purchase column is not a denial
     # of a marked Sale column. Multiple selections are ambiguous, not votes.
     checkboxes = {"type": [], "owner": [], "amount_raw": []}
-    for key, value in cells.items():
-        if not isinstance(key, str):
-            continue
-        header = _normalize_header(key)
-        field = next((field for field, aliases in headings.items() if header in aliases), None)
-        if field is not None:
-            compare(field, key, value)
-            continue
-        if header in {"purchase", "sale", "exchange"}:
-            field, claim = "type", header.title()
-        elif header in {"sp", "jt", "dc"}:
-            field, claim = "owner", header.upper()
-        elif normalize_amount(key)["amount_kind"] in {"range", "open"}:
-            field, claim = "amount_raw", key
-        else:
-            continue
-        checkboxes[field].append((key, value, claim))
 
-    for field, columns in checkboxes.items():
-        if not columns:
-            continue
+    def option(key):
+        header = _normalize_header(key)
+        if header in {"purchase", "sale", "exchange"}:
+            return "type", header.title()
+        if header in {"sp", "jt", "dc"}:
+            return "owner", header.upper()
+        if normalize_amount(key)["amount_kind"] in {"range", "open"}:
+            return "amount_raw", key
+        return None, None
+
+    def compare_group(field, columns):
         marked = []
         for key, value, claim in columns:
             if blank(value):
                 continue
-            if isinstance(value, str) and value.strip().casefold() in {"x", "[x]", "✓", "✔", "☑"}:
+            if isinstance(value, str) and (
+                value.strip().casefold() in {"x", "[x]", "✓", "✔", "☑"}
+                or field == "owner" and value.strip().upper() == claim
+            ):
                 marked.append((key, claim))
             else:
                 report(field, key, "source_unreadable_or_ambiguous")
@@ -184,21 +184,79 @@ def raw_cell_consistency_findings(row, occurrence):
                 report(field, key, "multiple_source_selections")
         elif marked:
             compare(field, *marked[0])
-        elif not blank(typed[field]):
+        elif all(blank(value) for _, value, _ in columns) and not blank(typed[field]):
             report(field, columns[0][0], "source_blank_typed_populated")
+
+    for key, value in cells.items():
+        if not isinstance(key, str):
+            continue
+        header = _normalize_header(key)
+        field = next((field for field, aliases in headings.items() if header in aliases), None)
+        if field is not None:
+            if field in checkboxes and isinstance(value, dict) and value:
+                columns = []
+                for nested_key, nested_value in value.items():
+                    nested_field, claim = option(nested_key) if isinstance(nested_key, str) else (None, None)
+                    if nested_field != field:
+                        # A blank ancillary option makes no claim. Never interpret
+                        # a populated unknown heading (including band letters).
+                        if blank(nested_value):
+                            continue
+                        break
+                    columns.append((f"{key}.{nested_key}", nested_value, claim))
+                else:
+                    if columns:
+                        compare_group(field, columns)
+                        continue
+            compare(field, key, value)
+            continue
+        field, claim = option(key)
+        if field is None:
+            continue
+        checkboxes[field].append((key, value, claim))
+
+    for field, columns in checkboxes.items():
+        if not columns:
+            continue
+        compare_group(field, columns)
     return findings
 
 
 def normalize_rows(doc_id, member, transactions, filing_date, expected_member, artifact_sha256):
     """Shared admission/cache projection, preserving order and repeated occurrences."""
-    from analyzer.ocr.common import apply_verified_house_corrections, validate_transactions, _strict_date
+    from analyzer.ocr.common import (
+        _strict_date,
+        _tx_notification_date,
+        apply_verified_house_corrections,
+        validate_transactions,
+    )
 
     raw = apply_verified_house_corrections(doc_id, artifact_sha256, deepcopy(transactions))
     filing = _strict_date(filing_date)
     if filing is None:
         return [], {"invalid_filing_date": len(raw) or 1}
-    rows, findings = validate_transactions(doc_id, member, raw, filing_date, expected_member, as_of_date=filing)
-    for occurrence, row in enumerate(rows, 1):
+    rows, findings = [], {}
+    if not raw:
+        return validate_transactions(doc_id, member, raw, filing_date, expected_member, as_of_date=filing)
+    # Validate individually to retain the original occurrence/claims across row
+    # rejection and notification-date clearing; never attach tracking fields to raw.
+    for source_occurrence, claim in enumerate(raw, 1):
+        valid, rejected = validate_transactions(doc_id, member, [claim], filing_date, expected_member, as_of_date=filing)
+        for key, count in rejected.items():
+            findings[key] = findings.get(key, 0) + count
+        if not valid:
+            continue
+        row = valid[0]
+        rows.append(row)
+        occurrence = len(rows)
+        conflicts = raw_cell_consistency_findings(claim, occurrence)
+        notification_claim = _strict_date(_tx_notification_date(claim))
+        if notification_claim is not None and notification_claim > filing:
+            findings.setdefault("notification_after_filing", []).append({
+                "occurrence": occurrence, "source_occurrence": source_occurrence,
+                "field": "notification_date", "notification_date": notification_claim.isoformat(),
+                "filing_date": filing.isoformat(),
+            })
         row["raw_instrument_type"] = row.get("raw_instrument_type", row.get("instrument_type"))
         row["raw_strike_price"] = row.get("raw_strike_price", row.get("strike_price"))
         try:
@@ -214,7 +272,6 @@ def normalize_rows(doc_id, member, transactions, filing_date, expected_member, a
         row["raw_owner"] = owner
         row["owner_code"] = extract_owner_code(owner)
         row["occurrence"] = occurrence
-        conflicts = raw_cell_consistency_findings(row, occurrence)
         if conflicts:
             findings.setdefault("raw_cell_consistency", []).extend(conflicts)
     return rows, findings

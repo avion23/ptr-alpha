@@ -36,7 +36,7 @@ def provider_code(result) -> str | None:
     return str(code) if isinstance(code, (str, int)) and not isinstance(code, bool) else None
 
 
-def _scope(db: Database, years: list[int] | None) -> list[dict]:
+def _scope(db: Database, years: list[int] | None, doc_ids: list[str] | None = None) -> list[dict]:
     """Official latest-generation PTR scope, including missing acquisitions."""
     if years == []:
         raise DataSourceError("House archive scope unknown: no archive years requested")
@@ -86,32 +86,56 @@ def _scope(db: Database, years: list[int] | None) -> list[dict]:
         WHERE m.filing_type = 'P'
         ORDER BY m.archive_year, m.doc_id
     """).fetchall()
-    return [dict(archive_year=int(y), generation_id=g, doc_id=str(d),
+    scope = [dict(archive_year=int(y), generation_id=g, doc_id=str(d),
                  first_name=f or "", last_name=l or "", filing_date=str(dt)[:10],
                  artifact_sha256=sha)
             for y, g, d, f, l, dt, sha in rows if years is None or y in years]
+    if doc_ids is None:
+        return scope
+    if not doc_ids:
+        raise DataSourceError("House archive scope unknown: no document IDs requested")
+    requested = set(doc_ids)
+    unknown = requested - {item["doc_id"] for item in scope}
+    if unknown:
+        raise DataSourceError(f"Document IDs outside official requested-year PTR scope: {sorted(unknown)}")
+    return [item for item in scope if item["doc_id"] in requested]
 
 
 def pipeline_status(data_dir: str | Path, *, years: list[int] | None = None,
-                    database: Database | None = None) -> dict:
+                    database: Database | None = None, doc_ids: list[str] | None = None) -> dict:
     """Read one published version, or project the already-owned writer connection."""
     from analyzer.persistence.ownership import publication_state, resolve_read_path
 
     path = Path(data_dir) / "congress.duckdb"
     with nullcontext(database) if database is not None else Database(resolve_read_path(path), read_only=True) as db:
-        scope = _scope(db, years)
+        scope = _scope(db, years, doc_ids)
         generations = {(s["archive_year"], s["generation_id"]) for s in scope}
         unresolved_docs = {(y, g, d) for y, g in generations
                            for d in db.get_unresolved_house_doc_ids(y, g)}
+        if doc_ids is not None:
+            unresolved_docs &= {(s["archive_year"], s["generation_id"], s["doc_id"]) for s in scope}
         unresolved = len(unresolved_docs)
         import json
         from collections import Counter
 
         tasks = {}
-        for envelope, state in db.conn.execute("SELECT envelope, status FROM extraction_work").fetchall():
+        selected_tasks = []
+        work_counts = Counter()
+        scoped = {(s["archive_year"], s["generation_id"], s["doc_id"]): s for s in scope}
+        for task_id, envelope, state in db.conn.execute("SELECT task_id, envelope, status FROM extraction_work").fetchall():
             item = json.loads(envelope)
             key = (item.get("archive_year"), item.get("generation_id"), item.get("doc_id"))
+            if doc_ids is not None and (key not in scoped
+                    or item.get("artifact_sha256") != scoped[key]["artifact_sha256"]):
+                continue
+            selected_tasks.append(task_id)
+            work_counts[state] += 1
             tasks.setdefault(key, set()).add(state)
+        work_status = db.work.status() if doc_ids is None else {
+            "total": sum(work_counts.values()), "by_state": dict(work_counts),
+            "results": db.conn.execute("SELECT COUNT(*) FROM extraction_results WHERE task_id IN (SELECT UNNEST(?))",
+                                       [selected_tasks]).fetchone()[0],
+        }
         counts = Counter()
         for item in scope:
             key = (item["archive_year"], item["generation_id"], item["doc_id"])
@@ -123,7 +147,7 @@ def pipeline_status(data_dir: str | Path, *, years: list[int] | None = None,
                           if s in states), "unstarted")
             counts["blocked" if not item["artifact_sha256"] else state] += 1
         return {"scope": len(scope), "unresolved": unresolved,
-                "resolved": len(scope) - unresolved, "work": db.work.status(),
+                "resolved": len(scope) - unresolved, "work": work_status,
                 "documents": {"total": len(scope), "by_state": dict(counts)},
                 "required_without_acquisition": sum(not s["artifact_sha256"] for s in scope),
                 "publication": publication_state(path)}
@@ -294,6 +318,7 @@ def run_pipeline(
     local_workers: int = 3, gemini_workers: int = 0, glm_workers: int = 0,
     refresh_recipe: bool = False, publish_every: int = 100,
     lease_seconds: int = 3600, database: Database | None = None,
+    doc_ids: list[str] | None = None,
 ) -> dict:
     """Drain ready work, including scoped GLM rate retries, with explicit API use.
 
@@ -319,16 +344,18 @@ def run_pipeline(
     settings = Settings()
     settings.data.data_dir = str(base)
     with nullcontext(database) if database is not None else Database(base / "congress.duckdb") as db:
-        source = HouseTransactionSource(settings, db=db)
         with ExitStack() as stack:
-            stack.callback(source.close)
             # Unproven metadata scope must not replace an earlier publication
             # or start extraction work, including when the row query is empty.
-            scope = _scope(db, years)
+            scope = _scope(db, years, doc_ids)
+            source = HouseTransactionSource(settings, db=db)
+            stack.callback(source.close)
             # Ownership may follow price, metadata, or other maintenance writes.
             # A document-only signature cannot establish whole-database freshness.
             publication = db.publish_snapshot()
             scoped = {(s["archive_year"], s["generation_id"], s["doc_id"]): s for s in scope}
+            scoped_doc_ids = sorted({s["doc_id"] for s in scope})
+            scoped_bindings = {(*key, item["artifact_sha256"]) for key, item in scoped.items()}
             unresolved = {(y, g): set(db.get_unresolved_house_doc_ids(y, g))
                           for y, g in {(s["archive_year"], s["generation_id"]) for s in scope}}
             missing_years = []
@@ -362,6 +389,8 @@ def run_pipeline(
                 result = load_result(path)
                 key = (result.work.archive_year, result.work.generation_id, result.work.doc_id)
                 if key not in scoped:
+                    return
+                if doc_ids is not None and binding(result.work) not in scoped_bindings:
                     return
                 raw_receipt, predecessor = _register_receipt(db, result, Path(path))
                 prior = predecessor["state"] if predecessor is not None else "extracted"
@@ -410,7 +439,22 @@ def run_pipeline(
             # Receipts can reference a durable bundle outside the default spool.
             for receipt in db.work.pending_results(limit=2147483647):
                 receive(receipt["path"])
-            db.work.recover_expired()
+            if doc_ids is None:
+                db.work.recover_expired()
+            else:
+                recovery_tasks = [task_id for task_id, envelope in db.conn.execute("""
+                    SELECT task_id, envelope FROM extraction_work
+                    WHERE status = 'running' AND lease_until <= CURRENT_TIMESTAMP
+                      AND json_extract_string(envelope, '$.doc_id') IN (SELECT UNNEST(?))
+                """, [scoped_doc_ids]).fetchall()
+                    if binding(WorkEnvelope.from_dict(json.loads(envelope))) in scoped_bindings]
+                db.conn.execute("""UPDATE extraction_work SET status = 'pending',
+                    lease_until = NULL, updated_at = CURRENT_TIMESTAMP
+                    WHERE task_id IN (SELECT UNNEST(?))
+                      AND NOT EXISTS (SELECT 1 FROM extraction_results r
+                          WHERE r.task_id = extraction_work.task_id
+                            AND r.attempt_id = extraction_work.attempt_id
+                            AND r.finished_at IS NULL)""", [recovery_tasks])
             # Resolve canonical scope once, not through the global canonical
             # view for every dispatch. Ledger timestamps distinguish a resumed
             # refresh from an older success on the same immutable binding.
@@ -424,6 +468,8 @@ def run_pipeline(
                 WHERE w.lane IS NOT NULL
             """).fetchall():
                 work = WorkEnvelope.from_dict(json.loads(envelope))
+                if doc_ids is not None and binding(work) not in scoped_bindings:
+                    continue
                 known[work.task_id] = (work, state, claimed_at)
                 if finished_at is not None:
                     key = binding(work)
@@ -508,7 +554,12 @@ def run_pipeline(
                       ON m.archive_year = g.archive_year AND m.generation_id = g.generation_id
                      AND m.doc_id = json_extract_string(w.envelope, '$.doc_id')
                     WHERE w.lane = ? AND json_extract_string(w.envelope, '$.extraction_recipe') = ?
-                      AND m.filing_type = 'P' AND g.archive_year IN (SELECT UNNEST(?))
+                       AND m.filing_type = 'P' AND g.archive_year IN (SELECT UNNEST(?))
+                       AND m.doc_id IN (SELECT UNNEST(?))
+                       AND (? OR EXISTS (SELECT 1 FROM house_pdf_artifacts a
+                           WHERE a.archive_year = g.archive_year AND a.generation_id = g.generation_id
+                             AND a.doc_id = m.doc_id
+                             AND a.artifact_sha256 = json_extract_string(w.envelope, '$.artifact_sha256')))
                        AND (w.status = 'pending' OR (w.status = 'retry_wait'
                             AND w.retry_at <= CURRENT_TIMESTAMP + (? * INTERVAL '1 SECOND')))
                       AND NOT EXISTS (
@@ -521,7 +572,7 @@ def run_pipeline(
                       )
                     ORDER BY w.priority DESC, w.task_id LIMIT ?
                 """, [lane.value, recipes[lane], sorted({s["archive_year"] for s in scope}),
-                       retry_delay, limit]).fetchall()
+                       scoped_doc_ids, doc_ids is None, retry_delay, limit]).fetchall()
 
             pools = {}
             for lane in lanes:
@@ -660,7 +711,7 @@ def run_pipeline(
                 if not db.get_unresolved_house_doc_ids(year, generation):
                     db.mark_house_generation_parse_complete(year, generation)
             publication = db.publish_snapshot()
-            return {**pipeline_status(base, years=years, database=db),
+            return {**pipeline_status(base, years=years, database=db, doc_ids=doc_ids),
                     "completed_attempts": completed, "missing_years": missing_years,
                     "snapshot": publication,
                     **({"APIquota_exhausted": True,

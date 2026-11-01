@@ -173,7 +173,7 @@ def _raw_cell_columns(text: str) -> list[list[str]]:
 def parse_gemini_output(
     output: str, *, expected_page_count: int | None = None
 ) -> ParsedGeminiOutput:
-    """Parse a complete response and require an outcome for every PDF page."""
+    """Parse all pages; a COLUMNS prelude binds only to its immediately next PAGE."""
     if not isinstance(output, str) or not output.strip():
         raise GeminiOutputError("empty_response")
     schema_version = 4 if "SCHEMA: 4" in output.splitlines() else 3
@@ -190,17 +190,27 @@ def parse_gemini_output(
     if member_starts:
         output = "\n".join(raw_lines[member_starts[-1] :])
 
+    lines = output.splitlines()
+    next_nonempty_line: list[str | None] = [None] * len(lines)
+    following_line: str | None = None
+    for index in range(len(lines) - 1, -1, -1):
+        next_nonempty_line[index] = following_line
+        if lines[index].strip():
+            following_line = lines[index].strip()
+
     member: str | None = None
     declared_page_count: int | None = None
     current_page: int | None = None
     raw_cell_columns: list[list[str]] | None = None
+    pending_page_columns: list[list[str]] | None = None
     transactions: list[dict] = []
     raw_row_count = 0
     declared_pages: set[int] = set()
     page_has_rows: set[int] = set()
     page_has_no_transactions: set[int] = set()
 
-    for line_number, raw_line in enumerate(output.splitlines(), start=1):
+    for line_index, raw_line in enumerate(lines):
+        line_number = line_index + 1
         line = raw_line.strip()
         if not line:
             continue
@@ -240,15 +250,35 @@ def parse_gemini_output(
             if current_page in declared_pages:
                 raise GeminiOutputError(f"line {line_number}: duplicate page")
             declared_pages.add(current_page)
-            raw_cell_columns = None
+            raw_cell_columns = pending_page_columns
+            pending_page_columns = None
             continue
         if line.startswith("COLUMNS:"):
-            if schema_version != 4 or current_page is None:
-                raise GeminiOutputError(f"line {line_number}: COLUMNS requires schema 4 PAGE")
+            if schema_version != 4:
+                raise GeminiOutputError(f"line {line_number}: COLUMNS requires schema 4")
             try:
-                raw_cell_columns = _raw_cell_columns(line.split(":", 1)[1].strip())
+                columns = _raw_cell_columns(line.split(":", 1)[1].strip())
             except ValueError as exc:
                 raise GeminiOutputError(f"line {line_number}: invalid COLUMNS JSON: {exc}") from exc
+            next_line = next_nonempty_line[line_index]
+            # A declaration directly before PAGE is that page's local prelude,
+            # never a global schema and never inherited by a later page.
+            if current_page is None or (next_line and next_line.upper().startswith("PAGE:")):
+                if declared_page_count is None or not (
+                    next_line and next_line.upper().startswith("PAGE:")
+                ):
+                    raise GeminiOutputError(
+                        f"line {line_number}: page-local COLUMNS prelude must immediately precede PAGE"
+                    )
+                if pending_page_columns is not None:
+                    raise GeminiOutputError(f"line {line_number}: duplicate pending COLUMNS")
+                pending_page_columns = columns
+            else:
+                if current_page in page_has_no_transactions:
+                    raise GeminiOutputError(
+                        f"line {line_number}: COLUMNS after NO_TRANSACTIONS"
+                    )
+                raw_cell_columns = columns
             continue
         if line == "NO_TRANSACTIONS":
             if current_page is None:

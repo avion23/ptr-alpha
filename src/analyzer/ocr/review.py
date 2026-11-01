@@ -674,8 +674,6 @@ def review_decision_locked(result, data_dir):
         if not history or any(item["verdict"] == "fail" for item in history):
             raise ValueError("missing or failed source review")
         entry = history[-1]
-        if selection is not None and selection["verdict_sha256"] != digest(entry):
-            raise ValueError("selected source review verdict changed")
         if entry["authority"] not in {POLICY["authority"], POLICY["ai_authority"]} or entry["binding"] != material["binding"]:
             raise ValueError("review is not locally authorized for this exact candidate")
         seal = hashlib.sha256(read_work_artifact(data_dir, directory / "bundle-seal.json")).hexdigest()
@@ -685,6 +683,8 @@ def review_decision_locked(result, data_dir):
             _validate_ai_report(entry["report"], result, material, directory, data_dir)
         else:
             _validate_report(entry["report"], result, material, "pass")
+        if selection is not None and selection["verdict_sha256"] != digest(entry):
+            raise ValueError("selected source review verdict changed")
         if _has_failed_projection(data_dir, material, result):
             raise ValueError("failed candidate requires re-extraction, not a later pass")
     except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:

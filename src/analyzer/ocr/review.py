@@ -1,7 +1,7 @@
 """Producer-neutral, operator-recorded source review of immutable API results.
 
 The local filesystem/recording command is the operator trust boundary, not a
- provider's evidence dictionary. Independent AI source review is explicitly labelled.
+provider's evidence dictionary. Independent AI source review is explicitly labelled.
 All writers and admission hold the existing audit-root lock before doc locks.
 """
 from __future__ import annotations
@@ -23,7 +23,7 @@ POLICY = {
     ],
     "coverage": "all source pages, all row occurrences, every critical field; omissions included",
     "ai_authority": "independent-ai-source-review-v1",
-    "ai_requirements": "two independent sessions; pixel citations; all field observations; local source-checking attestation",
+    "ai_requirements": "two independent sessions; pixel citations; all field observations; original UTF-8 ledgers with SHA-256; local source-checking and faithful comparison attestations; blind ledger binding is post-review",
 }
 
 
@@ -299,7 +299,9 @@ def ai_review_report_template(result, data_dir, *, supersedes_admission_decision
     seal = json.loads(read_work_artifact(data_dir, directory / "bundle-seal.json"))
     report = review_report_template(result, material,
                                    supersedes_admission_decision_id=supersedes_admission_decision_id)
-    report.update(reviewer_id="", session_id="")
+    report.update(reviewer_id="", session_id="", review_mode="",
+                  original_source_ledger="", original_source_ledger_sha256="",
+                  ledger_comparison_attested=False)
     for page, image in zip(report["pages"], seal["pages"]):
         page["image_sha256"] = image["sha256"]
     for row in report["rows"]:
@@ -313,8 +315,9 @@ def ai_review_report_template(result, data_dir, *, supersedes_admission_decision
 
 def _validate_ai_report(report, result, material, directory, data_dir):
     from analyzer.ocr.ingestion import read_work_artifact
-    from analyzer.ocr.common import _strict_date
+    from analyzer.ocr.common import _strict_date, _normalize_tx_type, validate_transactions
     from analyzer.ocr.normalization import normalize_amount
+    from analyzer.parsing.cells import extract_owner_code
 
     _validate_report(report, result, material, "fail")  # Envelope binding and evidence.
     reports = report.get("reports")
@@ -325,6 +328,15 @@ def _validate_ai_report(report, result, material, directory, data_dir):
     observations = []
     for source in reports:
         _validate_report(source, result, material, "pass")
+        # Binding is the local comparison, not a claim a blind reviewer saw the
+        # proposal. Preserve the exact original UTF-8 ledger, including its scope.
+        ledger = source.get("original_source_ledger")
+        if (source.get("review_mode") not in {"blind_source_ledger", "candidate_comparison"}
+                or source.get("ledger_comparison_attested") is not True
+                or not isinstance(ledger, str) or not ledger.strip()
+                or hashlib.sha256(ledger.encode("utf-8")).hexdigest() != source.get("original_source_ledger_sha256")
+                or not isinstance(json.loads(ledger), dict)):
+            raise ValueError("original immutable source ledger and local comparison attestation required")
         if source.get("supersedes_admission_decision_id") != report.get("supersedes_admission_decision_id"):
             raise ValueError("source report supersession differs")
         for index, key in enumerate(("reviewer_id", "session_id")):
@@ -378,6 +390,18 @@ def _validate_ai_report(report, result, material, directory, data_dir):
                         observed = parsed["amount_midpoint"] if parsed["amount_kind"] == "exact" else None
                     elif field == "amount_midpoint":
                         raise ValueError("midpoint requires code derivation")
+                    elif field == "owner_code":
+                        observed = extract_owner_code(literal)
+                        observed = "J" if observed == "JT" else observed
+                    elif field == "transaction_type":
+                        observed = _normalize_tx_type(literal)
+                    elif field == "member":
+                        _, rejected = validate_transactions(result.work.doc_id, literal, [],
+                                                            result.work.filing_date, result.work.member)
+                        observed = None if rejected else value
+                    elif field == "asset_description":
+                        observed = " ".join(literal.split())
+                        value = " ".join(value.split())
                     if observed != value:
                         raise ValueError(f"literal source differs from canonical value: {field}")
                 else:
@@ -456,7 +480,7 @@ def review_decision_locked(result, data_dir):
         # Authorization derives from the operator's affirmative page report,
         # not from a provider's empty claim. The raw bundle remains unchanged.
         material["candidate"] = {**material["candidate"], "status": "verified_empty"}
-    return {"allowed": True, "reason": "locally recorded all-pages source review passed",
+    return {"allowed": True, "reason": f"locally recorded all-pages source review passed ({entry['authority']})",
              "review_binding": {**material["binding"], "verdict_sha256": digest(entry),
                                 "authority": entry["authority"],
                                "supersedes_admission_decision_id": entry["report"].get("supersedes_admission_decision_id"),

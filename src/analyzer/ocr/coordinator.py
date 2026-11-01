@@ -229,9 +229,15 @@ def _ingest_registered(db: Database, result, receipt: dict, predecessor: dict | 
     if finished:
         current = db.conn.execute("SELECT attempt_id, result_id, status FROM extraction_work WHERE task_id = ?",
                                   [work.task_id]).fetchone()
-        if (predecessor["state"] != "needs_review" or work.lane == ExtractionLane.LOCAL
+        # Only an explicit historical recipe refusal can be reconsidered. Old
+        # generic GLM details can mask the gate reason; do not infer authority.
+        recipe_refusal = (predecessor["state"] == "blocked"
+                          and predecessor["detail"] == "extraction recipe changed"
+                          and result.outcome == ExtractionOutcome.CANDIDATE
+                          and result.evidence.get("artifact_verified") is True)
+        if ((predecessor["state"] != "needs_review" and not recipe_refusal) or work.lane == ExtractionLane.LOCAL
                 or result.outcome not in {ExtractionOutcome.CANDIDATE, ExtractionOutcome.VERIFIED_EMPTY}
-                or current != (work.attempt_id, predecessor["result_id"], "needs_review")):
+                or current != (work.attempt_id, predecessor["result_id"], predecessor["state"])):
             return predecessor["state"]
     db.work.validate_receipt(receipt)
     if not _current_binding(db, work):

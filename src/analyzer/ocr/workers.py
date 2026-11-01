@@ -335,7 +335,8 @@ def _admission_decision_locked(result: ResultBundle, data_dir) -> dict:
         return refused
     if result.evidence.get("artifact_verified") is not True:
         return {**refused, "reason": "artifact verification evidence missing"}
-    if result.work.extraction_recipe != extraction_recipe(result.work.lane):
+    if (result.work.lane == ExtractionLane.LOCAL
+            and result.work.extraction_recipe != extraction_recipe(result.work.lane)):
         return {**refused, "reason": "extraction recipe changed"}
     if result.work.lane != ExtractionLane.GLM:
         return {"allowed": True, "reason": "candidate; writer validation required", "audit_binding": None}

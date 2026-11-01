@@ -104,8 +104,9 @@ def required_review_supersession(repository, raw_result_id):
     receipt = dict(result_id=raw_result_id, task_id=row[0], attempt_id=row[1], path=row[2])
     effective = repository.effective_admission_decision(receipt)
     event = effective["detail"]
-    if (effective["state"] in {"needs_review", "blocked"} and isinstance(event, dict)
-            and event.get("kind") == "admission_decision"):
+    if (effective["state"] == "blocked"
+            or (effective["state"] == "needs_review" and isinstance(event, dict)
+                and event.get("kind") == "admission_decision")):
         return effective["result_id"]
     return None
 
@@ -149,6 +150,54 @@ def _validate_bundle(data_dir, directory, record):
     pdf = read_work_artifact(data_dir, directory / "source.pdf")
     if hashlib.sha256(pdf).hexdigest() != record["pdf_sha256"]:
         raise ValueError("frozen source PDF changed")
+
+
+def _has_failed_projection(data_dir, material, result):
+    """Failures follow identical interpreted rows, not a normalization directory.
+
+    Validate every sibling before using its history. Seals detect corruption at
+    the existing private-filesystem boundary, not hostile replacement of both.
+    """
+    from analyzer.ocr.ingestion import read_work_artifact
+
+    binding = material["binding"]
+    failed = False
+    for directory in bundle_directory(data_dir, material).parent.iterdir():
+        record = json.loads(read_work_artifact(data_dir, directory / "record.json"))
+        old = record["binding"]
+        if (record["schema"] != "house-api-review-bundle-v1"
+                or directory.name != digest(old) or old["raw_result_id"] != binding["raw_result_id"]
+                or record["raw_result"] != result.to_dict()
+                or old["work"] != result.work.to_dict()
+                or record["pdf_sha256"] != result.work.artifact_sha256
+                or record["candidate"]["normalization_recipe"] != old["normalization_recipe"]
+                or old["policy_sha256"] != digest(record["policy"])
+                or old["policy_identity"] != record["policy"]["identity"]
+                or old["final_projection_sha256"] != digest(record["final_projection"])
+                or old["final_projection_count"] != len(record["final_projection"])):
+            raise ValueError("invalid sibling source-review binding")
+        _validate_bundle(data_dir, directory, record)
+        history_path = directory / "verdicts.json"
+        # Prepared but unreviewed bundles have no history yet.
+        if not history_path.exists() and not history_path.is_symlink():
+            continue
+        history = json.loads(read_work_artifact(data_dir, history_path))
+        if not isinstance(history, list):
+            raise TypeError("invalid source-review history")
+        seal = hashlib.sha256(read_work_artifact(data_dir, directory / "bundle-seal.json")).hexdigest()
+        for entry in history:
+            report = entry["report"]
+            if (entry["binding"] != old or entry["bundle_seal_sha256"] != seal
+                    or entry["verdict"] not in {"pass", "fail"}
+                    or entry["authority"] not in {POLICY["authority"], "silver-failure-only"}
+                    or (entry["verdict"] == "pass" and entry["authority"] != POLICY["authority"])
+                    or report["binding"] != old or report["policy_sha256"] != old["policy_sha256"]
+                    or not isinstance(report["evidence"], str) or not report["evidence"].strip()):
+                raise ValueError("invalid sealed source-review history")
+            if (entry["verdict"] == "fail"
+                    and old["final_projection_sha256"] == binding["final_projection_sha256"]):
+                failed = True
+    return failed
 
 
 def prepare_review(result, data_dir, *, database=None, supersedes_admission_decision_id=None):
@@ -256,7 +305,7 @@ def record_review(result, data_dir, report, *, verdict, human_reviewed=False, da
                  "authority": POLICY["authority"] if human_reviewed else "silver-failure-only",
                  "bundle_seal_sha256": hashlib.sha256(read_work_artifact(root, directory / "bundle-seal.json")).hexdigest()}
         # A failed unchanged candidate is not repaired by another assertion.
-        if verdict == "pass" and any(item["verdict"] == "fail" for item in history):
+        if verdict == "pass" and _has_failed_projection(root, material, result):
             raise ValueError("failed candidate requires re-extraction, not a later pass")
         from scripts.glm_stage import atomic_write_json
         atomic_write_json(history_path, [*history, entry])
@@ -272,6 +321,8 @@ def review_decision_locked(result, data_dir):
     record = bundle_record(result, material)
     try:
         _validate_bundle(data_dir, directory, record)
+        if _has_failed_projection(data_dir, material, result):
+            raise ValueError("failed candidate requires re-extraction, not a later pass")
         history = json.loads(read_work_artifact(data_dir, directory / "verdicts.json"))
         if not history or any(item["verdict"] == "fail" for item in history):
             raise ValueError("missing or failed source review")

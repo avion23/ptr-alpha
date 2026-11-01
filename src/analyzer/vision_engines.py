@@ -205,8 +205,9 @@ def _snippet(text: str, limit: int = SNIPPET_LIMIT) -> str:
     return collapsed[: limit - 3] + "..."
 
 
-def request_max_tokens(page_count: int | None) -> int:
-    """Explicit output budget for one document read (interface audit item 1).
+def request_max_tokens(page_count: int | None, *, model: str | None = None,
+                       reasoning_effort: str | None = None) -> int:
+    """Explicit output ceiling for one document read.
 
     The client used to omit ``max_tokens`` and ride the server default; the
     vision request schema documents no default (only ``example: 1024``, which
@@ -214,9 +215,15 @@ def request_max_tokens(page_count: int | None) -> int:
     ``max(16384, 4096 + 1500 x pages)`` capped at the documented 131072
     ceiling. 1500/page covers ~20 rows x ~60 tokens plus PAGE headers — far
     above anything a PTR page holds — and the floor leaves headroom for
-    always-on reasoning tokens, which share the output budget.
+    always-on reasoning tokens, which share the output budget. GLM low-effort
+    recovery uses the full documented ceiling for verbose schema-4 raw cells;
+    it does not force a longer answer. Other requests retain the sized budget.
     """
     pages = max(int(page_count or 1), 1)
+    # Bulk recovery exhausted outputs: complete named raw cells
+    # exceed the old per-page estimate. This is a ceiling, not forced output.
+    if (model or "").lower() == "glm-5.3-flash" and reasoning_effort == "low":
+        return ZAI_MAX_TOKENS_CEILING
     budget = MAX_TOKENS_BASE + MAX_TOKENS_PER_PAGE * pages
     return min(max(budget, MAX_TOKENS_FLOOR), ZAI_MAX_TOKENS_CEILING)
 
@@ -286,8 +293,8 @@ def read_document_with_vision_b(
 ) -> str:
     """Read all page images with engine B and return the raw completion.
 
-    The prompt is the SAME transaction-extraction prompt the Gemini path uses
-    (imported, never forked). All pages travel in one chat-completions request
+    The extraction instructions are shared with Gemini; GLM also receives the
+    trusted physical image count/order. All pages travel in one chat-completions request
     in the documented Z.AI vision shape (content array of ``image_url`` parts
     in page order, text prompt last) with an explicit page-scaled
     ``max_tokens`` budget and a ``120s + 60s/page`` read-timeout (auto unless
@@ -321,6 +328,14 @@ def read_document_with_vision_b(
     extraction_prompt = (
         prompt if prompt is not None else gemini.PROMPT
     )
+    if prompt is None and config.model.lower() == "glm-5.3-flash":
+        extraction_prompt += (
+            f"\nInput binding: exactly {len(page_data_urls)} page images are supplied in physical PDF order. "
+            f"Output PAGES: {len(page_data_urls)} and PAGE: 1 through PAGE: {len(page_data_urls)}, each once. "
+            "Use image positions, not printed page numbers; copied sheets still have distinct physical positions. "
+            "Every ROW must be one complete valid JSON object on one line. Escape quotes and newlines "
+            "inside strings; no trailing commas, Markdown, or prose outside the required format."
+        )
     payload = {
         "model": config.model,
         "temperature": 0,
@@ -328,7 +343,8 @@ def read_document_with_vision_b(
         # documented vision-schema default is unspecified, and an
         # finish_reason="length" truncation is a rejected reading — size for
         # the heaviest real filing instead of riding an undocumented default.
-        "max_tokens": request_max_tokens(len(page_data_urls)),
+        "max_tokens": request_max_tokens(len(page_data_urls), model=config.model,
+                                         reasoning_effort=reasoning_effort),
         "messages": [
             {
                 "role": "user",

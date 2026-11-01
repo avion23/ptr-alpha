@@ -1748,6 +1748,8 @@ def _finish_receipt(conn, receipt, state, detail=None):
                 if (detail.get("review_binding", {}).get("authority") != POLICY["ai_authority"]
                         or source_lineage["original_raw_result_id"] != receipt["result_id"]
                         or digest(decision["result"].to_dict()) != receipt["result_id"]
+                        or source_lineage["source_origin"] != "independent-ai-source-proposal-v1"
+                        or source_lineage["extracted_raw_count"] != len(decision["result"].rows)
                         or source_lineage["source_proposal_sha256"] != digest(source_proposal)
                         or source_lineage["verified_source_count"] != len(source_proposal["rows"])
                         or source_lineage["derived_outcome"] != ("verified_empty" if state == "verified_empty" else "candidate")):

@@ -24,7 +24,7 @@ POLICY = {
     "coverage": "all source pages, all row occurrences, every critical field; omissions included",
     "ai_authority": "independent-ai-source-review-v1",
     "render_dpi": 180,
-    "ai_requirements": "two independent sessions; pixel citations; all field observations; original UTF-8 ledgers with SHA-256; local source-checking and faithful comparison attestations; blind ledger binding is post-review",
+    "ai_requirements": "two independent sessions, one blind source ledger and one candidate comparison; pixel citations; all field observations; original UTF-8 ledgers with SHA-256; local source-checking and faithful comparison attestations; blind ledger binding is post-review",
     "source_proposals": "AI-only schema-4 source observations; original raw result retained; both original ledger hashes bound; all current normalization gates; corrections publish as separate derived decisions",
 }
 
@@ -101,7 +101,8 @@ def review_material(result, *, source_proposal=None):
 
         if (not isinstance(source_proposal, dict)
                 or source_proposal.get("schema") != "independent-ai-source-proposal-v1"
-                or result.evidence.get("output_schema_version") != 4
+                or type(result.evidence.get("output_schema_version")) is not int
+                or result.evidence["output_schema_version"] != 4
                 or any(not isinstance(row.get("raw_cells"), dict) for row in result.rows)):
             raise ValueError("source proposals require an explicit source schema and original schema-4 result")
         rows = source_proposal.get("rows")
@@ -385,7 +386,7 @@ def ai_review_report_template(result, data_dir, *, supersedes_admission_decision
                   original_source_ledger="", original_source_ledger_sha256="",
                   ledger_comparison_attested=False, ledger_document_pointer="",
                   ledger_pdf_sha256_pointer="", ledger_row_count_pointer="", ledger_absence_pointer="")
-    if source_proposal is not None and not material["projection"]:
+    if not material["projection"]:
         report["source_header"] = {"member": {
             "status": "unknown", "value": None, "literal": "", "page_number": None,
             "image_sha256": "", "evidence": "", "ledger_pointer": ""}}
@@ -409,6 +410,15 @@ def _validate_ai_report(report, result, material, directory, data_dir):
     from analyzer.ocr.common import _strict_date, _normalize_tx_type, validate_transactions
     from analyzer.ocr.normalization import normalize_amount
     from analyzer.parsing.cells import extract_owner_code
+    from decimal import Decimal
+
+    def same_numeric_amount(left, right):
+        left, right = normalize_amount(left), normalize_amount(right)
+        if left["amount_kind"] not in {"range", "exact"} or left["amount_kind"] != right["amount_kind"]:
+            return False
+        return all((Decimal(left[key]) if left[key] is not None else None) ==
+                   (Decimal(right[key]) if right[key] is not None else None)
+                   for key in ("amount_lower", "amount_upper", "amount_exact"))
 
     _validate_report(report, result, material, "fail")  # Envelope binding and evidence.
     reports = report.get("reports")
@@ -416,6 +426,7 @@ def _validate_ai_report(report, result, material, directory, data_dir):
         raise ValueError("two locally attested independent source reports required")
     seal = json.loads(read_work_artifact(data_dir, directory / "bundle-seal.json"))
     identities = [set(), set()]
+    modes = set()
     observations = []
     for source in reports:
         _validate_report(source, result, material, "pass")
@@ -429,6 +440,7 @@ def _validate_ai_report(report, result, material, directory, data_dir):
                 or not isinstance(json.loads(ledger), dict)):
             raise ValueError("original immutable source ledger and local comparison attestation required")
         ledger = json.loads(ledger)
+        modes.add(source["review_mode"])
         document_pointer = source.get("ledger_document_pointer")
         document = _ledger_at(ledger, document_pointer)
         if (not isinstance(document, dict) or str(document.get("doc_id")) != result.work.doc_id
@@ -451,29 +463,29 @@ def _validate_ai_report(report, result, material, directory, data_dir):
             if [{"page_number": page["page_number"], "outcome": page["outcome"]}
                     for page in source["pages"]] != material["candidate"]["page_outcomes"]:
                 raise ValueError("source proposal and observed page outcomes differ")
-            if not material["projection"]:
-                header = source.get("source_header", {}).get("member")
-                if not isinstance(header, dict):
-                    raise ValueError("empty source proposal requires observed filer header")
-                page, literal = header.get("page_number"), header.get("literal")
-                if (header.get("status") != "observed" or header.get("value") != result.work.member
-                        or not isinstance(literal, str) or not literal.strip()
-                        or type(page) is not int or not 1 <= page <= len(seal["pages"])
-                        or header.get("image_sha256") != seal["pages"][page - 1]["sha256"]
-                        or not isinstance(header.get("evidence"), str) or not header["evidence"].strip()):
-                    raise ValueError("empty source proposal requires pixel-cited filer identity")
-                _, rejected = validate_transactions(result.work.doc_id, literal, [],
-                                                    result.work.filing_date, result.work.member)
-                if rejected:
-                    raise ValueError("empty source filer differs from official identity")
-                _original_observation(ledger, document_pointer, header)
-                absence = _ledger_at(ledger, source.get("ledger_absence_pointer"), within=document_pointer)
-                if (not isinstance(absence, dict) or absence.get("status") != "observed"
-                        or not isinstance(absence.get("literal"), str) or not absence["literal"].strip()
-                        or type(absence.get("source_page")) is not int
-                        or not 1 <= absence["source_page"] <= len(seal["pages"])
-                        or not isinstance(absence.get("evidence_location"), str) or not absence["evidence_location"].strip()):
-                    raise ValueError("empty source proposal requires original page-grounded absence observation")
+        if not material["projection"]:
+            header = source.get("source_header", {}).get("member")
+            if not isinstance(header, dict):
+                raise ValueError("empty source review requires observed filer header")
+            page, literal = header.get("page_number"), header.get("literal")
+            if (header.get("status") != "observed" or header.get("value") != result.work.member
+                    or not isinstance(literal, str) or not literal.strip()
+                    or type(page) is not int or not 1 <= page <= len(seal["pages"])
+                    or header.get("image_sha256") != seal["pages"][page - 1]["sha256"]
+                    or not isinstance(header.get("evidence"), str) or not header["evidence"].strip()):
+                raise ValueError("empty source review requires pixel-cited filer identity")
+            _, rejected = validate_transactions(result.work.doc_id, literal, [],
+                                                result.work.filing_date, result.work.member)
+            if rejected:
+                raise ValueError("empty source filer differs from official identity")
+            _original_observation(ledger, document_pointer, header)
+            absence = _ledger_at(ledger, source.get("ledger_absence_pointer"), within=document_pointer)
+            if (not isinstance(absence, dict) or absence.get("status") != "observed"
+                    or not isinstance(absence.get("literal"), str) or not absence["literal"].strip()
+                    or type(absence.get("source_page")) is not int
+                    or not 1 <= absence["source_page"] <= len(seal["pages"])
+                    or not isinstance(absence.get("evidence_location"), str) or not absence["evidence_location"].strip()):
+                raise ValueError("empty source review requires original page-grounded absence observation")
         values = []
         for row, expected in zip(source["rows"], material["projection"]):
             fields = row.get("fields")
@@ -521,7 +533,8 @@ def _validate_ai_report(report, result, material, directory, data_dir):
                         raise ValueError("midpoint requires code derivation")
                     elif field == "owner_code":
                         observed = extract_owner_code(literal)
-                        observed = "J" if observed == "JT" else observed
+                    elif field == "amount_raw":
+                        observed = value if same_numeric_amount(literal, value) else None
                     elif field == "transaction_type":
                         observed = _normalize_tx_type(literal)
                     elif field == "member":
@@ -538,6 +551,15 @@ def _validate_ai_report(report, result, material, directory, data_dir):
                     if observed != value:
                         raise ValueError(f"literal source differs from canonical value: {field}")
                     original_value = original.get("normalized_value")
+                    if field == "transaction_type":
+                        original_value = _normalize_tx_type(original_value)
+                    elif field == "owner_code":
+                        original_value = extract_owner_code(original_value)
+                    elif field == "amount_raw" and not isinstance(original_value, dict):
+                        original_value = value if same_numeric_amount(original_value, value) else None
+                    elif field in {"transaction_date", "notification_date", "expiry_date", "disclosure_date"}:
+                        parsed = _strict_date(original_value)
+                        original_value = parsed.isoformat() if parsed else None
                     if (not isinstance(original_value, dict) and field not in {"member", "asset_description"}
                             and original_value != value):
                         raise ValueError(f"original source value differs from canonical value: {field}")
@@ -547,6 +569,8 @@ def _validate_ai_report(report, result, material, directory, data_dir):
         observations.append(values)
     if observations[0] != observations[1]:
         raise ValueError("independent source observations disagree")
+    if modes != {"blind_source_ledger", "candidate_comparison"}:
+        raise ValueError("one blind source ledger and one candidate comparison required")
     if "source_proposal" in material:
         if (report.get("source_proposal") != material["source_proposal"]
                 or sorted(material["source_proposal"]["source_ledger_sha256s"]) != sorted(

@@ -99,7 +99,10 @@ def _complete_source_amount(literal):
     claims = list(re.finditer(pattern, literal, re.I))
     if len(claims) != 1:
         raise ValueError("source amount observation must preserve one complete numeric claim")
-    amount = normalize_amount(claims[0].group())
+    claim = claims[0]
+    if re.search(r"\d", literal[:claim.start()] + literal[claim.end():]):
+        raise ValueError("source amount observation contains unparsed numeric content")
+    amount = normalize_amount(claim.group())
     if amount["amount_kind"] not in {"range", "exact", "open"}:
         raise ValueError("source amount numeric bounds are unknown")
     return amount

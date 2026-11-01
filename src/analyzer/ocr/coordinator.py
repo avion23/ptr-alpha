@@ -710,19 +710,19 @@ def run_pipeline(
                             or any(char not in "0123456789abcdef" for char in verdict_sha)):
                         review_seen[selector_path.name] = signature
                         continue
-                    row = db.conn.execute("""SELECT path, state, finished_at FROM extraction_results
+                    row = db.conn.execute("""SELECT path, task_id, attempt_id, finished_at FROM extraction_results
                         WHERE result_id = ?""", [raw_id]).fetchone()
                     if row is None:
                         # A selector may arrive just before its worker result is registered.
                         continue
                     review_seen[selector_path.name] = signature
-                    path, state, finished_at = row
-                    if finished_at is not None and state != "needs_review":
-                        continue
+                    path, task_id, attempt_id, finished_at = row
+                    if finished_at is not None:
+                        effective = db.work.effective_admission_decision(dict(
+                            result_id=raw_id, task_id=task_id, attempt_id=attempt_id, path=path))
+                        if effective["state"] not in {"needs_review", "blocked"}:
+                            continue
                     receive(path)
-
-            def review_poll_deadline():
-                return next_review_poll
 
             completed = 0
             while True:
@@ -774,12 +774,12 @@ def run_pipeline(
                     if retry_wakeup is not None:
                         # Unknown quota errors retain their whole-lane backoff.
                         deadline = max(retry_wakeup, lane_backoff[ExtractionLane.GLM])
-                        delay = min(deadline, review_poll_deadline()) - time.monotonic()
+                        delay = min(deadline, next_review_poll) - time.monotonic()
                         if delay > 0:
                             time.sleep(delay)
                         continue
                     break
-                wakeups.append(review_poll_deadline())
+                wakeups.append(next_review_poll)
                 timeout = max(0, min(wakeups) - time.monotonic())
                 done, _ = wait(running, timeout=timeout, return_when=FIRST_COMPLETED)
                 for future in done:

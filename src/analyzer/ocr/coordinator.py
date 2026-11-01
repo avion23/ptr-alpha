@@ -570,7 +570,9 @@ def run_pipeline(
                             AND json_extract_string(active.envelope, '$.generation_id') = g.generation_id
                             AND json_extract_string(active.envelope, '$.artifact_sha256') = json_extract_string(w.envelope, '$.artifact_sha256')
                       )
-                    ORDER BY w.priority DESC, w.task_id LIMIT ?
+                    ORDER BY w.priority DESC,
+                        CAST(json_extract_string(w.envelope, '$.page_count') AS INTEGER),
+                        w.task_id LIMIT ?
                 """, [lane.value, recipes[lane], sorted({s["archive_year"] for s in scope}),
                        scoped_doc_ids, doc_ids is None, retry_delay, limit]).fetchall()
 

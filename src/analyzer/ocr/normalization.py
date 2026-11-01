@@ -123,6 +123,10 @@ def raw_cell_consistency_findings(row, occurrence):
         "amount_raw": {"amount", "amountraw", "amountletter", "transactionamount",
                        "amountoftransaction", "transactionvalue"},
     }
+    heading_fields = {alias: field for field, aliases in headings.items() for alias in aliases}
+    heading_prefixes = {alias[:length] for alias in heading_fields for length in range(1, len(alias) + 1)}
+    date_fields = {"transaction_date", "notification_date"}
+    date_format_annotations = {"mmddyy", "mmddyyyy"}
     findings = []
 
     def blank(value):
@@ -155,7 +159,7 @@ def raw_cell_consistency_findings(row, occurrence):
 
     # Checkbox claims are grouped: an empty Purchase column is not a denial
     # of a marked Sale column. Multiple selections are ambiguous, not votes.
-    checkboxes = {"type": [], "owner": [], "amount_raw": []}
+    top_level_checkboxes = {"type": [], "owner": [], "amount_raw": []}
 
     def option(key):
         header = _normalize_header(key)
@@ -187,35 +191,130 @@ def raw_cell_consistency_findings(row, occurrence):
         elif all(blank(value) for _, value, _ in columns) and not blank(typed[field]):
             report(field, columns[0][0], "source_blank_typed_populated")
 
+    def path_key(path):
+        return ".".join(str(part) for part in path)
+
+    def refuse_unknown(field, key, value):
+        if isinstance(value, dict):
+            if not value:
+                report(field, key, "source_unreadable_or_ambiguous")
+                return True
+            refused = False
+            for child_key, child_value in value.items():
+                refused = refuse_unknown(field, f"{key}.{child_key}", child_value) or refused
+            return refused
+        elif not blank(value):
+            report(field, key, "source_unreadable_or_ambiguous")
+            return True
+        return False
+
+    def amount_letter_columns(key, value, columns):
+        before = len(findings)
+        if not isinstance(value, dict) or not value:
+            report("amount_raw", key, "source_unreadable_or_ambiguous")
+            return
+        recognized = False
+        for child_key, child_value in value.items():
+            child_field, claim = option(child_key) if isinstance(child_key, str) else (None, None)
+            if child_field == "amount_raw":
+                columns.append((f"{key}.{child_key}", child_value, claim))
+                recognized = True
+            else:
+                refuse_unknown("amount_raw", f"{key}.{child_key}", child_value)
+        if not recognized and len(findings) == before:
+            report("amount_raw", key, "source_unreadable_or_ambiguous")
+
+    def walk_heading(path, value, fallback=None, checkbox_columns=None, checkbox_field=None):
+        normalized = "".join(_normalize_header(part) for part in path)
+        exact_field = heading_fields.get(normalized)
+        field = exact_field if exact_field is not None else fallback
+        key = path_key(path)
+        if not isinstance(value, dict):
+            if exact_field is not None:
+                compare(exact_field, key, value)
+                return True
+            if fallback is not None:
+                report(field, key, "source_unreadable_or_ambiguous")
+                return True
+            return False
+        if not value:
+            if exact_field is not None:
+                compare(exact_field, key, value)
+                return True
+            if fallback is not None:
+                report(fallback, key, "source_unreadable_or_ambiguous")
+                return True
+            return False
+
+        if exact_field is not None and checkbox_field is not None and checkbox_field != exact_field:
+            checkbox_columns, checkbox_field = None, None
+        owns_checkbox_group = False
+        if exact_field in top_level_checkboxes and checkbox_columns is None:
+            checkbox_columns = []
+            checkbox_field = exact_field
+            owns_checkbox_group = True
+
+        before = len(findings)
+        handled = False
+        for child_key, child_value in value.items():
+            child_normalized = _normalize_header(child_key) if isinstance(child_key, str) else ""
+            child_path = [*path, child_key]
+            child_source_key = path_key(child_path)
+            combined = normalized + child_normalized
+            if child_normalized and combined in heading_prefixes:
+                handled = walk_heading(child_path, child_value, field,
+                                       checkbox_columns, checkbox_field) or handled
+                continue
+            if exact_field in date_fields and child_normalized in date_format_annotations:
+                if isinstance(child_value, (dict, list)):
+                    refuse_unknown(exact_field, child_source_key, child_value)
+                else:
+                    compare(exact_field, child_source_key, child_value)
+                handled = True
+                continue
+            if exact_field in top_level_checkboxes:
+                child_field, claim = option(child_key) if isinstance(child_key, str) else (None, None)
+                if child_field == exact_field:
+                    checkbox_columns.append((child_source_key, child_value, claim))
+                    handled = True
+                elif (exact_field == "amount_raw" and isinstance(child_key, str)
+                      and child_key.strip().upper() in set("ABCDEFGHIJ")):
+                    if isinstance(child_value, dict):
+                        amount_letter_columns(child_source_key, child_value, checkbox_columns)
+                        handled = True
+                    elif not blank(child_value):
+                        report(exact_field, child_source_key, "source_unreadable_or_ambiguous")
+                        handled = True
+                else:
+                    handled = refuse_unknown(exact_field, child_source_key, child_value) or handled
+            elif field is not None:
+                handled = refuse_unknown(field, child_source_key, child_value) or handled
+
+        if owns_checkbox_group:
+            if checkbox_columns:
+                compare_group(exact_field, checkbox_columns)
+                handled = True
+            elif not handled and len(findings) == before:
+                compare(exact_field, key, value)
+                handled = True
+        elif not handled and len(findings) == before and exact_field is not None:
+            compare(exact_field, key, value)
+            handled = True
+        return handled
+
     for key, value in cells.items():
         if not isinstance(key, str):
             continue
         header = _normalize_header(key)
-        field = next((field for field, aliases in headings.items() if header in aliases), None)
-        if field is not None:
-            if field in checkboxes and isinstance(value, dict) and value:
-                columns = []
-                for nested_key, nested_value in value.items():
-                    nested_field, claim = option(nested_key) if isinstance(nested_key, str) else (None, None)
-                    if nested_field != field:
-                        # A blank ancillary option makes no claim. Never interpret
-                        # a populated unknown heading (including band letters).
-                        if blank(nested_value):
-                            continue
-                        break
-                    columns.append((f"{key}.{nested_key}", nested_value, claim))
-                else:
-                    if columns:
-                        compare_group(field, columns)
-                        continue
-            compare(field, key, value)
+        if header in heading_fields or (header in heading_prefixes and isinstance(value, dict)):
+            walk_heading([key], value)
             continue
         field, claim = option(key)
         if field is None:
             continue
-        checkboxes[field].append((key, value, claim))
+        top_level_checkboxes[field].append((key, value, claim))
 
-    for field, columns in checkboxes.items():
+    for field, columns in top_level_checkboxes.items():
         if not columns:
             continue
         compare_group(field, columns)

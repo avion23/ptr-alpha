@@ -1,7 +1,7 @@
 """Producer-neutral, operator-recorded source review of immutable API results.
 
 The local filesystem/recording command is the operator trust boundary, not a
-provider's evidence dictionary. LLM findings can refuse, never authorize.
+ provider's evidence dictionary. Independent AI source review is explicitly labelled.
 All writers and admission hold the existing audit-root lock before doc locks.
 """
 from __future__ import annotations
@@ -14,7 +14,7 @@ from analyzer.ocr.contracts import ExtractionLane, ExtractionOutcome
 
 
 POLICY = {
-    "identity": "house-api-grounded-review-v1",
+    "identity": "house-api-grounded-review-v2",
     "authority": "local-operator-record-v1",
     "critical_fields": [
         "member", "asset_description", "ticker", "transaction_type", "owner_code",
@@ -22,6 +22,8 @@ POLICY = {
         "amount_midpoint", "instrument_type", "strike_price", "expiry_date",
     ],
     "coverage": "all source pages, all row occurrences, every critical field; omissions included",
+    "ai_authority": "independent-ai-source-review-v1",
+    "ai_requirements": "two independent sessions; pixel citations; all field observations; local source-checking attestation",
 }
 
 
@@ -189,8 +191,8 @@ def _has_failed_projection(data_dir, material, result):
             report = entry["report"]
             if (entry["binding"] != old or entry["bundle_seal_sha256"] != seal
                     or entry["verdict"] not in {"pass", "fail"}
-                    or entry["authority"] not in {POLICY["authority"], "silver-failure-only"}
-                    or (entry["verdict"] == "pass" and entry["authority"] != POLICY["authority"])
+                    or entry["authority"] not in {POLICY["authority"], POLICY["ai_authority"], "silver-failure-only"}
+                    or (entry["verdict"] == "pass" and entry["authority"] == "silver-failure-only")
                     or report["binding"] != old or report["policy_sha256"] != old["policy_sha256"]
                     or not isinstance(report["evidence"], str) or not report["evidence"].strip()):
                 raise ValueError("invalid sealed source-review history")
@@ -228,6 +230,13 @@ def prepare_review(result, data_dir, *, database=None, supersedes_admission_deci
                           supersedes_admission_decision_id=required), template, indent=2, sort_keys=True)
         except FileExistsError:
             pass  # Never overwrite an operator's draft on repeated preparation.
+        ai_name = f"ai-report-template-{required}.json" if required else "ai-report-template.json"
+        try:
+            with (directory / ai_name).open("x") as template:
+                json.dump(ai_review_report_template(result, root,
+                          supersedes_admission_decision_id=required), template, indent=2, sort_keys=True)
+        except FileExistsError:
+            pass
         return str(Path(data_dir) / directory.relative_to(Path(root)))
 
 
@@ -279,21 +288,125 @@ def _validate_report(report, result, material, verdict):
         raise ValueError("empty claims require affirmative absence proof on every page")
 
 
-def record_review(result, data_dir, report, *, verdict, human_reviewed=False, database=None):
+def ai_review_report_template(result, data_dir, *, supersedes_admission_decision_id=None):
+    """Unapproved two-session checklist. Call after prepare_review; never copies proposed values."""
+    from copy import deepcopy
+    from analyzer.ocr.ingestion import read_work_artifact
+
+    material = review_material(result)
+    directory = bundle_directory(data_dir, material)
+    _validate_bundle(data_dir, directory, bundle_record(result, material))
+    seal = json.loads(read_work_artifact(data_dir, directory / "bundle-seal.json"))
+    report = review_report_template(result, material,
+                                   supersedes_admission_decision_id=supersedes_admission_decision_id)
+    report.update(reviewer_id="", session_id="")
+    for page, image in zip(report["pages"], seal["pages"]):
+        page["image_sha256"] = image["sha256"]
+    for row in report["rows"]:
+        row["fields"] = {field: {"status": "unknown", "value": None, "literal": "",
+                                 "page_number": row["page_number"], "image_sha256": "", "evidence": ""}
+                         for field in POLICY["critical_fields"]}
+    return {"binding": material["binding"], "policy_sha256": digest(POLICY), "evidence": "",
+            "supersedes_admission_decision_id": supersedes_admission_decision_id,
+            "source_checking_attested": False, "reports": [deepcopy(report), deepcopy(report)]}
+
+
+def _validate_ai_report(report, result, material, directory, data_dir):
+    from analyzer.ocr.ingestion import read_work_artifact
+    from analyzer.ocr.common import _strict_date
+    from analyzer.ocr.normalization import normalize_amount
+
+    _validate_report(report, result, material, "fail")  # Envelope binding and evidence.
+    reports = report.get("reports")
+    if report.get("source_checking_attested") is not True or not isinstance(reports, list) or len(reports) != 2:
+        raise ValueError("two locally attested independent source reports required")
+    seal = json.loads(read_work_artifact(data_dir, directory / "bundle-seal.json"))
+    identities = [set(), set()]
+    observations = []
+    for source in reports:
+        _validate_report(source, result, material, "pass")
+        if source.get("supersedes_admission_decision_id") != report.get("supersedes_admission_decision_id"):
+            raise ValueError("source report supersession differs")
+        for index, key in enumerate(("reviewer_id", "session_id")):
+            identity = source.get(key)
+            if not isinstance(identity, str) or not identity.strip() or identity in identities[index]:
+                raise ValueError("distinct reviewer and session IDs required")
+            identities[index].add(identity)
+        for page, image in zip(source["pages"], seal["pages"]):
+            if page.get("image_sha256") != image["sha256"]:
+                raise ValueError("source page image citation missing or changed")
+        values = []
+        for row, expected in zip(source["rows"], material["projection"]):
+            fields = row.get("fields")
+            if not isinstance(fields, dict) or set(fields) != set(POLICY["critical_fields"]):
+                raise ValueError("every critical field needs an observation")
+            for field, observation in fields.items():
+                if not isinstance(observation, dict):
+                    raise ValueError("field observation must be an object")
+                status = observation.get("status")
+                value, literal = observation.get("value"), observation.get("literal")
+                page = observation.get("page_number")
+                if (type(page) is not int or not 1 <= page <= len(seal["pages"])
+                        or observation.get("image_sha256") != seal["pages"][page - 1]["sha256"]
+                        or not isinstance(observation.get("evidence"), str) or not observation["evidence"].strip()
+                        or not isinstance(literal, str) or not literal.strip()):
+                    raise ValueError("every field needs literal source evidence and frozen page citation")
+                if value != expected[field]:
+                    raise ValueError(f"source observation differs from current projection: {field}")
+                if status == "not_reported":
+                    if literal != "NotReported" or value not in (None, "unknown"):
+                        raise ValueError("not-reported field must remain null/unknown")
+                elif status == "official_metadata":
+                    if field != "disclosure_date" or literal != result.work.filing_date or value != literal:
+                        raise ValueError("only bound official filing metadata can supply disclosure date")
+                elif status == "derived":
+                    amount = fields["amount_raw"]
+                    parsed = normalize_amount(amount.get("literal"))
+                    if (field != "amount_midpoint" or literal != amount.get("literal")
+                            or amount.get("status") != "observed" or parsed["amount_kind"] not in {"range", "exact"}
+                            or parsed["amount_midpoint"] != value):
+                        raise ValueError("midpoint must be computed from literal source numeric bounds")
+                elif status == "observed":
+                    if value is None or value == "unknown" or isinstance(value, bool):
+                        raise ValueError("unreported values require explicit not_reported status")
+                    observed = literal
+                    if field in {"transaction_date", "notification_date", "expiry_date", "disclosure_date"}:
+                        parsed = _strict_date(literal)
+                        observed = parsed.isoformat() if parsed else None
+                    elif field == "strike_price":
+                        parsed = normalize_amount(literal)
+                        observed = parsed["amount_midpoint"] if parsed["amount_kind"] == "exact" else None
+                    elif field == "amount_midpoint":
+                        raise ValueError("midpoint requires code derivation")
+                    if observed != value:
+                        raise ValueError(f"literal source differs from canonical value: {field}")
+                else:
+                    raise ValueError(f"unknown/conflicting field status: {field}")
+                values.append((field, status, value))
+        observations.append(values)
+    if observations[0] != observations[1]:
+        raise ValueError("independent source observations disagree")
+
+
+def record_review(result, data_dir, report, *, verdict, human_reviewed=False, ai_source_reviewed=False, database=None):
     """Append a local verdict, never accepting positive silver/model assertions."""
     from scripts.audit_sample import audit_operation_lock
     from analyzer.ocr.ingestion import approved_data_root, read_work_artifact
 
     if verdict not in {"pass", "fail"}:
         raise ValueError("review verdict must be pass or fail")
-    if verdict == "pass" and not human_reviewed:
+    if human_reviewed and ai_source_reviewed:
+        raise ValueError("human and AI source review modes are mutually exclusive")
+    if verdict == "pass" and not (human_reviewed or ai_source_reviewed):
         raise ValueError("positive authorization requires explicit local human review")
     with approved_data_root(data_dir) as root, audit_operation_lock(root):
         material = review_material(result)
         directory = bundle_directory(root, material)
         record = bundle_record(result, material)
         _validate_bundle(root, directory, record)
-        _validate_report(report, result, material, verdict)
+        _validate_report(report, result, material, "fail" if ai_source_reviewed else verdict)
+        if ai_source_reviewed and verdict == "pass":
+            _validate_ai_report(report, result, material, directory, root)
         # Recording acknowledges an operator-supplied subject, not its currentness.
         # DB-free commands may run alongside the writer. Only the owner can
         # authorize admission against the actual latest chain under its lock/txn.
@@ -302,7 +415,8 @@ def record_review(result, data_dir, report, *, verdict, human_reviewed=False, da
         history_path = directory / "verdicts.json"
         history = json.loads(read_work_artifact(root, history_path)) if history_path.exists() else []
         entry = {"verdict": verdict, "binding": material["binding"], "report": report,
-                 "authority": POLICY["authority"] if human_reviewed else "silver-failure-only",
+                 "authority": (POLICY["ai_authority"] if ai_source_reviewed else
+                               POLICY["authority"] if human_reviewed else "silver-failure-only"),
                  "bundle_seal_sha256": hashlib.sha256(read_work_artifact(root, directory / "bundle-seal.json")).hexdigest()}
         # A failed unchanged candidate is not repaired by another assertion.
         if verdict == "pass" and _has_failed_projection(root, material, result):
@@ -325,12 +439,15 @@ def review_decision_locked(result, data_dir):
         if not history or any(item["verdict"] == "fail" for item in history):
             raise ValueError("missing or failed source review")
         entry = history[-1]
-        if entry["authority"] != POLICY["authority"] or entry["binding"] != material["binding"]:
+        if entry["authority"] not in {POLICY["authority"], POLICY["ai_authority"]} or entry["binding"] != material["binding"]:
             raise ValueError("review is not locally authorized for this exact candidate")
         seal = hashlib.sha256(read_work_artifact(data_dir, directory / "bundle-seal.json")).hexdigest()
         if entry["bundle_seal_sha256"] != seal or entry["verdict"] != "pass":
             raise ValueError("review seal changed or verdict is not pass")
-        _validate_report(entry["report"], result, material, "pass")
+        if entry["authority"] == POLICY["ai_authority"]:
+            _validate_ai_report(entry["report"], result, material, directory, data_dir)
+        else:
+            _validate_report(entry["report"], result, material, "pass")
         if _has_failed_projection(data_dir, material, result):
             raise ValueError("failed candidate requires re-extraction, not a later pass")
     except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
@@ -340,6 +457,7 @@ def review_decision_locked(result, data_dir):
         # not from a provider's empty claim. The raw bundle remains unchanged.
         material["candidate"] = {**material["candidate"], "status": "verified_empty"}
     return {"allowed": True, "reason": "locally recorded all-pages source review passed",
-            "review_binding": {**material["binding"], "verdict_sha256": digest(entry),
+             "review_binding": {**material["binding"], "verdict_sha256": digest(entry),
+                                "authority": entry["authority"],
                                "supersedes_admission_decision_id": entry["report"].get("supersedes_admission_decision_id"),
                                "bundle_seal_sha256": seal}, **material}

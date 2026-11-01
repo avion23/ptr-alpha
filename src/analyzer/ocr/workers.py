@@ -307,7 +307,7 @@ def admission_guard(result: ResultBundle, data_dir):
         return
     from scripts import glm_stage
     from contextlib import nullcontext
-    from analyzer.ocr.review import ReviewAuthorization, review_decision_locked
+    from analyzer.ocr.review import POLICY, ReviewAuthorization, review_decision_locked
     from analyzer.ocr.ingestion import approved_data_root
 
     with (
@@ -316,10 +316,16 @@ def admission_guard(result: ResultBundle, data_dir):
         (glm_stage.document_publication_lock(root, result.work.archive_year, result.work.doc_id)
          if result.work.lane == ExtractionLane.GLM else nullcontext()),
     ):
-        decision = _admission_decision_locked(result, root)
+        try:
+            source_review = review_decision_locked(result, root)
+        except ValueError as exc:
+            source_review = {"allowed": False, "reason": str(exc)}
+        ai_authorized = (source_review["allowed"] and
+                         source_review["review_binding"]["authority"] == POLICY["ai_authority"])
+        decision = _admission_decision_locked(result, root, ai_source_review=ai_authorized)
         if decision["allowed"]:
             try:
-                decision = {**decision, **review_decision_locked(result, root)}
+                decision = {**decision, **source_review}
             except ValueError as exc:
                 decision = {**decision, "allowed": False, "reason": str(exc)}
         authorization = ReviewAuthorization(decision)
@@ -329,7 +335,7 @@ def admission_guard(result: ResultBundle, data_dir):
             authorization.active = False
 
 
-def _admission_decision_locked(result: ResultBundle, data_dir) -> dict:
+def _admission_decision_locked(result: ResultBundle, data_dir, *, ai_source_review=False) -> dict:
     refused = {"allowed": False, "reason": result.detail or result.outcome.value, "audit_binding": None}
     if result.outcome not in (ExtractionOutcome.CANDIDATE, ExtractionOutcome.VERIFIED_EMPTY):
         return refused
@@ -346,6 +352,20 @@ def _admission_decision_locked(result: ResultBundle, data_dir) -> dict:
     expected = result.evidence.get("staging_record")
     if record is None or expected is None or glm_stage.audit_staged_record_sha256(record) != glm_stage.audit_staged_record_sha256(expected):
         return {**refused, "reason": "staging evidence missing or changed"}
+    if ai_source_review:
+        expected_identity = {"doc_id": result.work.doc_id, "year": result.work.archive_year,
+                             "archive_year": result.work.archive_year,
+                             "ingestion_generation": result.work.generation_id,
+                             "pdf_sha256": result.work.artifact_sha256, "pages": result.work.page_count,
+                             "attempt_id": result.work.attempt_id,
+                             "extraction_recipe": result.work.extraction_recipe,
+                             "raw_output": result.raw_response, "rows": result.rows,
+                             "output_schema_version": 4, "legacy_limited": False}
+        if any(record.get(key) != value for key, value in expected_identity.items()):
+            return {**refused, "reason": "AI review requires exact current staging result/artifact binding"}
+        return {"allowed": True, "reason": "independent AI source review; not human/gold audit",
+                "audit_binding": {"authority": "independent-ai-source-review-v1",
+                                  "staged_record_sha256": glm_stage.audit_staged_record_sha256(record)}}
     state = glm_stage.audit_report_state(data_dir)
     history = glm_stage.audit_history_sha256(glm_stage.load_audit_results(data_dir))
     sample = glm_stage.sample_lot_file_sha256(data_dir, state.get("sample_file") if state else None)

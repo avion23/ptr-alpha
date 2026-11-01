@@ -753,6 +753,7 @@ def ocr_review_record(
     report: Path = typer.Argument(..., help="Completed grounded checklist; retain its supersedes_admission_decision_id"),
     verdict: str = typer.Option(..., help="pass or fail; silver findings may only fail"),
     human_reviewed: bool = typer.Option(False, "--human-reviewed", help="Operator confirms actual all-pages, all-rows source review"),
+    ai_source_reviewed: bool = typer.Option(False, "--ai-source-reviewed", help="Locally attest two independent AI sessions actually checked frozen source pages; NOT human review"),
     data_dir: str = typer.Option("data"),
 ):
     """Record a local review; this does not admit rows or release quality holds."""
@@ -761,7 +762,7 @@ def ocr_review_record(
     from analyzer.ocr.workers import load_result
 
     entry = record_review(load_result(result_path), data_dir, json.loads(report.read_text()),
-                          verdict=verdict, human_reviewed=human_reviewed)
+                          verdict=verdict, human_reviewed=human_reviewed, ai_source_reviewed=ai_source_reviewed)
     print(json.dumps(entry, sort_keys=True))
 
 
